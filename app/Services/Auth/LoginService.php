@@ -118,6 +118,9 @@ class LoginService
             return [false, [500, __('Reset failed')]];
         }
 
+                // revoke all existing sessions after password reset (patch 03 port)
+        $user->tokens()->delete();
+
         HookManager::call('user.password.reset.after', $user);
 
         // 清除邮箱验证码

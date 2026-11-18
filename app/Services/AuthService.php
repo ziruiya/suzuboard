@@ -57,7 +57,12 @@ class AuthService
         $token = str_replace('Bearer ', '', $bearerToken);
         
         $accessToken = PersonalAccessToken::findToken($token);
-        
+
+        // 已过期的 token 不得再用于换取快捷登录（防止过期 token 被无限续命）
+        if ($accessToken && $accessToken->expires_at && $accessToken->expires_at->isPast()) {
+            return null;
+        }
+
         $tokenable = $accessToken?->tokenable;
         
         return $tokenable instanceof User ? $tokenable : null;

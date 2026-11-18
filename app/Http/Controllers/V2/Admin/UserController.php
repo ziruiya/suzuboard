@@ -704,6 +704,9 @@ class UserController extends Controller
             $builder->whereIn('id', $userIds);
         } // all: ignore filter/sort
 
+        // collect affected user ids first; revoke their sessions after ban (patch 05 port)
+        $affectedUserIds = (clone $builder)->pluck('id');
+
         try {
             DB::transaction(function () use ($builder): void {
                 $ids = (clone $builder)->reorder()->lockForUpdate()->pluck('id');
@@ -717,7 +720,14 @@ class UserController extends Controller
             Log::error($e);
             return $this->fail([500, '处理失败']);
         }
-        // Full refresh not implemented.
+
+        // revoke all sessions of banned users (patch 05 port)
+        if ($affectedUserIds->isNotEmpty()) {
+            \Laravel\Sanctum\PersonalAccessToken::where('tokenable_type', User::class)
+                ->whereIn('tokenable_id', $affectedUserIds)
+                ->delete();
+        }
+                // Full refresh not implemented.
         return $this->success(true);
     }
 

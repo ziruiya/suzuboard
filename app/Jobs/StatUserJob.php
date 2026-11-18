@@ -58,7 +58,37 @@ class StatUserJob implements ShouldQueue
                 Log::error('StatUserJob failed for user ' . $uid . ': ' . $e->getMessage());
                 throw $e;
             }
+            // PATCH 08: mirror browser-plugin (type=http) node traffic into v2_stat_plugin
+            if (($this->server['type'] ?? null) === 'http') {
+                try {
+                    $this->processPluginStat((int) $uid, $v, $recordAt);
+                } catch (\Exception $e) {
+                    Log::error('StatPlugin mirror failed for user ' . $uid . ': ' . $e->getMessage());
+                }
+            }
         }
+    }
+
+    protected function processPluginStat(int $uid, array $v, int $recordAt): void
+    {
+        DB::table('v2_stat_plugin')->upsert(
+            [
+                'user_id' => $uid,
+                'server_id' => (int) ($this->server['id'] ?? 0),
+                'record_at' => $recordAt,
+                'record_type' => $this->recordType,
+                'u' => intval($v[0] * $this->server['rate']),
+                'd' => intval($v[1] * $this->server['rate']),
+                'created_at' => time(),
+                'updated_at' => time(),
+            ],
+            ['user_id', 'server_id', 'record_at', 'record_type'],
+            [
+                'u' => DB::raw("u + VALUES(u)"),
+                'd' => DB::raw("d + VALUES(d)"),
+                'updated_at' => time(),
+            ]
+        );
     }
 
     protected function processUserStat(int $uid, array $v, int $recordAt): void
