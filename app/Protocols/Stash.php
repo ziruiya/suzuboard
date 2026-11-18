@@ -303,7 +303,7 @@ class Stash extends AbstractProtocol
         $array['server'] = $server['host'];
         $array['port'] = $server['port'];
         $array['uuid'] = $uuid;
-        $array['udp'] = true;
+        $array['udp'] = data_get($server, 'suzu_udp_enabled', true);
 
         if ($fingerprint = Helper::getTlsFingerprint(data_get($protocol_settings, 'utls'))) {
             $array['client-fingerprint'] = $fingerprint;
@@ -380,7 +380,7 @@ class Stash extends AbstractProtocol
             'server' => $server['host'],
             'port' => $server['port'],
             'password' => $password,
-            'udp' => true,
+            'udp' => data_get($server, 'suzu_udp_enabled', true),
         ];
 
         $tlsMode = (int) data_get($protocol_settings, 'tls', 1);

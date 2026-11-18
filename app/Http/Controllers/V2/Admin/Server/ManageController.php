@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\ServerSave;
 use App\Models\Server;
 use App\Models\ServerGroup;
+use App\Models\SuzuNodeProfile;
 use App\Services\ServerService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -16,7 +17,9 @@ class ManageController extends Controller
 {
     public function getNodes(Request $request)
     {
-        $servers = ServerService::getAllServers()->map(function ($item) {
+        $profiles = SuzuNodeProfile::all()->keyBy('server_id');
+        $servers = ServerService::getAllServers()->map(function ($item) use ($profiles) {
+            $item['suzu_profile'] = $profiles->get($item->id);
             $item['groups'] = ServerGroup::whereIn('id', $item['group_ids'] ?? [])->get(['name', 'id']);
             $item['parent'] = $item->parent;
             return $item;
@@ -52,26 +55,34 @@ class ManageController extends Controller
     public function save(ServerSave $request)
     {
         $params = $request->validated();
-        if ($request->input('id')) {
-            $server = Server::find($request->input('id'));
-            if (!$server) {
-                return $this->fail([400202, '服务器不存在']);
-            }
-            try {
-                $server->update($params);
-                return $this->success(true);
-            } catch (\Exception $e) {
-                Log::error($e);
-                return $this->fail([500, '保存失败']);
-            }
-        }
-
+        $profile = $params['suzu_profile'] ?? null;
+        unset($params['suzu_profile']);
         try {
-            Server::create($params);
+            DB::transaction(function () use ($request, $params, $profile) {
+                if ($request->input('id')) {
+                    $server = Server::findOrFail($request->input('id'));
+                    $server->update($params);
+                } else {
+                    $server = Server::create($params);
+                }
+                if ($profile !== null) {
+                    SuzuNodeProfile::updateOrCreate(
+                        ['server_id' => $server->id],
+                        [
+                            'profile_code' => $profile['code'],
+                            'schema_version' => 1,
+                            'relay_policy' => $profile['relay_policy'] ?? 'required',
+                            'rollout_stage' => $profile['rollout_stage'] ?? 'draft',
+                            'client_policy' => 'standard',
+                            'udp_enabled' => (bool) ($profile['udp_enabled'] ?? false),
+                        ]
+                    );
+                }
+            });
             return $this->success(true);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error($e);
-            return $this->fail([500, '创建失败']);
+            return $this->fail([500, '保存失败']);
         }
     }
 

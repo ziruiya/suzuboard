@@ -56,6 +56,9 @@ class ServerService
     {
         $servers = Server::whereJsonContains('group_ids', (string) $user->group_id)
             ->where('show', true)
+            ->whereNotIn('id', \App\Models\SuzuNodeProfile::query()
+                ->where('rollout_stage', '!=', 'production')
+                ->pluck('server_id'))
             ->where(function ($query) {
                 $query->whereNull('transfer_enable')
                     ->orWhere('transfer_enable', 0)
@@ -65,7 +68,13 @@ class ServerService
             ->get()
             ->append(['last_check_at', 'last_push_at', 'online', 'is_online', 'available_status', 'cache_key', 'server_key']);
 
-        $servers = collect($servers)->map(function ($server) use ($user) {
+        $suzuProfiles = \App\Models\SuzuNodeProfile::whereIn('server_id', $servers->pluck('id'))
+            ->get(['server_id', 'udp_enabled', 'profile_code'])->keyBy('server_id');
+        $servers = collect($servers)->map(function ($server) use ($user, $suzuProfiles) {
+            if ($profile = $suzuProfiles->get($server->id)) {
+                $server->setAttribute('suzu_udp_enabled', (bool) $profile->udp_enabled);
+                $server->setAttribute('suzu_profile_code', $profile->profile_code);
+            }
             // 判断动态端口
             if (str_contains($server->port, '-')) {
                 $port = $server->port;

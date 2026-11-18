@@ -588,7 +588,7 @@ class SingBox extends AbstractProtocol
             "server" => $server['host'],
             "server_port" => $server['port'],
             "uuid" => $password,
-            "packet_encoding" => "xudp",
+            "packet_encoding" => data_get($server, "suzu_udp_enabled", true) ? "xudp" : null,
         ];
         if ($flow = data_get($protocol_settings, 'flow')) {
             $array['flow'] = $flow;
@@ -631,7 +631,7 @@ class SingBox extends AbstractProtocol
             $array['transport'] = $transport;
         }
 
-        return $array;
+        return array_filter($array, fn($v) => !is_null($v));
     }
 
     protected function buildTrojan($password, $server)

@@ -412,7 +412,7 @@ class ClashMeta extends AbstractProtocol
             'uuid' => $password,
             'alterId' => 0,
             'cipher' => 'auto',
-            'udp' => true,
+            'udp' => data_get($server, 'suzu_udp_enabled', true),
             'flow' => data_get($protocol_settings, 'flow'),
             'encryption' => match (data_get($protocol_settings, 'encryption.enabled')) {
                 true => data_get($protocol_settings, 'encryption.encryption', 'none'),
@@ -519,7 +519,7 @@ class ClashMeta extends AbstractProtocol
             'server' => $server['host'],
             'port' => $server['port'],
             'password' => $password,
-            'udp' => true,
+            'udp' => data_get($server, 'suzu_udp_enabled', true),
         ];
 
         $tlsMode = (int) data_get($protocol_settings, 'tls', 1);

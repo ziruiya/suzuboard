@@ -138,6 +138,11 @@ class ServerSave extends FormRequest
             'rate_time_ranges.*.end' => 'required_with:rate_time_ranges|string|date_format:H:i',
             'rate_time_ranges.*.rate' => 'required_with:rate_time_ranges|numeric|min:0',
             'protocol_settings' => 'array',
+            'suzu_profile' => 'sometimes|array',
+            'suzu_profile.code' => 'required_with:suzu_profile|in:sw1,ss1',
+            'suzu_profile.relay_policy' => 'sometimes|in:required,optional,direct',
+            'suzu_profile.rollout_stage' => 'sometimes|in:draft,staging,canary,production,disabled',
+            'suzu_profile.udp_enabled' => 'sometimes|boolean',
             'transfer_enable' => 'nullable|integer|min:0',
         ];
     }
@@ -237,6 +242,42 @@ class ServerSave extends FormRequest
         }
 
         return $rules;
+    }
+
+    public function withValidator($validator): void
+    {
+        $validator->after(function ($validator) {
+            $profile = $this->input('suzu_profile.code');
+            $existing = $this->input('id') ? Server::find($this->input('id')) : null;
+            if (!$profile && $existing) {
+                $profile = \App\Models\SuzuNodeProfile::where('server_id', $existing->id)->value('profile_code');
+            }
+            if (!$profile) {
+                return;
+            }
+            $type = $this->input('type', $existing?->type);
+            $settings = $this->input('protocol_settings', $existing?->protocol_settings ?? []);
+            $expected = $profile === 'sw1' ? ['vless', 'ws'] : ['trojan', 'grpc'];
+            if ($type !== $expected[0] || data_get($settings, 'network') !== $expected[1]) {
+                $validator->errors()->add('suzu_profile', 'Suzu profile requires its matching wire protocol and transport.');
+            }
+            if ((int) data_get($settings, 'tls') !== 1 ||
+                (bool) data_get($settings, 'tls_settings.allow_insecure', false) ||
+                !data_get($settings, 'tls_settings.server_name')) {
+                $validator->errors()->add('protocol_settings.tls', 'Suzu profile requires verified certificate TLS.');
+            }
+            if ($profile === 'sw1' && (!str_starts_with((string) data_get($settings, 'network_settings.path', ''), '/') ||
+                !data_get($settings, 'network_settings.headers.Host'))) {
+                $validator->errors()->add('protocol_settings.network_settings', 'SW1 requires WebSocket path and Host.');
+            }
+            if ($profile === 'ss1' && !preg_match('/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/',
+                    (string) data_get($settings, 'network_settings.serviceName', ''))) {
+                $validator->errors()->add('protocol_settings.network_settings.serviceName', 'SS1 requires a valid gRPC serviceName.');
+            }
+            if ($this->input('suzu_profile.rollout_stage') === 'production') {
+                $validator->errors()->add('suzu_profile.rollout_stage', 'Promote using a separately approved rollout operation.');
+            }
+        });
     }
 
     public function attributes(): array
