@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source_repository": "https://github.com/cedar2025/Xboard",
+  "production_revision": "d826a3b32f73bde24acce2a3ab033c6538ce121d",
+  "imported_repository_revision": "cd7172a1484bc8925d3b5333f0d9072cc754be99",
+  "source_snapshot_commit": null,
+  "admin_dist_repository": "https://github.com/cedar2025/xboard-admin-dist",
+  "admin_dist_commit": "ef5f43da335092cbff8fdf0ad7ff9b4d92d7d0d7",
+  "admin_dist_bundled": false,
+  "import_method": "independent_source_snapshot",
+  "notes": "Production revision is not necessarily the source commit imported to suzuboard; confirm source_snapshot_commit before a source upgrade. Do not set admin_dist_bundled true until asset verification."
+}
