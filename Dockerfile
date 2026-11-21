@@ -27,9 +27,9 @@ FROM alpine:3.20 AS singbox
 # Pinned sing-box used by the endpoint preflight probe engine
 # (SB-Endpoint-01). Static binary; checksum verified at build time.
 ARG SINGBOX_VERSION=v1.14.4
-ARG SINGBOX_SHA256=699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968
+ARG SINGBOX_SHA256=8f7c5f0651238850d96a0e488e5473cd77ec1a0098f63942e943f475a12057ca
 RUN apk --no-cache add curl tar gzip && \
-    curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION#v}-linux-amd64.tar.gz" && \
+    curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION#v}-linux-amd64-musl.tar.gz" && \
     echo "${SINGBOX_SHA256}  /tmp/sing-box.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/sing-box.tar.gz -C /tmp && \
     mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box && \
