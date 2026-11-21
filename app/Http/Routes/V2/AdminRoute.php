@@ -18,6 +18,7 @@ use App\Http\Controllers\V2\Admin\GiftCardController;
 use App\Http\Controllers\V2\Admin\KnowledgeController;
 use App\Http\Controllers\V2\Admin\PaymentController;
 use App\Http\Controllers\V2\Admin\SystemController;
+use App\Http\Controllers\V2\Admin\SuzuEndpointController;
 use App\Http\Controllers\V2\Admin\ThemeController;
 use App\Http\Controllers\V2\Admin\TrafficResetController;
 use Illuminate\Contracts\Routing\Registrar;
@@ -246,6 +247,20 @@ class AdminRoute
                 $router->get('/getQueueMasters', '\\Laravel\\Horizon\\Http\\Controllers\\MasterSupervisorController@index');
                 $router->get('/getHorizonFailedJobs', [SystemController::class, 'getHorizonFailedJobs']);
                 $router->any('/getAuditLog', [SystemController::class, 'getAuditLog']);
+            });
+
+            // Suzu Endpoint Recovery (SB-Endpoint-01): contracts, preflight, DNS cutover
+            $router->group([
+                'prefix' => 'suzu/endpoint'
+            ], function ($router) {
+                $router->get('/contracts', [SuzuEndpointController::class, 'contracts']);
+                $router->get('/contract', [SuzuEndpointController::class, 'contract']);
+                $router->post('/snapshot', [SuzuEndpointController::class, 'snapshot']);
+                $router->get('/binding', [SuzuEndpointController::class, 'binding']);
+                $router->post('/preflight', [SuzuEndpointController::class, 'preflight']);
+                $router->post('/cutover', [SuzuEndpointController::class, 'cutover']);
+                $router->post('/rollback', [SuzuEndpointController::class, 'rollback']);
+                $router->get('/changes', [SuzuEndpointController::class, 'changes']);
             });
 
             // Update

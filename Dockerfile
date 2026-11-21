@@ -22,9 +22,24 @@ RUN apk --no-cache add \
     (getent passwd redis || adduser -S -G redis -H -h /data redis) && \
     php -r 'foreach (["swoole", "pcntl", "posix", "bcmath", "pdo_mysql", "pdo_sqlite", "sockets", "zip", "igbinary", "redis"] as $ext) { if (!extension_loaded($ext)) { fwrite(STDERR, "Missing: {$ext}\n"); exit(1); } }'
 
+FROM alpine:3.20 AS singbox
+
+# Pinned sing-box used by the endpoint preflight probe engine
+# (SB-Endpoint-01). Static binary; checksum verified at build time.
+ARG SINGBOX_VERSION=v1.14.4
+ARG SINGBOX_SHA256=699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968
+RUN apk --no-cache add curl tar gzip && \
+    curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION#v}-linux-amd64.tar.gz" && \
+    echo "${SINGBOX_SHA256}  /tmp/sing-box.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp && \
+    mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box && \
+    chmod +x /usr/local/bin/sing-box && \
+    /usr/local/bin/sing-box version
+
 FROM runtime AS app
 WORKDIR /www
 COPY .docker /
+COPY --from=singbox /usr/local/bin/sing-box /usr/local/bin/sing-box
 # Build only the checked-out, reviewed repository content. No remote source clone.
 COPY . /www/
 
