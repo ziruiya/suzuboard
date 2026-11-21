@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no" />
   <title>{{$title}}</title>
   <script type="module" crossorigin src="/theme/{{$theme}}/assets/umi.js?v=20261107d"></script>
+  <link rel="stylesheet" href="/theme/{{$theme}}/assets/suzu-login.css?v=20261121a" />
 </head>
 
 <body>
@@ -35,6 +36,7 @@
   </script>
   <div id="app"></div>
   {!! $theme_config['custom_html'] !!}
+  <script src="/theme/{{$theme}}/assets/suzu-login.js?v=20261121a" defer></script>
 </body>
 
 </html>
