@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\V1\Guest;
 
 use App\Http\Controllers\Controller;
+use App\Services\CaptchaService;
 use App\Services\Plugin\HookManager;
 use App\Utils\Dict;
 use App\Utils\Helper;
@@ -12,6 +13,7 @@ class CommController extends Controller
 {
     public function config()
     {
+        $appCaptchaMode = CaptchaService::appCaptchaMode();
         $data = [
             'tos_url' => admin_setting('tos_url'),
             'is_email_verify' => (int) admin_setting('email_verify', 0) ? 1 : 0,
@@ -25,6 +27,10 @@ class CommController extends Controller
             'recaptcha_v3_site_key' => admin_setting('recaptcha_v3_site_key'),
             'recaptcha_v3_score_threshold' => admin_setting('recaptcha_v3_score_threshold', 0.5),
             'turnstile_site_key' => admin_setting('turnstile_site_key'),
+            // App captcha mode: app_captcha_mode is the source of truth,
+            // app_captcha_exempt is a derived view (1 only in exempt mode)
+            'app_captcha_mode' => $appCaptchaMode,
+            'app_captcha_exempt' => $appCaptchaMode === 'exempt' ? 1 : 0,
             'app_description' => admin_setting('app_description'),
             'app_url' => admin_setting('app_url'),
             'logo' => admin_setting('logo'),

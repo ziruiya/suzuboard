@@ -6,6 +6,7 @@ use App\Exceptions\ApiException;
 use App\Models\InviteCode;
 use App\Models\Plan;
 use App\Models\User;
+use App\Services\AppRateLimitService;
 use App\Services\CaptchaService;
 use App\Services\Plugin\HookManager;
 use App\Services\UserService;
@@ -26,6 +27,19 @@ class RegisterService
      */
     public function validateRegister(Request $request): array
     {
+        // Compensating per-IP rate limit for this endpoint (hourly window)
+        if (!app(AppRateLimitService::class)->attempt('APP_REGISTER_IP_RATE_LIMIT', (string) $request->ip(), 50)) {
+            return [
+                false,
+                [
+                    429,
+                    __('Register frequently, please try again after :minute minute', [
+                        'minute' => 60
+                    ])
+                ]
+            ];
+        }
+
         $emailIdentity = User::normalizeEmail((string) $request->input('email'));
 
         // 检查IP注册限制

@@ -7,6 +7,7 @@ use App\Http\Requests\Passport\CommSendEmailVerify;
 use App\Jobs\SendEmailJob;
 use App\Models\InviteCode;
 use App\Models\User;
+use App\Services\AppRateLimitService;
 use App\Services\CaptchaService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
@@ -18,7 +19,12 @@ class CommController extends Controller
 
     public function sendEmailVerify(CommSendEmailVerify $request)
     {
-                // 验证人机验证码
+        // Compensating per-IP rate limit for this endpoint (hourly window)
+        if (!app(AppRateLimitService::class)->attempt('APP_EMAIL_VERIFY_IP_RATE_LIMIT', (string) $request->ip(), 30)) {
+            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
+        }
+
+        // 验证人机验证码
         $captchaService = app(CaptchaService::class);
         [$captchaValid, $captchaError] = $captchaService->verify($request);
         if (!$captchaValid) {
