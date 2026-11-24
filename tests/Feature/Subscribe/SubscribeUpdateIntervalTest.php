@@ -8,6 +8,8 @@ use App\Models\User;
 use App\Protocols\Clash;
 use App\Protocols\ClashMeta;
 use App\Protocols\Shadowrocket;
+use App\Protocols\SingBox;
+use App\Protocols\Stash;
 use App\Services\SubscribeUpdateIntervalService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
@@ -15,8 +17,8 @@ use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
 /**
- * SB-SUB-INTERVAL v1.0: the Clash-family `profile-update-interval`
- * response header is driven by the global admin setting
+ * SB-SUB-INTERVAL v1.0: the `profile-update-interval` response header
+ * (Clash/ClashMeta/SingBox/Stash) is driven by the global admin setting
  * `subscribe_update_interval_hours` (default 6, range 1–72).
  */
 class SubscribeUpdateIntervalTest extends TestCase
@@ -112,6 +114,38 @@ class SubscribeUpdateIntervalTest extends TestCase
         }
         $this->corruptStoredValue('999');
         $this->assertSame(6, app(SubscribeUpdateIntervalService::class)->hours());
+    }
+
+    public function test_singbox_interval_comes_from_setting_and_tracks_changes(): void
+    {
+        // Seeded default (6) is served before any change.
+        $response = (new SingBox($this->protocolUser(), []))->handle();
+        $this->assertSame('6', $response->headers->get('profile-update-interval'));
+
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 12]);
+        $response = (new SingBox($this->protocolUser(), []))->handle();
+        $this->assertSame('12', $response->headers->get('profile-update-interval'));
+
+        // A further change is visible on the very next response.
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 48]);
+        $response = (new SingBox($this->protocolUser(), []))->handle();
+        $this->assertSame('48', $response->headers->get('profile-update-interval'));
+    }
+
+    public function test_stash_interval_comes_from_setting_and_tracks_changes(): void
+    {
+        // Seeded default (6) is served before any change.
+        $response = (new Stash($this->protocolUser(), []))->handle();
+        $this->assertSame('6', $response->headers->get('profile-update-interval'));
+
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 12]);
+        $response = (new Stash($this->protocolUser(), []))->handle();
+        $this->assertSame('12', $response->headers->get('profile-update-interval'));
+
+        // A further change is visible on the very next response.
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 48]);
+        $response = (new Stash($this->protocolUser(), []))->handle();
+        $this->assertSame('48', $response->headers->get('profile-update-interval'));
     }
 
     public function test_shadowrocket_response_has_no_interval_header(): void
