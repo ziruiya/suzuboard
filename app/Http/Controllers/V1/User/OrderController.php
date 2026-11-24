@@ -11,6 +11,7 @@ use App\Models\Payment;
 use App\Models\Plan;
 use App\Models\User;
 use App\Services\CouponService;
+use App\Services\Enterprise\EnterpriseSkuCatalog;
 use App\Services\OrderService;
 use App\Services\PaymentService;
 use App\Services\PlanService;
@@ -77,12 +78,23 @@ class OrderController extends Controller
 
         $planService->validatePurchase($user, $request->input('period'));
 
+        // Model A (D06): the purchase page selects region -> usage in two
+        // levels; the pair composes exactly one SKU code. An explicit
+        // enterprise_purpose code (older clients) still wins when present.
+        $purposeCode = $request->input('enterprise_purpose');
+        if (!$purposeCode) {
+            $purposeCode = EnterpriseSkuCatalog::compose(
+                $request->input('enterprise_region'),
+                $request->input('enterprise_usage')
+            );
+        }
+
         $order = OrderService::createFromRequest(
             $user,
             $plan,
             $request->input('period'),
             $request->input('coupon_code'),
-            $request->input('enterprise_purpose')
+            $purposeCode
         );
 
         return $this->success($order->trade_no);

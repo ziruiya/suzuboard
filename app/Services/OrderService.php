@@ -121,6 +121,11 @@ class OrderService
                     $existingKit = \App\Models\EnterpriseInventoryKit::find($user->enterprise_kit_id);
                     $code = $existingKit?->purpose?->code;
                 }
+                // Model A (D06): resolve through the SKU catalog so batch-1
+                // legacy purpose codes (JP_TIKTOK / JP_SHOPPING / HK_TRADE /
+                // HK_GENERAL) keep mapping to their model-A SKU and renewals
+                // keep finding the customer's original kit.
+                $code = \App\Services\Enterprise\EnterpriseSkuCatalog::normalizeCode($code);
                 $purpose = $code
                     ? \App\Models\EnterprisePurpose::where('code', $code)->where('is_active', true)->first()
                     : null;

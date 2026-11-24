@@ -75,7 +75,8 @@
     card.className = 'suzu-ent-card';
     card.innerHTML =
       '<div class="suzu-ent-head"><span class="suzu-ent-title">我的企业专属线路</span><span class="suzu-ent-plan">' + esc(d.plan_name || '') + '</span></div>' +
-      '<div class="suzu-ent-row"><span class="suzu-ent-label">用途</span><span>' + esc(d.purpose_name || '') + '</span></div>' +
+      '<div class="suzu-ent-row"><span class="suzu-ent-label">地区</span><span>' + esc(d.region_name || '') + '</span></div>' +
+      '<div class="suzu-ent-row"><span class="suzu-ent-label">用途</span><span>' + esc(d.usage_name || d.purpose_name || '') + '</span></div>' +
       nodeLine('主线', d.primary) +
       nodeLine('备线', d.backup) +
       '<div class="suzu-ent-row"><span class="suzu-ent-label">到期时间</span><span>' + esc(fmtTime(d.expired_at)) + '</span></div>' +

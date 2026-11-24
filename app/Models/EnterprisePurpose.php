@@ -44,4 +44,24 @@ class EnterprisePurpose extends Model
     {
         return $this->machine_id && $this->protocol && $this->entry_provider && $this->dns_alias_suffix;
     }
+
+    /** Model A region code (JP/HK); falls back to parsing the SKU code. */
+    public function regionCode(): ?string
+    {
+        if (!empty($this->region)) {
+            return $this->region;
+        }
+        $parts = explode('_', (string) $this->code, 2);
+        return $parts[0] ?? null;
+    }
+
+    /** Model A usage key (TIKTOK/SHOPPING/TRADE/GENERAL); falls back to parsing the SKU code. */
+    public function usageKey(): ?string
+    {
+        if (!empty($this->usage_key)) {
+            return $this->usage_key;
+        }
+        $parts = explode('_', (string) $this->code, 2);
+        return $parts[1] ?? null;
+    }
 }

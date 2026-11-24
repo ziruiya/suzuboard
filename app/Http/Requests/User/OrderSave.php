@@ -16,7 +16,11 @@ class OrderSave extends FormRequest
         return [
             'plan_id' => 'required',
             'period' => 'required|in:month_price,quarter_price,half_year_price,year_price,two_year_price,three_year_price,onetime_price,reset_price',
-            'enterprise_purpose' => 'nullable|string|max:20'
+            'enterprise_purpose' => 'nullable|string|max:20',
+            // Model A two-level selection (region -> usage); the pair is
+            // composed into the single enterprise_purpose SKU before submit.
+            'enterprise_region' => 'nullable|string|max:8',
+            'enterprise_usage' => 'nullable|string|max:16'
         ];
     }
 

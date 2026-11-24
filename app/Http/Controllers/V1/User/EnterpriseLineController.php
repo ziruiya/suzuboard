@@ -5,8 +5,10 @@ namespace App\Http\Controllers\V1\User;
 use App\Http\Controllers\Controller;
 use App\Models\EnterpriseInventoryKit;
 use App\Models\EnterpriseInventoryNode;
+use App\Models\EnterprisePurpose;
 use App\Models\Plan;
 use App\Models\User;
+use App\Services\Enterprise\EnterpriseSkuCatalog;
 use App\Services\UserService;
 use Illuminate\Http\Request;
 
@@ -18,6 +20,31 @@ use Illuminate\Http\Request;
  */
 class EnterpriseLineController extends Controller
 {
+    /**
+     * Model A purchase catalog: two levels (region -> usage), each leaf
+     * carrying the single SKU code the order submits. Only SKUs whose
+     * purpose row exists and is active are offered.
+     */
+    public function catalog()
+    {
+        $purposes = EnterprisePurpose::where('is_active', true)->get()->keyBy('code');
+        $regions = [];
+        foreach (EnterpriseSkuCatalog::twoLevel() as $region) {
+            $usages = [];
+            foreach ($region['usages'] as $usage) {
+                $purpose = $purposes->get($usage['code']);
+                if (!$purpose) {
+                    continue;
+                }
+                $usages[] = [...$usage, 'purpose_id' => (int) $purpose->id];
+            }
+            if ($usages) {
+                $regions[] = ['code' => $region['code'], 'name' => $region['name'], 'usages' => $usages];
+            }
+        }
+        return $this->success(['regions' => $regions]);
+    }
+
     public function lines(Request $request, UserService $userService)
     {
         $user = User::find($request->user()->id);
@@ -53,6 +80,10 @@ class EnterpriseLineController extends Controller
             'plan_name' => $plan?->name,
             'purpose_name' => $kit->purpose?->name,
             'purpose_code' => $kit->purpose?->code,
+            'region_code' => $kit->purpose?->regionCode(),
+            'region_name' => EnterpriseSkuCatalog::REGIONS[$kit->purpose?->regionCode()] ?? null,
+            'usage_code' => $kit->purpose?->usageKey(),
+            'usage_name' => EnterpriseSkuCatalog::USAGES[$kit->purpose?->usageKey()] ?? null,
             'status' => $kit->status,
             'primary' => $presentNode(EnterpriseInventoryNode::ROLE_PRIMARY),
             'backup' => $presentNode(EnterpriseInventoryNode::ROLE_BACKUP),

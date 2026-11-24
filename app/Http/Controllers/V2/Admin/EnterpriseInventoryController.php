@@ -36,6 +36,8 @@ class EnterpriseInventoryController extends Controller
                 'id' => $p->id,
                 'code' => $p->code,
                 'name' => $p->name,
+                'region' => $p->regionCode(),
+                'usage_key' => $p->usageKey(),
                 'is_active' => $p->is_active,
                 'machine_id' => $p->machine_id,
                 'protocol' => $p->protocol,
@@ -45,7 +47,7 @@ class EnterpriseInventoryController extends Controller
                 'entry_port_base' => $p->entry_port_base,
                 'dns_alias_suffix' => $p->dns_alias_suffix,
                 'blueprint_complete' => $p->blueprintComplete(),
-                'target_level' => $p->config?->target_level ?? 3,
+                'target_level' => $p->config?->target_level ?? EnterpriseInventoryConfig::DEFAULT_TARGET_LEVEL,
                 'current_level' => $p->config?->current_level ?? 0,
                 'ready_rules' => EnterpriseInventoryRule::where('purpose_id', $p->id)
                     ->where('status', EnterpriseInventoryRule::STATUS_READY)
@@ -182,7 +184,7 @@ class EnterpriseInventoryController extends Controller
         return $this->success($this->presentKit($kit->load(['purpose', 'nodes.server', 'group'])));
     }
 
-    public function registerRule(Request $request)
+    public function registerRule(Request $request, \App\Services\Enterprise\EnterpriseCapacityService $capacity)
     {
         if (!$this->requireConfirm($request)) {
             return $this->fail([422, 'write operations require confirm=true']);
@@ -195,6 +197,15 @@ class EnterpriseInventoryController extends Controller
             'target_port' => 'required|integer|min:1|max:65535',
             'provider_rule_ref' => 'nullable|string|max:255',
         ]);
+        // Capacity guardrail (D06 §6.3): csmzzmb registrations stop at the
+        // stop threshold; the warn threshold raises its alert via evaluate().
+        if ($params['provider'] === EnterprisePurpose::PROVIDER_CSMZZMB) {
+            try {
+                $capacity->assertCanRegister();
+            } catch (\Throwable $e) {
+                return $this->fail([422, $e->getMessage()]);
+            }
+        }
         $exists = EnterpriseInventoryRule::where('provider', $params['provider'])
             ->where('public_entry_port', $params['public_entry_port'])
             ->exists();
@@ -205,6 +216,9 @@ class EnterpriseInventoryController extends Controller
             ...$params,
             'status' => EnterpriseInventoryRule::STATUS_READY,
         ]);
+        if ($params['provider'] === EnterprisePurpose::PROVIDER_CSMZZMB) {
+            $capacity->evaluate();
+        }
         return $this->success($rule);
     }
 

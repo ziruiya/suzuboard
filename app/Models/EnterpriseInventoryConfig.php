@@ -7,6 +7,9 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class EnterpriseInventoryConfig extends Model
 {
+    /** D03: every SKU keeps this many READY kits in stock. */
+    public const DEFAULT_TARGET_LEVEL = 3;
+
     protected $table = 'suzu_enterprise_inventory_config';
     protected $guarded = ['id'];
     protected $casts = [

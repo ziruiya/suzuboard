@@ -49,6 +49,7 @@ class UserRoute
             $router->get('/plan/fetch', [PlanController::class, 'fetch']);
             // Enterprise dedicated lines (SB-ENT-INV-01)
             $router->get('/enterprise/lines', [EnterpriseLineController::class, 'lines']);
+            $router->get('/enterprise/catalog', [EnterpriseLineController::class, 'catalog']);
             // Invite
             $router->get('/invite/save', [InviteController::class, 'save']);
             $router->get('/invite/fetch', [InviteController::class, 'fetch']);

@@ -17,6 +17,7 @@ class EnterpriseReplenishmentService
     public function __construct(
         private EnterpriseInventoryService $inventory,
         private EnterpriseKitBuilderService $builder,
+        private ?EnterpriseCapacityService $capacity = null,
     ) {
     }
 
@@ -28,6 +29,12 @@ class EnterpriseReplenishmentService
         if (!$purpose->blueprintComplete()) {
             EnterpriseInventoryAlert::raise($purpose->id, null, EnterpriseInventoryAlert::TYPE_BLUEPRINT_INCOMPLETE, "Purpose {$purpose->code} blueprint is incomplete; replenishment skipped");
             return null;
+        }
+        // Capacity guardrail surfacing (D06 §6.3): replenishment runs are a
+        // natural checkpoint for the csmzzmb occupancy alerts. Read-only —
+        // building consumes registered rules and never changes occupancy.
+        if ($purpose->entry_provider === EnterprisePurpose::PROVIDER_CSMZZMB) {
+            ($this->capacity ?? app(EnterpriseCapacityService::class))->evaluate();
         }
         $target = $this->inventory->targetLevel($purpose->id);
         $ready = $this->inventory->refreshLevel($purpose->id);

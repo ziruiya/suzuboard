@@ -25,6 +25,8 @@ class EnterpriseInventoryAlert extends Model
     public const TYPE_HEALTH_QUARANTINED = 'health_quarantined';
     public const TYPE_DNS_ALIAS_PENDING = 'dns_alias_pending';
     public const TYPE_DELIVERY_VERIFY_FAILED = 'delivery_verify_failed';
+    public const TYPE_RULE_CAPACITY_WARN = 'rule_capacity_warn';
+    public const TYPE_RULE_CAPACITY_STOP = 'rule_capacity_stop';
     public const TYPE_STOCK_LOW = 'stock_low';
 
     public static function raise(?int $purposeId, ?int $kitId, string $type, string $message): self

@@ -42,7 +42,7 @@ class EnterpriseInventoryService
 
     public function targetLevel(int $purposeId): int
     {
-        return (int) (EnterpriseInventoryConfig::where('purpose_id', $purposeId)->value('target_level') ?? 3);
+        return (int) (EnterpriseInventoryConfig::where('purpose_id', $purposeId)->value('target_level') ?? EnterpriseInventoryConfig::DEFAULT_TARGET_LEVEL);
     }
 
     /** Kits that count toward the stock target (being built or ready to hand out). */
