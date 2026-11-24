@@ -99,7 +99,7 @@ return new class extends Migration {
             $table->string('status', 16)->default('READY');            // READY | IN_USE | RESERVED | DISABLED
             $table->timestamps();
 
-            $table->unique(['provider', 'public_entry_port']);
+            $table->unique(['provider', 'public_entry_port'], 'ent_rules_provider_port_unique');
             $table->index(['purpose_id', 'status']);
             $table->index('kit_id');
         });
@@ -137,7 +137,7 @@ return new class extends Migration {
             $table->dateTime('captured_at');
             $table->timestamps();
 
-            $table->unique(['kit_id', 'server_id', 'contract_version']);
+            $table->unique(['kit_id', 'server_id', 'contract_version'], 'ent_snap_kit_server_ver_unique');
             $table->index('kit_id');
         });
 
