@@ -1151,6 +1151,11 @@ window.XBOARD_TRANSLATIONS['zh-CN'] = {
         "current_format": "当前订阅路径格式：{path}/xxxxxxxxxx",
         "restart_tip": "修改订阅路径后，可能需要重启服务才能生效。"
       },
+      "subscribe_update_interval": {
+        "title": "订阅自动更新间隔（小时）",
+        "placeholder": "6",
+        "description": "Clash 类客户端自动重新拉取订阅的间隔，范围 1–72 小时，修改后下一次订阅请求即生效。"
+      },
       "show_info_to_server": {
         "title": "在订阅中展示订阅信息",
         "description": "开启后将会在用户订阅节点时输出订阅信息。"

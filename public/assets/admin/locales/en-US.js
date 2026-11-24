@@ -1241,6 +1241,11 @@ window.XBOARD_TRANSLATIONS['en-US'] = {
         "current_format": "Current subscription path format: {path}/xxxxxxxxxx",
         "restart_tip": "You may need to restart the service for the new subscribe path to take effect."
       },
+      "subscribe_update_interval": {
+        "title": "Subscription Auto-Update Interval (hours)",
+        "placeholder": "6",
+        "description": "How often Clash-family clients re-fetch the subscription. Range 1–72 hours; takes effect on the next subscription request."
+      },
       "show_info_to_server": {
         "title": "Show Subscription Info in Nodes",
         "description": "When enabled, subscription information will be output when users subscribe to nodes."

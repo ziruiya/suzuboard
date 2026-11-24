@@ -46,6 +46,7 @@ class ConfigSave extends FormRequest
         'show_info_to_server_enable' => '',
         'show_protocol_to_server_enable' => '',
         'subscribe_path' => '',
+        'subscribe_update_interval_hours' => 'integer|min:1|max:72',
         // server
         'server_token' => 'nullable|min:16',
         'server_pull_interval' => 'integer',
@@ -137,6 +138,9 @@ class ConfigSave extends FormRequest
             'secure_path.min' => '后台路径长度最小为8位',
             'secure_path.regex' => '后台路径只能为字母或数字',
             'captcha_type.in' => '人机验证类型只能选择 recaptcha、turnstile 或 recaptcha-v3',
+            'subscribe_update_interval_hours.integer' => '订阅自动更新间隔必须为整数（小时）',
+            'subscribe_update_interval_hours.min' => '订阅自动更新间隔不能小于1小时',
+            'subscribe_update_interval_hours.max' => '订阅自动更新间隔不能大于72小时',
             'recaptcha_v3_score_threshold.numeric' => 'reCAPTCHA v3 分数阈值必须为数字',
             'recaptcha_v3_score_threshold.min' => 'reCAPTCHA v3 分数阈值不能小于0',
             'recaptcha_v3_score_threshold.max' => 'reCAPTCHA v3 分数阈值不能大于1'

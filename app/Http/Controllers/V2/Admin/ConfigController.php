@@ -4,7 +4,9 @@ namespace App\Http\Controllers\V2\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\ConfigSave;
+use App\Models\AdminAuditLog;
 use App\Models\SubscribeTemplate;
+use App\Services\SubscribeUpdateIntervalService;
 use App\Services\MailService;
 use App\Services\TelegramService;
 use App\Services\ThemeService;
@@ -130,6 +132,7 @@ class ConfigController extends Controller
                 'default_remind_expire' => (bool) admin_setting('default_remind_expire', 1),
                 'default_remind_traffic' => (bool) admin_setting('default_remind_traffic', 1),
                 'subscribe_path' => admin_setting('subscribe_path', 's'),
+                'subscribe_update_interval_hours' => app(SubscribeUpdateIntervalService::class)->hours(),
             ],
             'frontend' => [
                 'frontend_theme' => admin_setting('frontend_theme', 'Xboard'),
@@ -212,6 +215,15 @@ class ConfigController extends Controller
     {
         $data = $request->validated();
 
+        // SB-SUB-INTERVAL v1.0: capture the effective interval before the
+        // save so the change can be audited with old/new values. Invalid
+        // values never reach this point (ConfigSave validation rejects
+        // them and the running value stays untouched).
+        $intervalOldValue = null;
+        if (array_key_exists(SubscribeUpdateIntervalService::SETTING_KEY, $data)) {
+            $intervalOldValue = app(SubscribeUpdateIntervalService::class)->hours();
+        }
+
         $templateKeys = [
             'subscribe_template_singbox' => 'singbox',
             'subscribe_template_clash' => 'clash',
@@ -231,6 +243,28 @@ class ConfigController extends Controller
                 $themeService->switch($v);
             }
             admin_setting([$k => $v]);
+        }
+
+        if ($intervalOldValue !== null) {
+            try {
+                AdminAuditLog::insert([
+                    'admin_id' => $request->user()?->id,
+                    'action' => 'config.subscribe_update_interval',
+                    'method' => $request->method(),
+                    'uri' => $request->getRequestUri(),
+                    'request_data' => json_encode([
+                        'key' => SubscribeUpdateIntervalService::SETTING_KEY,
+                        'old_value' => $intervalOldValue,
+                        'new_value' => (int) $data[SubscribeUpdateIntervalService::SETTING_KEY],
+                        'result' => 'applied',
+                    ], JSON_UNESCAPED_UNICODE),
+                    'ip' => $request->getClientIp(),
+                    'created_at' => time(),
+                    'updated_at' => time(),
+                ]);
+            } catch (\Throwable $e) {
+                \Log::warning('Subscribe interval audit write failed: ' . $e->getMessage());
+            }
         }
 
         return $this->success(true);
