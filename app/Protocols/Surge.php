@@ -55,7 +55,14 @@ class Surge extends AbstractProtocol
                 $proxies .= self::buildVmess($item['password'], $item);
                 $proxyGroup .= $item['name'] . ', ';
             }
-            if ($item['type'] === Server::TYPE_TROJAN) {
+            // AUD-033: Surge supports gRPC for VLESS only; a Trojan+gRPC
+            // node rendered as plain Trojan is a permanently broken line,
+            // so it is omitted from this client's config (the same
+            // treatment this codebase gives every unsupported combination).
+            if (
+                $item['type'] === Server::TYPE_TROJAN
+                && data_get($item, 'protocol_settings.network') !== 'grpc'
+            ) {
                 $proxies .= self::buildTrojan($item['password'], $item);
                 $proxyGroup .= $item['name'] . ', ';
             }

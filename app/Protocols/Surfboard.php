@@ -54,7 +54,14 @@ class Surfboard extends AbstractProtocol
                 // [Proxy Group]
                 $proxyGroup .= $item['name'] . ', ';
             }
-            if ($item['type'] === Server::TYPE_TROJAN) {
+            // AUD-033: Surfboard explicitly does not support Trojan
+            // gRPC; rendering it as plain Trojan would produce a
+            // permanently broken line, so it is omitted from this
+            // client's config instead of being silently degraded.
+            if (
+                $item['type'] === Server::TYPE_TROJAN
+                && data_get($item, 'protocol_settings.network') !== 'grpc'
+            ) {
                 // [Proxy]
                 $proxies .= self::buildTrojan($item['password'], $item);
                 // [Proxy Group]

@@ -184,6 +184,15 @@ class QuantumultX extends AbstractProtocol
     public static function buildTrojan($password, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        // AUD-032: Quantumult X cannot express Trojan over gRPC (its
+        // Trojan transports are TCP/WebSocket only; gRPC exists only for
+        // VMess). Rendering the node as plain Trojan would hand users a
+        // permanently broken line, so — like every other unsupported
+        // combination in this codebase — the node is omitted from this
+        // client's config instead of being silently degraded.
+        if (data_get($protocol_settings, 'network') === 'grpc') {
+            return '';
+        }
         $addr = Helper::wrapIPv6($server['host']);
         $config = [
             "trojan={$addr}:{$server['port']}",

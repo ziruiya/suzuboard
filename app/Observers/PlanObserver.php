@@ -13,7 +13,11 @@ class PlanObserver
      */
     public function updated(Plan $plan): void
     {
-        if (!$plan->isDirty('reset_traffic_method')) {
+        // AUD-037: `updated` fires after the model has been persisted and
+        // its original attributes synced, so isDirty() is always false
+        // here and the reset below could never run. wasChanged() is the
+        // post-save check.
+        if (!$plan->wasChanged('reset_traffic_method')) {
             return;
         }
         $trafficResetService = app(TrafficResetService::class);

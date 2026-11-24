@@ -12,6 +12,41 @@ use Illuminate\Support\Facades\Redis;
 class NodeSyncService
 {
     /**
+     * AUD-035: Redis set of node ids whose agent-side user list may be
+     * stale. The pub/sub pushes below are fire-and-forget: a delta issued
+     * while a node is offline (or while the publish itself fails) is
+     * lost. Every user-affecting notify therefore also records the node
+     * here, and the `suzu:node-resync` command (every minute) re-pushes
+     * the full user list — built from the database, the source of truth —
+     * to any marked node that is online, then clears the mark. The
+     * instant push behaviour is unchanged; this is only the safety net
+     * behind it (node reconnects already trigger a full sync as well).
+     */
+    public const USERS_RESYNC_PENDING_KEY = 'node:users_resync_pending';
+
+    public static function markUsersResyncPending(int $nodeId): void
+    {
+        try {
+            Redis::sadd(self::USERS_RESYNC_PENDING_KEY, $nodeId);
+        } catch (\Throwable $e) {
+            Log::warning("[NodePush] Redis resync mark failed: {$e->getMessage()}", [
+                'node_id' => $nodeId,
+            ]);
+        }
+    }
+
+    public static function clearUsersResyncPending(int $nodeId): void
+    {
+        try {
+            Redis::srem(self::USERS_RESYNC_PENDING_KEY, $nodeId);
+        } catch (\Throwable $e) {
+            Log::warning("[NodePush] Redis resync clear failed: {$e->getMessage()}", [
+                'node_id' => $nodeId,
+            ]);
+        }
+    }
+
+    /**
      * Check if node has active WS connection
      */
     public static function isNodeOnline(int $nodeId): bool
@@ -46,6 +81,7 @@ class NodeSyncService
             ->get();
 
         foreach ($servers as $server) {
+            self::markUsersResyncPending($server->id);
             if (!self::isNodeOnline($server->id))
                 continue;
 
@@ -64,6 +100,7 @@ class NodeSyncService
 
         $servers = Server::whereJsonContains('group_ids', (string) $user->group_id)->get();
         foreach ($servers as $server) {
+            self::markUsersResyncPending($server->id);
             if (!self::isNodeOnline($server->id))
                 continue;
 
@@ -97,6 +134,7 @@ class NodeSyncService
             ->get();
 
         foreach ($servers as $server) {
+            self::markUsersResyncPending($server->id);
             if (!self::isNodeOnline($server->id))
                 continue;
 
