@@ -4,6 +4,8 @@ namespace Tests\Unit\Plugins;
 
 use App\Models\Order;
 use App\Models\Payment;
+use App\Models\Plan;
+use App\Models\ServerGroup;
 use App\Models\User;
 use App\Services\TelegramService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -47,10 +49,22 @@ class TelegramPaymentNotifyTest extends TestCase
             'created_at' => time(),
             'updated_at' => time(),
         ]);
+        $group = new ServerGroup;
+        $group->name = '企业专用';
+        $group->save();
+        $plan = Plan::create([
+            'group_id' => $group->id,
+            'transfer_enable' => 200,
+            'name' => '业务-企业专用套餐',
+            'show' => true,
+            'sell' => 1,
+            'renew' => true,
+            'prices' => ['monthly' => 99],
+        ]);
         $order = Order::create([
             'user_id' => $user->id,
             'payment_id' => $payment->id,
-            'plan_id' => 1,
+            'plan_id' => $plan->id,
             'type' => Order::TYPE_NEW_PURCHASE,
             'period' => \App\Models\Plan::PERIOD_MONTHLY,
             'trade_no' => '2026112411112628789914318',
@@ -84,6 +98,7 @@ class TelegramPaymentNotifyTest extends TestCase
         $this->assertStringContainsString('支付接口：EPay', $captured);
         $this->assertStringContainsString('支付渠道：微信支付', $captured);
         $this->assertStringContainsString('本站订单：`2026112411112628789914318`', $captured);
+        $this->assertStringContainsString('购买套餐：业务-企业专用套餐', $captured);
         $this->assertStringContainsString("用户编号：{$user->id}", $captured);
         $this->assertStringContainsString('用户账号：buyer@example.com', $captured);
     }
@@ -124,5 +139,72 @@ class TelegramPaymentNotifyTest extends TestCase
         $prop->setValue($plugin, $service);
 
         $plugin->sendPaymentNotify($order);
+    }
+
+    public function test_payment_notify_falls_back_when_plan_missing(): void
+    {
+        $user = User::create([
+            'email' => 'noplan@example.com',
+            'password' => 'password',
+            'uuid' => '00000000-0000-0000-0000-000000000102',
+            'token' => 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'balance' => 0,
+            'commission_balance' => 0,
+            'transfer_enable' => 0,
+            'u' => 0,
+            'd' => 0,
+            'banned' => 0,
+            'is_admin' => 0,
+            'is_staff' => 0,
+            'expired_at' => 0,
+            'remind_expire' => 1,
+            'remind_traffic' => 1,
+            'created_at' => time(),
+            'updated_at' => time(),
+        ]);
+        $payment = Payment::create([
+            'uuid' => '00000000000000000000000000000202',
+            'config' => '{}',
+            'payment' => 'EPay',
+            'name' => '微信支付',
+            'enable' => 1,
+            'created_at' => time(),
+            'updated_at' => time(),
+        ]);
+        $order = Order::create([
+            'user_id' => $user->id,
+            'payment_id' => $payment->id,
+            'plan_id' => 999999,
+            'type' => Order::TYPE_NEW_PURCHASE,
+            'period' => \App\Models\Plan::PERIOD_MONTHLY,
+            'trade_no' => 'orphan-plan-order-1',
+            'total_amount' => 100,
+            'balance_amount' => 0,
+            'status' => Order::STATUS_COMPLETED,
+            'commission_status' => 0,
+            'commission_balance' => 0,
+            'created_at' => time(),
+            'updated_at' => time(),
+        ]);
+
+        $captured = null;
+        $service = $this->createMock(TelegramService::class);
+        $service->expects($this->once())
+            ->method('sendMessageWithAdmin')
+            ->with($this->callback(function ($message) use (&$captured) {
+                $captured = $message;
+                return true;
+            }), true);
+
+        $plugin = new Plugin('Telegram');
+        $prop = new \ReflectionProperty(Plugin::class, 'telegramService');
+        $prop->setAccessible(true);
+        $prop->setValue($plugin, $service);
+
+        $plugin->sendPaymentNotify($order);
+
+        $this->assertNotNull($captured);
+        $this->assertStringContainsString('购买套餐：未知套餐', $captured);
+        $this->assertStringContainsString('用户账号：noplan@example.com', $captured);
     }
 }

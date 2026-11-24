@@ -57,18 +57,22 @@ class Plugin extends AbstractPlugin
       return;
     }
 
+    $plan = $order->plan;
+
     $message = sprintf(
       "💰成功收款%s元\n" .
       "———————————————\n" .
       "支付接口：%s\n" .
       "支付渠道：%s\n" .
       "本站订单：`%s`\n" .
+      "购买套餐：%s\n" .
       "用户编号：%s\n" .
       "用户账号：%s",
       $order->total_amount / 100,
       Helper::escapeMarkdown($payment->payment),
       Helper::escapeMarkdown($payment->name),
       $order->trade_no,
+      $plan ? Helper::escapeMarkdown($plan->name) : '未知套餐',
       $order->user_id,
       Helper::escapeMarkdown($user->email)
     );
