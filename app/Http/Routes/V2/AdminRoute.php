@@ -286,6 +286,24 @@ class AdminRoute
                 $router->get('/intents', [EnterpriseInventoryController::class, 'intents']);
             });
 
+            // Business plans batch 3: dedicated-VPS fulfilment queue
+            // (「待处理订单」). Writes require confirm=true, like the other
+            // suzu admin surfaces.
+            $router->group([
+                'prefix' => 'suzu/machine-fulfillment'
+            ], function ($router) {
+                $c = \App\Http\Controllers\V2\Admin\MachineFulfillmentController::class;
+                $router->get('/queue', [$c, 'queue']);
+                $router->get('/{id}', [$c, 'show'])->where('id', '[0-9]+');
+                $router->post('/{id}/start-purchase', [$c, 'startPurchase'])->where('id', '[0-9]+');
+                $router->post('/{id}/mark-blocked', [$c, 'markBlocked'])->where('id', '[0-9]+');
+                $router->post('/{id}/backfill-ip', [$c, 'backfillIp'])->where('id', '[0-9]+');
+                $router->post('/{id}/retry-verify', [$c, 'retryVerify'])->where('id', '[0-9]+');
+                $router->post('/{id}/suspend', [$c, 'suspend'])->where('id', '[0-9]+');
+                $router->post('/{id}/resume', [$c, 'resume'])->where('id', '[0-9]+');
+                $router->post('/{id}/reclaim-step', [$c, 'reclaimStep'])->where('id', '[0-9]+');
+            });
+
             // Suzu Relay (SB-RELAY-01): native relay machines, rules, config outbox
             $router->group([
                 'prefix' => 'suzu/relay'

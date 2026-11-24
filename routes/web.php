@@ -103,6 +103,14 @@ Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path
     ]);
 });
 
+// Business plans batch 3: dedicated-VPS 待处理订单 admin page (data via the V2 admin API)
+Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key')))) . '/suzu-machine-orders', function () {
+    return view('admin.machine-fulfillment', [
+        'title' => admin_setting('app_name', 'XBoard'),
+        'secure_path' => admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key'))))
+    ]);
+});
+
 Route::get('/' . (admin_setting('subscribe_path', 's')) . '/{token}', [\App\Http\Controllers\V1\Client\ClientController::class, 'subscribe'])
     ->middleware('client')
     ->name('client.subscribe');

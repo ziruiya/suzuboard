@@ -18,3 +18,12 @@
 .suzu-ent-row { display: flex; gap: 12px; padding: 3px 0; flex-wrap: wrap; }
 .suzu-ent-label { width: 64px; color: #9a3412; font-weight: 600; flex: none; }
 .suzu-ent-addr { color: #2563eb; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.suzu-biz-btn {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  background: #FF9F0A; color: #fff; border: 1px solid #FF9F0A; font-weight: 600;
+}
+.suzu-biz-btn:disabled { background: #e5e7eb; color: #6b7280; border-color: #e5e7eb; cursor: not-allowed; }
+.suzu-biz-msg { color: #9a3412; min-height: 18px; }
+#suzu-biz-region select, #suzu-biz-card select {
+  font-size: 13px; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff;
+}

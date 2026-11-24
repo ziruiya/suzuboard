@@ -88,13 +88,16 @@ class Plan extends Model
         'sell',
         'device_limit',
         'tags',
-        'enterprise_purpose_required'
+        'enterprise_purpose_required',
+        'business_tier',
+        'machine_region_required'
     ];
 
     protected $casts = [
         'show' => 'boolean',
         'renew' => 'boolean',
         'enterprise_purpose_required' => 'boolean',
+        'machine_region_required' => 'boolean',
         'created_at' => 'timestamp',
         'updated_at' => 'timestamp',
         'group_id' => 'integer',

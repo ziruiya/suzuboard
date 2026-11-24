@@ -20,7 +20,10 @@ class OrderSave extends FormRequest
             // Model A two-level selection (region -> usage); the pair is
             // composed into the single enterprise_purpose SKU before submit.
             'enterprise_region' => 'nullable|string|max:8',
-            'enterprise_usage' => 'nullable|string|max:16'
+            'enterprise_usage' => 'nullable|string|max:16',
+            // Business plans batch 3: the dedicated-VPS plan requires one
+            // region at checkout; it is snapshotted onto the order.
+            'machine_region' => 'nullable|string|max:8'
         ];
     }
 

@@ -29,6 +29,8 @@ class OrderService
     public $user;
     /** SB-ENT-INV-01: result of the enterprise assignment run inside open(). */
     public $enterpriseOpenResult;
+    /** Business plans batch 3: fulfilment advanced/restored inside open(). */
+    public $machineOpenResult;
 
     public function __construct(Order $order)
     {
@@ -66,6 +68,7 @@ class OrderService
         string $period,
         ?string $couponCode = null,
         ?string $enterprisePurposeCode = null,
+        ?string $machineRegionCode = null,
     ): Order {
         $userService = app(UserService::class);
         $planService = new PlanService($plan);
@@ -73,7 +76,7 @@ class OrderService
         $planService->validatePurchase($user, $period);
         HookManager::call('order.create.before', [$user, $plan, $period, $couponCode]);
 
-        return DB::transaction(function () use ($user, $plan, $period, $couponCode, $userService, $enterprisePurposeCode) {
+        return DB::transaction(function () use ($user, $plan, $period, $couponCode, $userService, $enterprisePurposeCode, $machineRegionCode) {
             $user = User::lockForUpdate()->find($user->id);
             if (!$user) {
                 throw new ApiException(__('The user does not exist'));
@@ -138,6 +141,27 @@ class OrderService
                     ->holdForOrder($order, $purpose, $user);
             }
 
+            // Business plans batch 3: the dedicated-VPS plan cannot become
+            // a payable order without a region. The region is snapshotted
+            // onto the order (immutable) and the fulfilment record is born
+            // in WAITING_PAYMENT inside the same transaction.
+            if ($plan->machine_region_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
+                $region = \App\Services\Machine\MachineRegionCatalog::normalize($machineRegionCode);
+                if (!$region) {
+                    // Renewals inherit the region of the active fulfilment.
+                    $active = app(\App\Services\Machine\MachineFulfillmentService::class)
+                        ->activeForUser((int) $user->id, (int) $plan->id);
+                    $region = $active?->region_code;
+                }
+                if (!$region) {
+                    throw new ApiException(__('Please select a region for the dedicated-VPS plan'));
+                }
+                $order->machine_region_code = $region;
+                $order->save();
+                app(\App\Services\Machine\MachineFulfillmentService::class)
+                    ->createForOrder($order, $plan, $region, $user);
+            }
+
             HookManager::call('order.create.after', $order);
             // 兼容旧钩子
             HookManager::call('order.after_create', $order);
@@ -187,6 +211,15 @@ class OrderService
                     ->assignWithinOpen($order, $this->user, $plan);
             }
 
+            // Business plans batch 3: same pattern for the dedicated-VPS
+            // plan — advance the fulfilment's SLA clock on payment and
+            // restore the dedicated machine group on renewals (buyByPeriod
+            // just overwrote it with the plan's template group).
+            if ($plan->machine_region_required || $order->machine_region_code) {
+                $this->machineOpenResult = app(\App\Services\Machine\MachineFulfillmentService::class)
+                    ->assignWithinOpen($order, $this->user, $plan);
+            }
+
             $this->setSpeedLimit($plan->speed_limit);
             $this->setDeviceLimit($plan->device_limit);
 
@@ -215,6 +248,11 @@ class OrderService
             app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
                 ->afterOpenCommitted($this->enterpriseOpenResult);
             $this->enterpriseOpenResult = null;
+            // Tier exclusivity (D06): the kit assignment above is instantly
+            // usable, so a DELIVERED machine fulfilment is superseded now
+            // (48h retention, then reclaim) — never before this moment.
+            app(\App\Services\Machine\MachineFulfillmentService::class)
+                ->supersedeActiveMachine($this->user, 'customer switched to the dedicated-port tier');
         }
 
         $eventId = match ((int) $order->type) {
@@ -440,6 +478,11 @@ class OrderService
                 app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
                     ->releaseHold($intent, 'order cancelled');
             }
+
+            // Business plans batch 3: an unpaid machine order cancels its
+            // WAITING_PAYMENT fulfilment with it.
+            app(\App\Services\Machine\MachineFulfillmentService::class)
+                ->cancelForOrder($cancelledOrder);
 
             HookManager::call('order.cancel.after', $cancelledOrder);
             return true;

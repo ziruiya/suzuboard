@@ -50,6 +50,13 @@ class UserRoute
             // Enterprise dedicated lines (SB-ENT-INV-01)
             $router->get('/enterprise/lines', [EnterpriseLineController::class, 'lines']);
             $router->get('/enterprise/catalog', [EnterpriseLineController::class, 'catalog']);
+            // Business plans batch 3: two-tier member-center surface —
+            // machine region catalog, business status, 「更换端口」 and the
+            // SLA-overdue choice for dedicated-VPS fulfilments.
+            $router->get('/business/machine-regions', [\App\Http\Controllers\V1\User\BusinessController::class, 'machineRegions']);
+            $router->get('/business/status', [\App\Http\Controllers\V1\User\BusinessController::class, 'status']);
+            $router->post('/business/rotate-port', [\App\Http\Controllers\V1\User\BusinessController::class, 'rotatePort']);
+            $router->post('/business/choice', [\App\Http\Controllers\V1\User\BusinessController::class, 'choice']);
             // Invite
             $router->get('/invite/save', [InviteController::class, 'save']);
             $router->get('/invite/fetch', [InviteController::class, 'fetch']);

@@ -94,7 +94,8 @@ class OrderController extends Controller
             $plan,
             $request->input('period'),
             $request->input('coupon_code'),
-            $purposeCode
+            $purposeCode,
+            $request->input('machine_region')
         );
 
         return $this->success($order->trade_no);
