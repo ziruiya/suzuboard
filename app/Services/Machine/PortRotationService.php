@@ -30,18 +30,6 @@ use Illuminate\Support\Facades\DB;
  * once lines live on the in-panel relay, so no sold assignment can be
  * in that state.
  */
-class PortRotationException extends \RuntimeException
-{
-}
-
-class PortRotationCooldownException extends PortRotationException
-{
-    public function __construct(public int $remainingSeconds)
-    {
-        parent::__construct('Port rotation is on cooldown; try again in ' . (int) ceil($remainingSeconds / 60) . ' minutes');
-    }
-}
-
 class PortRotationService
 {
     public const COOLDOWN_SECONDS = 7200; // D08: once per 2 hours

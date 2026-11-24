@@ -341,6 +341,22 @@ class MachineFulfillmentFlowTest extends MachineTestCase
         $this->assertSame($count, Plan::where('name', '业务套餐-独享整机')->count(), 'seed is idempotent');
     }
 
+    /**
+     * Regression (v1.3.0 production find): the production container
+     * binding MachineNodeProbe -> TcpMachineNodeProbe must autoload —
+     * the implementation lives in its own PSR-4 file.
+     */
+    public function test_production_probe_binding_resolves(): void
+    {
+        $this->app->forgetInstance(\App\Services\Machine\MachineNodeProbe::class);
+        $probe = app(\App\Services\Machine\MachineNodeProbe::class);
+        $this->assertInstanceOf(\App\Services\Machine\TcpMachineNodeProbe::class, $probe);
+        $this->assertInstanceOf(
+            \App\Services\Machine\MachineFulfillmentService::class,
+            app(\App\Services\Machine\MachineFulfillmentService::class)
+        );
+    }
+
     /** PURCHASE_BLOCKED is reachable and recoverable by the admin. */
     public function test_purchase_blocked_and_recovery(): void
     {
