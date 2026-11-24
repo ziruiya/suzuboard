@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\EnterpriseInventoryAlert;
 use App\Models\EnterpriseInventoryKit;
+use App\Models\EnterpriseInventoryLog;
 use App\Models\EnterpriseOrderIntent;
 use App\Services\Enterprise\EnterpriseInventoryHealthService;
 use Illuminate\Bus\Queueable;
@@ -19,6 +20,12 @@ use Illuminate\Queue\SerializesModels;
  * DELIVERED; failure raises an ops alert (the customer keeps the lines —
  * verification failure is an ops problem, not a reason to roll back a
  * completed order).
+ *
+ * Verification is retried with increasing backoff over a bounded window:
+ * right after assignment the agent may not have synced the kit's nodes
+ * yet, and a single immediate probe misjudges that lag as a delivery
+ * failure. Only when every attempt in the window has failed is the
+ * delivery declared failed (fail-closed semantics unchanged).
  */
 class EnterpriseDeliveryVerifyJob implements ShouldQueue
 {
@@ -37,13 +44,28 @@ class EnterpriseDeliveryVerifyJob implements ShouldQueue
         if (!$kit || !$intent) {
             return;
         }
-        $result = $health->verifyDelivery($kit);
-        if ($result['ok']) {
-            if ($intent->status === EnterpriseOrderIntent::STATUS_RESERVED) {
-                $intent->status = EnterpriseOrderIntent::STATUS_DELIVERED;
-                $intent->save();
+        $backoff = array_map('intval', (array) config('suzu_enterprise.delivery_verify_backoff_seconds', [20, 40, 60, 90]));
+        $maxAttempts = count($backoff) + 1;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $result = $health->verifyDelivery($kit);
+            if ($result['ok']) {
+                if ($intent->status === EnterpriseOrderIntent::STATUS_RESERVED) {
+                    $intent->status = EnterpriseOrderIntent::STATUS_DELIVERED;
+                    $intent->save();
+                }
+                return;
             }
-            return;
+            if ($attempt < $maxAttempts) {
+                $delay = (int) ($backoff[$attempt - 1] ?? 0);
+                EnterpriseInventoryLog::record(
+                    $kit->id,
+                    'delivery.verify.retry',
+                    "delivery verification attempt {$attempt}/{$maxAttempts} failed; retrying in {$delay}s (agent sync may lag)"
+                );
+                if ($delay > 0) {
+                    sleep($delay);
+                }
+            }
         }
         EnterpriseInventoryAlert::raise(
             $kit->purpose_id,

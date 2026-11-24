@@ -207,14 +207,27 @@ class EnterpriseKitBuilderService
 
         $this->inventory->transition($kit, EnterpriseInventoryKit::STATUS_VERIFYING, 'kit.verifying', 'nodes materialized');
         // READY requires three consecutive full passes (health service).
+        // A failed attempt usually means the agent has not picked up the
+        // brand-new nodes yet, not that the kit is bad: retry failures
+        // with increasing backoff instead of abandoning the kit to the
+        // patrol. Passing attempts are never delayed.
         $health = app(EnterpriseInventoryHealthService::class);
-        for ($attempt = 0; $attempt < 3; $attempt++) {
+        $backoff = array_map('intval', (array) config('suzu_enterprise.build_verify_backoff_seconds', [15, 30, 45, 60]));
+        $maxAttempts = count($backoff) + 1;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             $result = $health->verifyKit($kit->fresh(), 'full');
-            if (!$result['ok']) {
-                break;
-            }
             if ($kit->fresh()->status === EnterpriseInventoryKit::STATUS_READY) {
                 break;
+            }
+            if ($result['ok']) {
+                continue;
+            }
+            if ($attempt < $maxAttempts) {
+                $delay = (int) ($backoff[$attempt - 1] ?? 0);
+                EnterpriseInventoryLog::record($kit->id, 'kit.verify.retry', "build verification attempt {$attempt}/{$maxAttempts} failed; retrying in {$delay}s (agent sync may lag)");
+                if ($delay > 0) {
+                    sleep($delay);
+                }
             }
         }
     }
@@ -241,7 +254,7 @@ class EnterpriseKitBuilderService
             'sort' => $isPrimary ? self::SORT_PRIMARY : self::SORT_BACKUP,
             'protocol_settings' => $settings,
             'cert_config' => $purpose->protocol === EnterprisePurpose::PROTOCOL_SW1
-                ? ['cert_mode' => 'dns', 'domain_name' => $alias]
+                ? $this->sw1CertConfig($alias)
                 : null,
         ]);
 
@@ -280,6 +293,82 @@ class EnterpriseKitBuilderService
             'utls' => ['enabled' => true, 'fingerprint' => 'chrome'],
             'multiplex' => ['enabled' => false],
             'encryption' => null,
+        ];
+    }
+
+    /**
+     * Production-shaped SW1 cert_config. The agent's DNS-01 issuance
+     * reads domain / dns_provider / dns_env / email; the shape this
+     * builder used to emit (['cert_mode' => 'dns', 'domain_name' => …])
+     * was silently unusable — the first TRADE kits only got working
+     * certificates after their configs were repaired by hand.
+     *
+     * The shared Cloudflare credential set lives in no setting or env
+     * var: production nodes carry it per-node. Clone the credential
+     * set (dns_provider / dns_env / email) used by the majority of
+     * existing nodes — the same set the manual repair cloned — and
+     * substitute this kit's own alias as the domain.
+     */
+    private function sw1CertConfig(string $alias): array
+    {
+        $config = ['cert_mode' => 'dns', 'domain' => $alias];
+        $reference = $this->certCredentialReference();
+        if ($reference !== null) {
+            $config['dns_provider'] = $reference['dns_provider'];
+            $config['dns_env'] = $reference['dns_env'];
+            $config['email'] = $reference['email'];
+            return $config;
+        }
+        // No credentialed node exists yet (fresh install): keep the
+        // production provider and the configured cert email; dns_env
+        // cannot be invented and stays absent until ops seeds a node.
+        $config['dns_provider'] = 'cloudflare';
+        $email = admin_setting('machine_cert_email');
+        if (!empty($email)) {
+            $config['email'] = $email;
+        }
+        return $config;
+    }
+
+    private ?array $certCredentialReferenceCache = null;
+    private bool $certCredentialReferenceResolved = false;
+
+    /**
+     * The majority credential set among existing nodes with a complete
+     * cert_config, or null when no node carries one.
+     *
+     * @return array{dns_provider: string, dns_env: array, email: string}|null
+     */
+    private function certCredentialReference(): ?array
+    {
+        if ($this->certCredentialReferenceResolved) {
+            return $this->certCredentialReferenceCache;
+        }
+        $this->certCredentialReferenceResolved = true;
+        $groups = [];
+        foreach (Server::whereNotNull('cert_config')->get() as $server) {
+            $cert = $server->cert_config;
+            if (!is_array($cert) || empty($cert['dns_env']) || !is_array($cert['dns_env'])
+                || empty($cert['dns_provider']) || empty($cert['email'])) {
+                continue;
+            }
+            $key = md5(json_encode($cert['dns_env']));
+            $groups[$key] ??= ['count' => 0, 'server_id' => 0, 'cert' => null];
+            $groups[$key]['count']++;
+            if ((int) $server->id > $groups[$key]['server_id']) {
+                $groups[$key]['server_id'] = (int) $server->id;
+                $groups[$key]['cert'] = $cert;
+            }
+        }
+        if (!$groups) {
+            return null;
+        }
+        uasort($groups, fn($a, $b) => ($b['count'] <=> $a['count']) ?: ($b['server_id'] <=> $a['server_id']));
+        $cert = reset($groups)['cert'];
+        return $this->certCredentialReferenceCache = [
+            'dns_provider' => $cert['dns_provider'],
+            'dns_env' => $cert['dns_env'],
+            'email' => $cert['email'],
         ];
     }
 
