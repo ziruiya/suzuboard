@@ -20,6 +20,7 @@ class StatUserJob implements ShouldQueue
     protected array $server;
     protected string $protocol;
     protected string $recordType;
+    protected ?string $batchHash;
 
     public $tries = 3;
     public $timeout = 60;
@@ -36,13 +37,14 @@ class StatUserJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd')
+    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd', ?string $batchHash = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
         $this->server = $server;
         $this->protocol = $protocol;
         $this->recordType = $recordType;
+        $this->batchHash = $batchHash;
     }
 
     public function handle(): void
@@ -51,22 +53,38 @@ class StatUserJob implements ShouldQueue
             ? strtotime(date('Y-m-01'))
             : strtotime(date('Y-m-d'));
 
-        foreach ($this->data as $uid => $v) {
-            try {
-                $this->processUserStat($uid, $v, $recordAt);
-            } catch (\Exception $e) {
-                Log::error('StatUserJob failed for user ' . $uid . ': ' . $e->getMessage());
-                throw $e;
+        // SB-AUD-022: the whole chunk runs in one transaction together
+        // with the batch claim. Previously each user's upsert committed
+        // independently, so a retry after a mid-chunk failure re-added
+        // the users that had already been written (double counting);
+        // now a failure rolls back everything including the claim and
+        // the retry counts the batch exactly once.
+        DB::transaction(function () use ($recordAt) {
+            if ($this->batchHash !== null && !\App\Services\TrafficBatchGuard::claim(
+                $this->batchHash,
+                (int) ($this->server['id'] ?? 0),
+                \App\Services\TrafficBatchGuard::PROCESSOR_STAT_USER
+            )) {
+                return;
             }
-            // PATCH 08: mirror browser-plugin (type=http) node traffic into v2_stat_plugin
-            if (($this->server['type'] ?? null) === 'http') {
+
+            foreach ($this->data as $uid => $v) {
                 try {
-                    $this->processPluginStat((int) $uid, $v, $recordAt);
+                    $this->processUserStat($uid, $v, $recordAt);
                 } catch (\Exception $e) {
-                    Log::error('StatPlugin mirror failed for user ' . $uid . ': ' . $e->getMessage());
+                    Log::error('StatUserJob failed for user ' . $uid . ': ' . $e->getMessage());
+                    throw $e;
+                }
+                // PATCH 08: mirror browser-plugin (type=http) node traffic into v2_stat_plugin
+                if (($this->server['type'] ?? null) === 'http') {
+                    try {
+                        $this->processPluginStat((int) $uid, $v, $recordAt);
+                    } catch (\Exception $e) {
+                        Log::error('StatPlugin mirror failed for user ' . $uid . ': ' . $e->getMessage());
+                    }
                 }
             }
-        }
+        });
     }
 
     protected function processPluginStat(int $uid, array $v, int $recordAt): void
@@ -168,7 +186,7 @@ class StatUserJob implements ShouldQueue
 
         $sql = "INSERT INTO {$table} (user_id, server_rate, record_at, record_type, u, d, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (user_id, server_rate, record_at)
+                ON CONFLICT (user_id, server_rate, record_at, record_type)
                 DO UPDATE SET
                     u = {$table}.u + EXCLUDED.u,
                     d = {$table}.d + EXCLUDED.d,

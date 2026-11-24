@@ -125,9 +125,14 @@ class UserService
 
         $timestamp = strtotime(date('Y-m-d'));
         collect($data)->chunk(1000)->each(function ($chunk) use ($timestamp, $server, $protocol) {
-            TrafficFetchJob::dispatch($server, $chunk->toArray(), $protocol, $timestamp);
-            StatUserJob::dispatch($server, $chunk->toArray(), $protocol, 'd');
-            StatServerJob::dispatch($server, $chunk->toArray(), $protocol, 'd');
+            $chunkData = $chunk->toArray();
+            // SB-AUD-022: the push payload carries no batch id, so derive
+            // one from the content; every processor claims it before
+            // writing and a replayed batch is counted exactly once.
+            $batchHash = TrafficBatchGuard::hashFor((int) ($server['id'] ?? 0), $protocol, $chunkData);
+            TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash);
+            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash);
+            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash);
         });
     }
 

@@ -44,5 +44,13 @@ class ResetLog extends Command
         StatUser::where('record_at', '<', strtotime('-2 month', time()))->delete();
         StatServer::where('record_at', '<', strtotime('-2 month', time()))->delete();
         AdminAuditLog::where('created_at', '<', strtotime('-3 month', time()))->delete();
+        // SB-AUD-022: prune traffic batch dedup markers after 48 hours;
+        // realistic replays (agent retry, queue redelivery) land within
+        // minutes, so the window only needs to cover those.
+        if (\Illuminate\Support\Facades\Schema::hasTable('suzu_traffic_batches')) {
+            \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
+                ->where('created_at', '<', time() - 172800)
+                ->delete();
+        }
     }
 }

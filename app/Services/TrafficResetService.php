@@ -25,32 +25,68 @@ class TrafficResetService
       return false;
     }
 
-    return $this->performReset($user, $triggerSource);
+    // $onlyIfDue: performReset re-checks eligibility under the row lock,
+    // so a second concurrent caller cannot reset the same user twice.
+    return $this->performReset($user, $triggerSource, true);
   }
 
   /**
    * Perform the traffic reset for a user.
    */
-  public function performReset(User $user, string $triggerSource = TrafficResetLog::SOURCE_MANUAL): bool
+  public function performReset(User $user, string $triggerSource = TrafficResetLog::SOURCE_MANUAL, bool $onlyIfDue = false): bool
   {
     try {
-      return DB::transaction(function () use ($user, $triggerSource) {
-        $oldUpload = $user->u ?? 0;
-        $oldDownload = $user->d ?? 0;
+      return DB::transaction(function () use ($user, $triggerSource, $onlyIfDue) {
+        // SB-AUD-023: lock the user row and work from the freshly read
+        // row. Previously the reset read u/d from the caller's possibly
+        // stale in-memory model and wrote absolute zeroes without any
+        // lock: a traffic increment landing in between was silently
+        // wiped (and the reset log recorded values that were never the
+        // real counters), and two concurrent checkAndReset callers
+        // could both reset. With the row locked, increments serialize
+        // against the reset — they are either fully included in the
+        // logged old counters or counted in the new period.
+        $locked = User::where('id', $user->id)->lockForUpdate()->first();
+        if (!$locked) {
+          return false;
+        }
+
+        if ($onlyIfDue && !$locked->shouldResetTraffic()) {
+          return false;
+        }
+
+        $oldUpload = $locked->u ?? 0;
+        $oldDownload = $locked->d ?? 0;
         $oldTotal = $oldUpload + $oldDownload;
 
-        $nextResetTime = $this->calculateNextResetTime($user);
+        $nextResetTime = $this->calculateNextResetTime($locked);
 
-        $user->update([
+        $resetAt = time();
+        $resetCount = ($locked->reset_count ?? 0) + 1;
+        $nextResetAt = $nextResetTime ? $nextResetTime->timestamp : null;
+
+        $locked->update([
           'u' => 0,
           'd' => 0,
-          'last_reset_at' => time(),
-          'reset_count' => $user->reset_count + 1,
-          'next_reset_at' => $nextResetTime ? $nextResetTime->timestamp : null,
+          'last_reset_at' => $resetAt,
+          'reset_count' => $resetCount,
+          'next_reset_at' => $nextResetAt,
+        ]);
+
+        // Mirror the reset fields onto the caller's instance so a later
+        // save() on it cannot resurrect the pre-reset counters. Any
+        // other in-memory changes on the instance (e.g. an order's
+        // surplus credit) are deliberately left untouched.
+        $user->forceFill([
+          'u' => 0,
+          'd' => 0,
+          'last_reset_at' => $resetAt,
+          'reset_count' => $resetCount,
+          'next_reset_at' => $nextResetAt,
         ]);
 
         $this->recordResetLog($user, [
-          'reset_type' => $this->getResetTypeFromPlan($user->plan),
+          'reset_type' => $this->getResetTypeFromPlan($locked->plan),
           'trigger_source' => $triggerSource,
           'old_upload' => $oldUpload,
           'old_download' => $oldDownload,

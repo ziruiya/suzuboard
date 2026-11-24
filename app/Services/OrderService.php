@@ -198,7 +198,7 @@ class OrderService
 
             match ((string) $order->period) {
                 Plan::PERIOD_ONETIME => $this->buyByOneTime($plan),
-                Plan::PERIOD_RESET_TRAFFIC => app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_ORDER),
+                Plan::PERIOD_RESET_TRAFFIC => $this->resetTrafficOrFail(),
                 default => $this->buyByPeriod($order, $plan),
             };
 
@@ -507,6 +507,21 @@ class OrderService
         $this->user->device_limit = $deviceLimit;
     }
 
+    /**
+     * SB-AUD-008: performReset() reports failure by returning false (it
+     * swallows the exception). The order flow must not ignore that: a
+     * purchase whose traffic reset failed must not complete, so turn
+     * the failure into an exception and let the surrounding transaction
+     * roll the whole open back (the order stays PROCESSING and is
+     * retried by the order checker instead of completing half-applied).
+     */
+    private function resetTrafficOrFail(): void
+    {
+        if (!app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_ORDER)) {
+            throw new \RuntimeException('流量重置失败，订单开通中止');
+        }
+    }
+
     private function buyByPeriod(Order $order, Plan $plan)
     {
         // change plan process
@@ -516,7 +531,7 @@ class OrderService
         $this->user->transfer_enable = $plan->transfer_enable * 1073741824;
         // 从一次性转换到循环或者新购的时候，重置流量
         if ($this->user->expired_at === NULL || $order->type === Order::TYPE_NEW_PURCHASE)
-            app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_ORDER);
+            $this->resetTrafficOrFail();
         $this->user->plan_id = $plan->id;
         $this->user->group_id = $plan->group_id;
         $this->user->expired_at = $this->getTime($order->period, $this->user->expired_at);
@@ -524,7 +539,7 @@ class OrderService
 
     private function buyByOneTime(Plan $plan)
     {
-        app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_ORDER);
+        $this->resetTrafficOrFail();
         $this->user->transfer_enable = $plan->transfer_enable * 1073741824;
         $this->user->plan_id = $plan->id;
         $this->user->group_id = $plan->group_id;
@@ -557,7 +572,7 @@ class OrderService
             case 0:
                 break;
             case 1:
-                app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_ORDER);
+                $this->resetTrafficOrFail();
                 break;
         }
     }

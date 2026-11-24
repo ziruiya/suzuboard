@@ -22,6 +22,7 @@ class StatServerJob implements ShouldQueue
     protected array $server;
     protected string $protocol;
     protected string $recordType;
+    protected ?string $batchHash;
 
     public $tries = 3;
     public $timeout = 60;
@@ -38,13 +39,14 @@ class StatServerJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, $protocol, string $recordType = 'd')
+    public function __construct(array $server, array $data, $protocol, string $recordType = 'd', ?string $batchHash = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
         $this->server = $server;
         $this->protocol = $protocol;
         $this->recordType = $recordType;
+        $this->batchHash = $batchHash;
     }
 
     public function handle(): void
@@ -60,8 +62,22 @@ class StatServerJob implements ShouldQueue
         }
 
         try {
-            $this->processServerStat($u, $d, $recordAt);
-            $this->updateServerTraffic($u, $d);
+            // SB-AUD-022: stat write and the server counter increment
+            // commit atomically together with the batch claim; a retry
+            // after a failure between the two writes can no longer
+            // count the stat twice.
+            DB::transaction(function () use ($u, $d, $recordAt) {
+                if ($this->batchHash !== null && !\App\Services\TrafficBatchGuard::claim(
+                    $this->batchHash,
+                    (int) ($this->server['id'] ?? 0),
+                    \App\Services\TrafficBatchGuard::PROCESSOR_STAT_SERVER
+                )) {
+                    return;
+                }
+
+                $this->processServerStat($u, $d, $recordAt);
+                $this->updateServerTraffic($u, $d);
+            });
         } catch (\Exception $e) {
             Log::error('StatServerJob failed for server ' . $this->server['id'] . ': ' . $e->getMessage());
             throw $e;
@@ -154,7 +170,7 @@ class StatServerJob implements ShouldQueue
         // Use parameter binding to avoid SQL injection and keep maintainability
         $sql = "INSERT INTO {$table} (record_at, server_id, server_type, record_type, u, d, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (server_id, server_type, record_at)
+                ON CONFLICT (server_id, server_type, record_at, record_type)
                 DO UPDATE SET
                     u = {$table}.u + EXCLUDED.u,
                     d = {$table}.d + EXCLUDED.d,

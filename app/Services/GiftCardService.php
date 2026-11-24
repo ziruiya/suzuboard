@@ -180,7 +180,13 @@ class GiftCardService
 
         if (isset($rewards['reset_package']) && $rewards['reset_package']) {
             if ($this->user->plan_id) {
-                app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_GIFT_CARD);
+                // SB-AUD-008 (same pattern as OrderService): a failed
+                // reset must not be silently ignored — abort the
+                // redemption so this transaction rolls back and the
+                // card is not consumed without its reset.
+                if (!app(TrafficResetService::class)->performReset($this->user, TrafficResetLog::SOURCE_GIFT_CARD)) {
+                    throw new \RuntimeException('流量重置失败，礼品卡兑换中止');
+                }
             }
         }
 
