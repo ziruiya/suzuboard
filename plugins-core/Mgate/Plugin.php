@@ -5,6 +5,7 @@ namespace Plugin\Mgate;
 use App\Services\Plugin\AbstractPlugin;
 use App\Contracts\PaymentInterface;
 use App\Exceptions\ApiException;
+use App\Utils\MoneyAmount;
 use Curl\Curl;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
@@ -73,7 +74,9 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $curl = new Curl();
         $curl->setUserAgent('MGate');
-        $curl->setOpt(CURLOPT_SSL_VERIFYPEER, 0);
+        // SB-AUD-031: never disable TLS verification on a payment call.
+        $curl->setOpt(CURLOPT_SSL_VERIFYPEER, true);
+        $curl->setOpt(CURLOPT_SSL_VERIFYHOST, 2);
         $curl->post($this->getConfig('mgate_url') . '/v1/gateway/fetch', http_build_query($params));
         $result = $curl->response;
 
@@ -131,9 +134,30 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             return false;
         }
 
+        // SB-AUD-029: a valid signature proves origin, not payment. The
+        // callback must explicitly report a successful final status;
+        // anything else (missing, pending, failed) fails closed.
+        $status = $params['status'] ?? $params['trade_status'] ?? null;
+        $successStatuses = ['SUCCESS', 'TRADE_SUCCESS', 'PAID', 'COMPLETED', '1'];
+        if ((!is_string($status) && !is_int($status))
+            || !in_array(strtoupper((string) $status), $successStatuses, true)) {
+            return false;
+        }
+
+        // SB-AUD-002/030: MGate denominates in integer cents (see pay());
+        // report the echoed amount so the caller can reconcile it.
+        $paidAmountCents = MoneyAmount::cents($params['total_amount'] ?? null);
+        if ($paidAmountCents === null) {
+            return false;
+        }
+
+        $currency = $this->getConfig('mgate_source_currency') ?: 'CNY';
+
         return [
             'trade_no' => $params['out_trade_no'],
-            'callback_no' => $params['trade_no']
+            'callback_no' => $params['trade_no'],
+            'paid_amount_cents' => $paidAmountCents,
+            'paid_currency' => strtoupper((string) $currency)
         ];
     }
 }

@@ -383,7 +383,12 @@ class OrderService
             $orderAmountSum = $orders->sum(fn($item) => $item->total_amount + $item->balance_amount + $item->surplus_amount - $item->surplus_credit);
             $orderMonthSum = $orders->sum(fn($item) => self::STR_TO_TIME[PlanService::getPeriodKey($item->period)] ?? 0);
             $firstOrderAt = $orders->min('created_at');
-            $expiredAt = Carbon::createFromTimestamp($firstOrderAt)->addMonths($orderMonthSum);
+            // SB-AUD-009: the authoritative expiry is the user's real
+            // expired_at. Reconstructing it from historical orders (first
+            // order + summed months) drifts whenever expiry was extended,
+            // shortened or granted outside the order flow, and silently
+            // zeroed the surplus credit in those cases.
+            $expiredAt = Carbon::createFromTimestamp($user->expired_at);
 
             $now = now();
             $totalSeconds = $expiredAt->timestamp - $firstOrderAt;

@@ -4,6 +4,7 @@ namespace Plugin\Epay;
 
 use App\Services\Plugin\AbstractPlugin;
 use App\Contracts\PaymentInterface;
+use App\Utils\MoneyAmount;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
@@ -110,9 +111,20 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             return false;
         }
 
+        // SB-AUD-002/030: the signed callback carries the paid amount in
+        // `money` (major units). Report it in integer cents so the caller
+        // can reconcile it against the order total; a callback without a
+        // well-formed amount fails closed.
+        $paidAmountCents = MoneyAmount::majorToCents($params['money'] ?? null);
+        if ($paidAmountCents === null) {
+            return false;
+        }
+
         return [
             'trade_no' => $params['out_trade_no'],
-            'callback_no' => $params['trade_no']
+            'callback_no' => $params['trade_no'],
+            'paid_amount_cents' => $paidAmountCents,
+            'paid_currency' => 'CNY'
         ];
     }
 }

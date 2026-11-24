@@ -23,7 +23,12 @@ class PaymentController extends Controller
                 return $this->fail([422, 'verify error']);
             }
             HookManager::call('payment.notify.verified', $verify);
-            if (!$this->handle($verify['trade_no'], $verify['callback_no'])) {
+            if (!is_array($verify)) {
+                // Plugins may answer with a plain acknowledgement string
+                // (e.g. CoinPayments "IPN OK: pending"): nothing to handle.
+                return $verify;
+            }
+            if (!$this->handle($verify['trade_no'], $verify['callback_no'], $verify)) {
                 return $this->fail([400, 'handle error']);
             }
             return (isset($verify['custom_result']) ? $verify['custom_result'] : 'success');
@@ -33,7 +38,7 @@ class PaymentController extends Controller
         }
     }
 
-    private function handle($tradeNo, $callbackNo)
+    private function handle($tradeNo, $callbackNo, array $verify = [])
     {
         $order = Order::where('trade_no', $tradeNo)->first();
         if (!$order) {
@@ -41,6 +46,28 @@ class PaymentController extends Controller
         }
         if ($order->status !== Order::STATUS_PENDING)
             return true;
+        // SB-AUD-002/030: when the gateway's verified callback reports the
+        // paid amount, it must reconcile with the order total (integer
+        // cents, orders are CNY-denominated) before the order may
+        // complete. A mismatch fails closed: the order stays PENDING and
+        // a correct callback can still complete it later.
+        if (isset($verify['paid_currency'])
+            && strtoupper((string) $verify['paid_currency']) !== 'CNY') {
+            Log::warning('payment notify currency mismatch', [
+                'trade_no' => $order->trade_no,
+                'paid_currency' => $verify['paid_currency'],
+            ]);
+            return false;
+        }
+        if (isset($verify['paid_amount_cents'])
+            && (int) $verify['paid_amount_cents'] !== (int) $order->total_amount) {
+            Log::warning('payment notify amount mismatch', [
+                'trade_no' => $order->trade_no,
+                'paid_amount_cents' => $verify['paid_amount_cents'],
+                'order_total_amount' => $order->total_amount,
+            ]);
+            return false;
+        }
         $orderService = new OrderService($order);
         if (!$orderService->paid($callbackNo)) {
             return false;

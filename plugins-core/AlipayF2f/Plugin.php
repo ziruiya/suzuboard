@@ -5,6 +5,7 @@ namespace Plugin\AlipayF2f;
 use App\Services\Plugin\AbstractPlugin;
 use App\Contracts\PaymentInterface;
 use App\Exceptions\ApiException;
+use App\Utils\MoneyAmount;
 use Illuminate\Support\Facades\Log;
 use Plugin\AlipayF2f\library\AlipayF2F;
 
@@ -91,9 +92,19 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         try {
             if ($gateway->verify($params)) {
+                // SB-AUD-002/030: report the RSA-verified paid amount so
+                // the caller can reconcile it against the order total; a
+                // verified callback without a well-formed amount fails
+                // closed.
+                $paidAmountCents = MoneyAmount::majorToCents($params['total_amount'] ?? null);
+                if ($paidAmountCents === null) {
+                    return false;
+                }
                 return [
                     'trade_no' => $params['out_trade_no'],
-                    'callback_no' => $params['trade_no']
+                    'callback_no' => $params['trade_no'],
+                    'paid_amount_cents' => $paidAmountCents,
+                    'paid_currency' => 'CNY'
                 ];
             } else {
                 return false;

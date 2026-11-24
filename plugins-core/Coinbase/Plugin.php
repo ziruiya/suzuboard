@@ -5,6 +5,7 @@ namespace Plugin\Coinbase;
 use App\Services\Plugin\AbstractPlugin;
 use App\Contracts\PaymentInterface;
 use App\Exceptions\ApiException;
+use App\Utils\MoneyAmount;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
@@ -90,12 +91,35 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             throw new ApiException('HMAC signature does not match', 400);
         }
 
-        $out_trade_no = $json_param['event']['data']['metadata']['outTradeNo'];
-        $pay_trade_no = $json_param['event']['id'];
-        
+        // SB-AUD-004: a signed webhook proves origin, not settlement.
+        // Only a final charge event may complete an order; created /
+        // pending / delayed / failed events fail closed (Coinbase keeps
+        // retrying, and the final event completes the order later).
+        $eventType = $json_param['event']['type'] ?? null;
+        if (!in_array($eventType, ['charge:confirmed', 'charge:resolved'], true)) {
+            throw new ApiException('charge is not in a final paid state', 400);
+        }
+
+        $out_trade_no = $json_param['event']['data']['metadata']['outTradeNo'] ?? null;
+        $pay_trade_no = $json_param['event']['id'] ?? null;
+        if (!is_string($out_trade_no) || $out_trade_no === '' || !is_string($pay_trade_no) || $pay_trade_no === '') {
+            throw new ApiException('charge payload is incomplete', 400);
+        }
+
+        // SB-AUD-002/030: charges are created in CNY (see pay()); report
+        // the charged local amount for reconciliation against the order.
+        $local = $json_param['event']['data']['pricing']['local'] ?? null;
+        $paidAmountCents = MoneyAmount::majorToCents(is_array($local) ? ($local['amount'] ?? null) : null);
+        if ($paidAmountCents === null
+            || strtoupper((string) ($local['currency'] ?? '')) !== 'CNY') {
+            throw new ApiException('charge amount is not reconcilable', 400);
+        }
+
         return [
             'trade_no' => $out_trade_no,
-            'callback_no' => $pay_trade_no
+            'callback_no' => $pay_trade_no,
+            'paid_amount_cents' => $paidAmountCents,
+            'paid_currency' => 'CNY'
         ];
     }
 

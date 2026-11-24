@@ -5,6 +5,7 @@ namespace Plugin\Btcpay;
 use App\Services\Plugin\AbstractPlugin;
 use App\Contracts\PaymentInterface;
 use App\Exceptions\ApiException;
+use App\Utils\MoneyAmount;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
@@ -99,15 +100,35 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             )
         ));
 
-        $invoiceDetail = file_get_contents($this->getConfig('btcpay_url') . 'api/v1/stores/' . $this->getConfig('btcpay_storeId') . '/invoices/' . $json_param['invoiceId'], false, $context);
-        $invoiceDetail = json_decode($invoiceDetail, true);
+        $invoiceDetailRaw = file_get_contents($this->getConfig('btcpay_url') . 'api/v1/stores/' . $this->getConfig('btcpay_storeId') . '/invoices/' . $json_param['invoiceId'], false, $context);
+        $invoiceDetail = $invoiceDetailRaw === false ? null : json_decode($invoiceDetailRaw, true);
+        if (!is_array($invoiceDetail) || empty($invoiceDetail['metadata']['orderId'])) {
+            throw new ApiException('invoice query failed', 400);
+        }
+
+        // SB-AUD-004: the webhook event alone does not prove settlement;
+        // the fetched invoice must be in its final settled state
+        // (Greenfield "Settled"; legacy "Complete" accepted).
+        if (!in_array($invoiceDetail['status'] ?? null, ['Settled', 'Complete'], true)) {
+            throw new ApiException('invoice is not settled', 400);
+        }
+
+        // SB-AUD-002/030: invoices are created in CNY (see pay()); report
+        // the invoiced amount for reconciliation against the order.
+        $paidAmountCents = MoneyAmount::majorToCents($invoiceDetail['amount'] ?? null);
+        if ($paidAmountCents === null
+            || strtoupper((string) ($invoiceDetail['currency'] ?? '')) !== 'CNY') {
+            throw new ApiException('invoice amount is not reconcilable', 400);
+        }
 
         $out_trade_no = $invoiceDetail['metadata']["orderId"];
         $pay_trade_no = $json_param['invoiceId'];
-        
+
         return [
             'trade_no' => $out_trade_no,
-            'callback_no' => $pay_trade_no
+            'callback_no' => $pay_trade_no,
+            'paid_amount_cents' => $paidAmountCents,
+            'paid_currency' => 'CNY'
         ];
     }
 
