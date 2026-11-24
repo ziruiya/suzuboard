@@ -6,6 +6,7 @@ use App\Http\Controllers\V1\Server\TrojanTidalabController;
 use App\Http\Controllers\V1\Server\UniProxyController;
 use App\Http\Controllers\V2\Server\ServerController;
 use App\Http\Controllers\V2\Server\MachineController;
+use App\Http\Controllers\V2\Server\RelayAgentController;
 use Illuminate\Contracts\Routing\Registrar;
 
 class ServerRoute
@@ -31,6 +32,10 @@ class ServerRoute
         ], function ($route) {
             $route->post('nodes', [MachineController::class, 'nodes']);
             $route->post('status', [MachineController::class, 'status']);
+            // SB-RELAY-01 agent channel (relay.config.v1)
+            $route->post('relay/config', [RelayAgentController::class, 'config']);
+            $route->post('relay/ack', [RelayAgentController::class, 'ack']);
+            $route->post('relay/traffic', [RelayAgentController::class, 'traffic']);
         });
     }
 }

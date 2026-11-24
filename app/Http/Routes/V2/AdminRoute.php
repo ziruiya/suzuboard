@@ -20,6 +20,7 @@ use App\Http\Controllers\V2\Admin\PaymentController;
 use App\Http\Controllers\V2\Admin\SystemController;
 use App\Http\Controllers\V2\Admin\SuzuEndpointController;
 use App\Http\Controllers\V2\Admin\EnterpriseInventoryController;
+use App\Http\Controllers\V2\Admin\RelayController;
 use App\Http\Controllers\V2\Admin\ThemeController;
 use App\Http\Controllers\V2\Admin\TrafficResetController;
 use Illuminate\Contracts\Routing\Registrar;
@@ -283,6 +284,25 @@ class AdminRoute
                 $router->get('/alerts', [EnterpriseInventoryController::class, 'alerts']);
                 $router->post('/alerts/ack', [EnterpriseInventoryController::class, 'ackAlert']);
                 $router->get('/intents', [EnterpriseInventoryController::class, 'intents']);
+            });
+
+            // Suzu Relay (SB-RELAY-01): native relay machines, rules, config outbox
+            $router->group([
+                'prefix' => 'suzu/relay'
+            ], function ($router) {
+                $router->get('/machines', [RelayController::class, 'machines']);
+                $router->post('/machines/toggle', [RelayController::class, 'toggleMachine']);
+                $router->post('/machines/tier', [RelayController::class, 'setTier']);
+                $router->get('/nodes', [RelayController::class, 'nodes']);
+                $router->get('/rules', [RelayController::class, 'rules']);
+                $router->post('/rules', [RelayController::class, 'createRule']);
+                $router->post('/rules/update', [RelayController::class, 'updateRule']);
+                $router->post('/rules/toggle', [RelayController::class, 'toggleRule']);
+                $router->post('/rules/drop', [RelayController::class, 'dropRule']);
+                $router->get('/outbox', [RelayController::class, 'outbox']);
+                $router->post('/rollback', [RelayController::class, 'rollback']);
+                $router->post('/republish', [RelayController::class, 'republish']);
+                $router->get('/audit', [RelayController::class, 'audit']);
             });
 
             // Update

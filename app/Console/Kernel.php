@@ -50,6 +50,8 @@ class Kernel extends ConsoleKernel
         $schedule->command('suzu:enterprise-lifecycle')->everyTenMinutes()->onOneServer()->withoutOverlapping(10);
         $schedule->command('suzu:enterprise-health', ['--mode' => 'light'])->everySixHours()->onOneServer()->withoutOverlapping(30);
         $schedule->command('suzu:enterprise-health', ['--mode' => 'full'])->dailyAt('04:30')->onOneServer()->withoutOverlapping(60);
+        // SB-RELAY-01: relay config reconciliation every 5 minutes
+        $schedule->command('suzu:relay-reconcile')->everyFiveMinutes()->onOneServer()->withoutOverlapping(5);
         // backup Timing
         // if (env('ENABLE_AUTO_BACKUP_AND_UPDATE', false)) {
         //     $schedule->command('backup:database', ['true'])->daily()->onOneServer();

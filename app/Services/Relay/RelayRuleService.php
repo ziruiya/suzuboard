@@ -1,0 +1,417 @@
+<?php
+
+namespace App\Services\Relay;
+
+use App\Models\RelayAuditLog;
+use App\Models\RelayPortClaim;
+use App\Models\RelayRule;
+use App\Models\Server;
+use App\Models\ServerMachine;
+use App\Services\ServerService;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * SB-RELAY-01: rule CRUD with the full guard set —
+ *  - listen ports only from the preflight pool (service layer here, model
+ *    layer in RelayRule::booted, occupancy layer in suzu_relay_port_claims);
+ *  - per-machine rule/connection caps from the preflight resource classes;
+ *  - NODE targets must be agent-deliverable (AUD-010/011 gate reused);
+ *  - MANUAL targets on a public bind need an approved CIDR allowlist;
+ *  - no loops: a rule may not feed this machine's own relay listeners,
+ *    directly or through a chain of node targets across machines.
+ * Every mutation is audited and republishes the machine config.
+ */
+class RelayRuleService
+{
+    public function __construct(private RelayConfigService $config)
+    {
+    }
+
+    public function create(ServerMachine $machine, array $data, string $actorType = 'admin', ?int $actorId = null): RelayRule
+    {
+        $this->assertMachineCanTakeRules($machine);
+
+        return DB::transaction(function () use ($machine, $data, $actorType, $actorId) {
+            $attrs = $this->validateAndNormalize($machine, $data, null);
+            $rule = new RelayRule($attrs);
+            $rule->machine_id = $machine->id;
+            $rule->status = RelayRule::STATUS_NOT_APPLIED;
+            $rule->save();
+            $rule->forceFill(['rule_code' => 'RL' . str_pad((string) $rule->id, 6, '0', STR_PAD_LEFT)])->save();
+            $this->syncClaims($rule);
+            RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, 'rule.create', $rule->rule_code . ' ' . $rule->name);
+            $this->config->publish($machine, $actorType, $actorId);
+            return $rule->fresh();
+        });
+    }
+
+    public function update(RelayRule $rule, array $data, string $actorType = 'admin', ?int $actorId = null): RelayRule
+    {
+        $machine = $rule->machine;
+        return DB::transaction(function () use ($rule, $machine, $data, $actorType, $actorId) {
+            $merged = array_merge($rule->only([
+                'name', 'transport', 'listen_ip', 'listen_port', 'target_type',
+                'target_node_id', 'target_host', 'target_port', 'allowlist_cidrs',
+                'allowlist_approved', 'max_connections', 'udp_max_sessions',
+                'udp_idle_timeout_sec', 'drain_timeout_sec', 'buffer_bytes',
+                'rate_in_bps', 'rate_out_bps', 'burst_bytes', 'enabled',
+            ]), $data);
+            $attrs = $this->validateAndNormalize($machine, $merged, $rule);
+            $rule->fill($attrs);
+            $rule->version = $rule->version + 1; // optimistic lock bump
+            if ($rule->status === RelayRule::STATUS_APPLIED) {
+                $rule->status = RelayRule::STATUS_NOT_APPLIED;
+            }
+            $rule->save();
+            $this->syncClaims($rule);
+            RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, 'rule.update', $rule->rule_code);
+            $this->config->publish($machine, $actorType, $actorId);
+            return $rule->fresh();
+        });
+    }
+
+    public function setEnabled(RelayRule $rule, bool $enabled, string $actorType = 'admin', ?int $actorId = null): RelayRule
+    {
+        $machine = $rule->machine;
+        if ($enabled) {
+            $this->assertMachineCanTakeRules($machine);
+            // Re-validate the target: a node that lost eligibility while the
+            // rule was disabled must not come back (it goes BROKEN instead).
+            $this->validateAndNormalize($machine, $rule->only([
+                'name', 'transport', 'listen_ip', 'listen_port', 'target_type',
+                'target_node_id', 'target_host', 'target_port', 'allowlist_cidrs',
+                'allowlist_approved', 'max_connections', 'udp_max_sessions',
+            ]), $rule);
+        }
+        $rule->forceFill([
+            'enabled' => $enabled,
+            'status' => $enabled ? RelayRule::STATUS_NOT_APPLIED : RelayRule::STATUS_DISABLED,
+        ])->save();
+        RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, $enabled ? 'rule.enable' : 'rule.disable', $rule->rule_code);
+        $this->config->publish($machine, $actorType, $actorId);
+        return $rule->fresh();
+    }
+
+    public function delete(RelayRule $rule, string $actorType = 'admin', ?int $actorId = null): void
+    {
+        $machine = $rule->machine;
+        DB::transaction(function () use ($rule, $machine, $actorType, $actorId) {
+            RelayPortClaim::where('rule_id', $rule->id)->delete();
+            RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, 'rule.delete', $rule->rule_code . ' ' . $rule->name);
+            $rule->delete(); // rule_code is never reused: codes derive from the row id
+            $this->config->publish($machine, $actorType, $actorId);
+        });
+    }
+
+    private function assertMachineCanTakeRules(ServerMachine $machine): void
+    {
+        if (!$machine->relay_enabled || $machine->relay_status === ServerMachine::RELAY_STATUS_DRAINING) {
+            throw new RelayValidationException('machine is not an active relay machine');
+        }
+        $count = RelayRule::where('machine_id', $machine->id)->count();
+        if ($count >= $machine->relayRulesLimit()) {
+            throw new RelayValidationException(
+                'machine rule limit reached (' . $machine->relayRulesLimit() . ' for tier ' . $machine->relay_tier . ')'
+            );
+        }
+    }
+
+    /**
+     * Validate a candidate rule and return the attributes to persist.
+     * $existing is the rule being updated (excluded from claim/loop checks).
+     */
+    private function validateAndNormalize(ServerMachine $machine, array $data, ?RelayRule $existing): array
+    {
+        $name = trim((string) ($data['name'] ?? ''));
+        if ($name === '') {
+            throw new RelayValidationException('name is required');
+        }
+        $transport = strtolower((string) ($data['transport'] ?? 'both'));
+        if (!in_array($transport, ['tcp', 'udp', 'both'], true)) {
+            throw new RelayValidationException('transport must be tcp, udp or both');
+        }
+        $listenIp = trim((string) ($data['listen_ip'] ?? '0.0.0.0'));
+        if (filter_var($listenIp, FILTER_VALIDATE_IP) === false) {
+            throw new RelayValidationException('listen_ip must be a valid IP address');
+        }
+        $listenPort = (int) ($data['listen_port'] ?? 0);
+        if (!RelayPorts::inPool($listenPort)) {
+            throw new RelayValidationException(
+                'listen_port must be inside the relay pool ' . RelayPorts::POOL_MIN . '-' . RelayPorts::POOL_MAX
+            );
+        }
+
+        $targetType = strtoupper((string) ($data['target_type'] ?? ''));
+        $targetNodeId = null;
+        $targetHost = '';
+        $targetPort = 0;
+        $contractHash = null;
+        if ($targetType === RelayRule::TARGET_NODE) {
+            $targetNodeId = (int) ($data['target_node_id'] ?? 0);
+            $node = Server::find($targetNodeId);
+            if (!$node) {
+                throw new RelayValidationException('target node does not exist');
+            }
+            if (!ServerService::isAgentDeliverable($node)) {
+                throw new RelayValidationException('target node is not agent-deliverable (disabled, hidden stock node, or non-production profile)');
+            }
+            $targetHost = (string) $node->host;
+            $targetPort = (int) $node->server_port;
+            $contractHash = self::nodeContractHash($node);
+        } elseif ($targetType === RelayRule::TARGET_MANUAL) {
+            $targetHost = trim((string) ($data['target_host'] ?? ''));
+            $targetPort = (int) ($data['target_port'] ?? 0);
+            if ($targetHost === '' || $targetPort < 1 || $targetPort > 65535) {
+                throw new RelayValidationException('manual target requires a host and a valid port');
+            }
+            if (filter_var($targetHost, FILTER_VALIDATE_IP) === false
+                && !preg_match('/^(?=.{1,253}$)([a-zA-Z0-9-]+\.)*[a-zA-Z0-9-]+$/', $targetHost)) {
+                throw new RelayValidationException('manual target host must be an IP or a hostname');
+            }
+        } else {
+            throw new RelayValidationException('target_type must be NODE or MANUAL');
+        }
+
+        // MANUAL targets on a public bind: approved CIDR allowlist required.
+        $allowlist = $data['allowlist_cidrs'] ?? null;
+        if (is_string($allowlist)) {
+            $allowlist = array_values(array_filter(array_map('trim', explode(',', $allowlist))));
+        }
+        $allowlistApproved = (bool) ($data['allowlist_approved'] ?? false);
+        if ($targetType === RelayRule::TARGET_MANUAL && $this->isPublicBind($listenIp)) {
+            if (empty($allowlist)) {
+                throw new RelayValidationException('manual target on a public bind requires an allowlist of CIDRs');
+            }
+            if (!$allowlistApproved) {
+                throw new RelayValidationException('manual target allowlist must be approved');
+            }
+        }
+        foreach ((array) ($allowlist ?? []) as $cidr) {
+            if (!self::isCidr((string) $cidr)) {
+                throw new RelayValidationException('invalid CIDR in allowlist: ' . $cidr);
+            }
+        }
+
+        // Connection caps follow the machine's preflight class unless the
+        // admin explicitly set tighter values on the rule.
+        $maxConnections = (int) ($data['max_connections'] ?? 0);
+        if ($maxConnections <= 0) {
+            $maxConnections = $machine->relayTcpLimit();
+        }
+        if ($maxConnections > $machine->relayTcpLimit()) {
+            throw new RelayValidationException('max_connections exceeds the machine tier cap (' . $machine->relayTcpLimit() . ')');
+        }
+        $udpSessions = (int) ($data['udp_max_sessions'] ?? 0);
+        if ($udpSessions <= 0) {
+            $udpSessions = $machine->relayUdpLimit();
+        }
+        if ($udpSessions > $machine->relayUdpLimit()) {
+            throw new RelayValidationException('udp_max_sessions exceeds the machine tier cap (' . $machine->relayUdpLimit() . ')');
+        }
+
+        $candidate = [
+            'name' => $name,
+            'transport' => $transport,
+            'listen_ip' => $listenIp,
+            'listen_port' => $listenPort,
+            'target_type' => $targetType,
+            'target_node_id' => $targetNodeId,
+            'target_host' => $targetHost,
+            'target_port' => $targetPort,
+            'target_contract_hash' => $contractHash,
+            'target_snapshot_host' => $targetType === RelayRule::TARGET_NODE ? $targetHost : null,
+            'target_snapshot_port' => $targetType === RelayRule::TARGET_NODE ? $targetPort : null,
+            'allowlist_cidrs' => $allowlist ?: null,
+            'allowlist_approved' => $allowlistApproved,
+            'max_connections' => $maxConnections,
+            'udp_max_sessions' => $udpSessions,
+            'udp_idle_timeout_sec' => max(1, (int) ($data['udp_idle_timeout_sec'] ?? 60)),
+            'drain_timeout_sec' => max(1, (int) ($data['drain_timeout_sec'] ?? 300)),
+            'buffer_bytes' => max(1024, (int) ($data['buffer_bytes'] ?? 32768)),
+            'rate_in_bps' => isset($data['rate_in_bps']) && $data['rate_in_bps'] !== null ? (int) $data['rate_in_bps'] : null,
+            'rate_out_bps' => isset($data['rate_out_bps']) && $data['rate_out_bps'] !== null ? (int) $data['rate_out_bps'] : null,
+            'burst_bytes' => isset($data['burst_bytes']) && $data['burst_bytes'] !== null ? (int) $data['burst_bytes'] : null,
+            'enabled' => array_key_exists('enabled', $data) ? (bool) $data['enabled'] : true,
+        ];
+
+        $this->assertNoLoop($machine, $candidate, $existing);
+
+        return $candidate;
+    }
+
+    /**
+     * Loop prevention, two layers:
+     *  1. Direct/chain on this machine: the target may not be one of this
+     *     machine's own relay listen endpoints — following listen ports as
+     *     edges must never lead back to the candidate's own listen port.
+     *  2. Cross-machine: NODE targets form machine->machine edges; adding
+     *     this edge must not close a cycle.
+     */
+    private function assertNoLoop(ServerMachine $machine, array $candidate, ?RelayRule $existing): void
+    {
+        $ownRules = RelayRule::where('machine_id', $machine->id)
+            ->when($existing, fn($q) => $q->where('id', '!=', $existing->id))
+            ->get();
+
+        // Resolve the candidate's effective target endpoint.
+        [$tHost, $tPort] = [$candidate['target_host'], $candidate['target_port']];
+        $targetMachineId = null;
+        if ($candidate['target_type'] === RelayRule::TARGET_NODE && $candidate['target_node_id']) {
+            $node = Server::find($candidate['target_node_id']);
+            $targetMachineId = $node?->machine_id ? (int) $node->machine_id : null;
+        }
+
+        $pointsHome = $this->hostPointsAtMachine($machine, $tHost, $targetMachineId);
+        if ($pointsHome) {
+            if ($tPort === (int) $candidate['listen_port']) {
+                throw new RelayValidationException('target is this rule\'s own listen endpoint (relay loop)');
+            }
+            // Walk the chain of this machine's listeners starting at tPort:
+            // if following targets ever lands back on the candidate's own
+            // listen port (or revisits a port), the chain is a loop.
+            $edges = [];
+            foreach ($ownRules as $r) {
+                $edges[(int) $r->listen_port] = $r;
+            }
+            $seen = [];
+            $port = $tPort;
+            while (isset($edges[$port])) {
+                if (isset($seen[$port])) {
+                    throw new RelayValidationException('target creates a relay loop on this machine');
+                }
+                $seen[$port] = true;
+                $next = $edges[$port];
+                if ($next->target_type === RelayRule::TARGET_NODE) {
+                    break; // chain leaves via a node; cross-machine check below covers cycles
+                }
+                if (!$this->hostPointsAtMachine($machine, (string) $next->target_host, null)) {
+                    break;
+                }
+                $port = (int) $next->target_port;
+                if ($port === (int) $candidate['listen_port']) {
+                    throw new RelayValidationException('target creates a relay loop on this machine');
+                }
+            }
+        }
+
+        // Cross-machine cycle: edges machine -> target node's machine.
+        if ($targetMachineId !== null) {
+            if ($targetMachineId === (int) $machine->id) {
+                // Node on the same machine: fine unless its port is one of
+                // this machine's relay listeners (handled above via chain).
+                return;
+            }
+            $graph = [];
+            RelayRule::where('target_type', RelayRule::TARGET_NODE)
+                ->whereNotNull('target_node_id')
+                ->when($existing, fn($q) => $q->where('id', '!=', $existing->id))
+                ->get()
+                ->each(function (RelayRule $r) use (&$graph) {
+                    $node = Server::find($r->target_node_id);
+                    if ($node && $node->machine_id) {
+                        $graph[(int) $r->machine_id][] = (int) $node->machine_id;
+                    }
+                });
+            $graph[(int) $machine->id][] = $targetMachineId;
+            if ($this->graphHasCycleFrom($graph, $targetMachineId, (int) $machine->id)) {
+                throw new RelayValidationException('target creates a cross-machine relay loop');
+            }
+        }
+    }
+
+    private function graphHasCycleFrom(array $graph, int $from, int $seek): bool
+    {
+        $stack = [$from];
+        $seen = [];
+        while ($stack) {
+            $cur = array_pop($stack);
+            if ($cur === $seek) {
+                return true;
+            }
+            if (isset($seen[$cur])) {
+                continue;
+            }
+            $seen[$cur] = true;
+            foreach ($graph[$cur] ?? [] as $next) {
+                $stack[] = $next;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Does this host refer to the relay machine itself? Loopback always
+     * does; a NODE target does when the node lives on this machine; a
+     * hostname does when it is the host of one of this machine's nodes.
+     */
+    private function hostPointsAtMachine(ServerMachine $machine, string $host, ?int $targetMachineId): bool
+    {
+        if (in_array(strtolower($host), ['127.0.0.1', '::1', 'localhost', '0.0.0.0', '::'], true)) {
+            return true;
+        }
+        if ($targetMachineId !== null) {
+            return $targetMachineId === (int) $machine->id;
+        }
+        return Server::where('machine_id', $machine->id)->where('host', $host)->exists();
+    }
+
+    private function isPublicBind(string $listenIp): bool
+    {
+        if ($listenIp === '0.0.0.0' || $listenIp === '::') {
+            return true;
+        }
+        $ip = $listenIp;
+        return !(
+            str_starts_with($ip, '127.') || $ip === '::1'
+            || str_starts_with($ip, '10.')
+            || str_starts_with($ip, '192.168.')
+            || preg_match('/^172\.(1[6-9]|2\d|3[01])\./', $ip)
+            || str_starts_with(strtolower($ip), 'fe80:')
+            || str_starts_with(strtolower($ip), 'fd')
+            || str_starts_with(strtolower($ip), 'fc')
+        );
+    }
+
+    private static function isCidr(string $cidr): bool
+    {
+        if (!str_contains($cidr, '/')) {
+            return filter_var($cidr, FILTER_VALIDATE_IP) !== false;
+        }
+        [$ip, $bits] = explode('/', $cidr, 2);
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false || !is_numeric($bits)) {
+            return false;
+        }
+        $max = str_contains($ip, ':') ? 128 : 32;
+        return (int) $bits >= 0 && (int) $bits <= $max;
+    }
+
+    public static function nodeContractHash(Server $node): string
+    {
+        return hash('sha256', implode('|', [
+            $node->id, $node->type, $node->host, $node->server_port,
+            $node->machine_id ?? '', $node->enabled ? '1' : '0', $node->show ? '1' : '0',
+        ]));
+    }
+
+    private function syncClaims(RelayRule $rule): void
+    {
+        RelayPortClaim::where('rule_id', $rule->id)->delete();
+        foreach ($rule->transports() as $transport) {
+            try {
+                RelayPortClaim::create([
+                    'machine_id' => $rule->machine_id,
+                    'rule_id' => $rule->id,
+                    'transport' => $transport,
+                    'bind_family' => $rule->bindFamily(),
+                    'bind_ip' => $rule->listen_ip,
+                    'listen_port' => $rule->listen_port,
+                ]);
+            } catch (\Illuminate\Database\QueryException $e) {
+                $rule->forceFill(['status' => RelayRule::STATUS_CONFLICT, 'last_error' => 'port claim conflict'])->save();
+                throw new RelayValidationException(
+                    'listen port ' . $rule->listen_port . '/' . $transport . ' on ' . $rule->listen_ip . ' is already claimed on this machine'
+                );
+            }
+        }
+    }
+}

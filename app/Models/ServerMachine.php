@@ -31,6 +31,11 @@ class ServerMachine extends Model
         'is_active' => 'boolean',
         'last_seen_at' => 'integer',
         'load_status' => 'array',
+        'relay_enabled' => 'boolean',
+        'relay_config_version' => 'integer',
+        'relay_applied_version' => 'integer',
+        'relay_applied_at' => 'timestamp',
+        'relay_status_changed_at' => 'timestamp',
         'created_at' => 'timestamp',
         'updated_at' => 'timestamp',
     ];
@@ -45,6 +50,44 @@ class ServerMachine extends Model
     public function loadHistory(): HasMany
     {
         return $this->hasMany(ServerMachineLoadHistory::class, 'machine_id');
+    }
+
+    // ---- SB-RELAY-01 -------------------------------------------------
+
+    public const RELAY_STATUS_DISABLED = 'DISABLED';
+    public const RELAY_STATUS_ENABLED = 'ENABLED';
+    public const RELAY_STATUS_DRAINING = 'DRAINING';
+
+    /** Preflight resource classes: 2GB machines vs 1GB machines. */
+    public const RELAY_TIERS = [
+        'large' => ['rules' => 60, 'tcp' => 1000, 'udp' => 1024],
+        'small' => ['rules' => 30, 'tcp' => 500, 'udp' => 512],
+    ];
+
+    public function relayRules(): HasMany
+    {
+        return $this->hasMany(RelayRule::class, 'machine_id');
+    }
+
+    public function relayRulesLimit(): int
+    {
+        return $this->relay_rules_limit
+            ?? self::RELAY_TIERS[$this->relay_tier]['rules']
+            ?? self::RELAY_TIERS['small']['rules'];
+    }
+
+    public function relayTcpLimit(): int
+    {
+        return $this->relay_tcp_limit
+            ?? self::RELAY_TIERS[$this->relay_tier]['tcp']
+            ?? self::RELAY_TIERS['small']['tcp'];
+    }
+
+    public function relayUdpLimit(): int
+    {
+        return $this->relay_udp_limit
+            ?? self::RELAY_TIERS[$this->relay_tier]['udp']
+            ?? self::RELAY_TIERS['small']['udp'];
     }
 
     /**

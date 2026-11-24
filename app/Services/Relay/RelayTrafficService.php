@@ -1,0 +1,123 @@
+<?php
+
+namespace App\Services\Relay;
+
+use App\Models\RelayRule;
+use App\Models\RelayRuleStat;
+use App\Models\RelayTrafficBatch;
+use App\Models\ServerMachine;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * SB-RELAY-01 traffic accounting. The agent reports immutable batches
+ * (machine, rule, boot, seq); a batch is booked only when its ledger insert
+ * succeeds against the UNIQUE keys, so replaying a batch — even ten times —
+ * counts exactly once. Booked bytes are split across UTC day boundaries
+ * into per-rule stats (record_type 'd' at the day boundary, 'm' at the
+ * month boundary). Relay traffic NEVER touches v2_user.u/d.
+ */
+class RelayTrafficService
+{
+    /**
+     * @param array $batches each: rule_code, boot_id, seq, period_start,
+     *                        period_end, bytes_in, bytes_out, connections?
+     * @return array{accepted:int, duplicates:int, rejected:int}
+     */
+    public function ingest(ServerMachine $machine, array $batches): array
+    {
+        $accepted = 0;
+        $duplicates = 0;
+        $rejected = 0;
+
+        foreach ($batches as $batch) {
+            $ruleCode = (string) ($batch['rule_code'] ?? '');
+            $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $ruleCode)->first();
+            $bootId = (string) ($batch['boot_id'] ?? '');
+            $seq = (int) ($batch['seq'] ?? -1);
+            $start = (int) ($batch['period_start'] ?? 0);
+            $end = (int) ($batch['period_end'] ?? 0);
+            if (!$rule || $bootId === '' || $seq < 0 || $start <= 0 || $end <= $start) {
+                $rejected++;
+                continue;
+            }
+            $bytesIn = max(0, (int) ($batch['bytes_in'] ?? 0));
+            $bytesOut = max(0, (int) ($batch['bytes_out'] ?? 0));
+
+            $booked = DB::transaction(function () use ($machine, $rule, $bootId, $seq, $start, $end, $bytesIn, $bytesOut, $batch) {
+                try {
+                    RelayTrafficBatch::create([
+                        'batch_id' => $machine->id . ':' . $rule->id . ':' . $bootId . ':' . $seq,
+                        'machine_id' => $machine->id,
+                        'rule_id' => $rule->id,
+                        'boot_id' => $bootId,
+                        'seq' => $seq,
+                        'period_start' => $start,
+                        'period_end' => $end,
+                        'bytes_in' => $bytesIn,
+                        'bytes_out' => $bytesOut,
+                        'connections' => max(0, (int) ($batch['connections'] ?? 0)),
+                        'created_at' => now(),
+                    ]);
+                } catch (\Illuminate\Database\QueryException $e) {
+                    return false; // duplicate: unique key rejected the replay
+                }
+                $this->bookIntoStats($rule->id, $start, $end, $bytesIn, $bytesOut);
+                return true;
+            });
+
+            $booked ? $accepted++ : $duplicates++;
+        }
+
+        return ['accepted' => $accepted, 'duplicates' => $duplicates, 'rejected' => $rejected];
+    }
+
+    /**
+     * Split [start, end) at UTC day boundaries; each day segment books its
+     * pro-rata share (last segment takes the remainder so totals are exact)
+     * into the day row and the month row of that segment.
+     */
+    private function bookIntoStats(int $ruleId, int $start, int $end, int $bytesIn, int $bytesOut): void
+    {
+        $total = $end - $start;
+        $segments = [];
+        $cursor = $start;
+        while ($cursor < $end) {
+            $dayStart = (int) (floor($cursor / 86400) * 86400);
+            $segEnd = min($end, $dayStart + 86400);
+            $segments[] = [$dayStart, $cursor, $segEnd];
+            $cursor = $segEnd;
+        }
+
+        $bookedIn = 0;
+        $bookedOut = 0;
+        foreach ($segments as $i => [$dayStart, $segStart, $segEnd]) {
+            $isLast = $i === count($segments) - 1;
+            $in = $isLast ? $bytesIn - $bookedIn : intdiv($bytesIn * ($segEnd - $segStart), $total);
+            $out = $isLast ? $bytesOut - $bookedOut : intdiv($bytesOut * ($segEnd - $segStart), $total);
+            $bookedIn += $in;
+            $bookedOut += $out;
+            $monthStart = (int) strtotime(gmdate('Y-m-01 00:00:00', $dayStart) . ' UTC');
+            $this->addStat($ruleId, 'd', $dayStart, $in, $out);
+            $this->addStat($ruleId, 'm', $monthStart, $in, $out);
+        }
+    }
+
+    private function addStat(int $ruleId, string $type, int $recordAt, int $in, int $out): void
+    {
+        if ($in === 0 && $out === 0) {
+            return;
+        }
+        RelayRuleStat::firstOrCreate(
+            ['rule_id' => $ruleId, 'record_type' => $type, 'record_at' => $recordAt],
+            ['u' => 0, 'd' => 0]
+        );
+        $query = RelayRuleStat::where('rule_id', $ruleId)->where('record_type', $type)->where('record_at', $recordAt);
+        if ($in > 0) {
+            $query->increment('u', $in);
+        }
+        if ($out > 0) {
+            RelayRuleStat::where('rule_id', $ruleId)->where('record_type', $type)->where('record_at', $recordAt)
+                ->increment('d', $out);
+        }
+    }
+}
