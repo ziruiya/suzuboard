@@ -178,6 +178,7 @@ return [
         App\Providers\OctaneServiceProvider::class,
         App\Providers\PluginServiceProvider::class,
         App\Providers\ProtocolServiceProvider::class,
+        App\Providers\EnterpriseServiceProvider::class,
 
     ],
 
@@ -189,5 +190,5 @@ return [
     | The only modification by laravel config
     |
     */
-    'version' => '1.0.2'
+    'version' => '1.1.0'
 ];

@@ -7,6 +7,7 @@
   <title>{{$title}}</title>
   <script type="module" crossorigin src="/theme/{{$theme}}/assets/umi.js?v=20261107d"></script>
   <link rel="stylesheet" href="/theme/{{$theme}}/assets/suzu-login.css?v=20261121a" />
+  <link rel="stylesheet" href="/theme/{{$theme}}/assets/suzu-enterprise.css?v=20261124a" />
 </head>
 
 <body>
@@ -37,6 +38,7 @@
   <div id="app"></div>
   {!! $theme_config['custom_html'] !!}
   <script src="/theme/{{$theme}}/assets/suzu-login.js?v=20261121a" defer></script>
+  <script src="/theme/{{$theme}}/assets/suzu-enterprise.js?v=20261124a" defer></script>
 </body>
 
 </html>

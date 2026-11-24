@@ -19,6 +19,7 @@ use App\Http\Controllers\V2\Admin\KnowledgeController;
 use App\Http\Controllers\V2\Admin\PaymentController;
 use App\Http\Controllers\V2\Admin\SystemController;
 use App\Http\Controllers\V2\Admin\SuzuEndpointController;
+use App\Http\Controllers\V2\Admin\EnterpriseInventoryController;
 use App\Http\Controllers\V2\Admin\ThemeController;
 use App\Http\Controllers\V2\Admin\TrafficResetController;
 use Illuminate\Contracts\Routing\Registrar;
@@ -261,6 +262,27 @@ class AdminRoute
                 $router->post('/cutover', [SuzuEndpointController::class, 'cutover']);
                 $router->post('/rollback', [SuzuEndpointController::class, 'rollback']);
                 $router->get('/changes', [SuzuEndpointController::class, 'changes']);
+            });
+
+            // Suzu Enterprise Inventory (SB-ENT-INV-01)
+            $router->group([
+                'prefix' => 'suzu/enterprise'
+            ], function ($router) {
+                $router->get('/purposes', [EnterpriseInventoryController::class, 'purposes']);
+                $router->post('/purposes/blueprint', [EnterpriseInventoryController::class, 'updateBlueprint']);
+                $router->get('/kits', [EnterpriseInventoryController::class, 'kits']);
+                $router->get('/kit', [EnterpriseInventoryController::class, 'kit']);
+                $router->post('/kits/build', [EnterpriseInventoryController::class, 'build']);
+                $router->post('/kits/confirm-rules', [EnterpriseInventoryController::class, 'confirmRules']);
+                $router->post('/kits/verify', [EnterpriseInventoryController::class, 'verify']);
+                $router->post('/kits/rebuild', [EnterpriseInventoryController::class, 'rebuild']);
+                $router->post('/kits/revoke', [EnterpriseInventoryController::class, 'revoke']);
+                $router->post('/kits/register-legacy', [EnterpriseInventoryController::class, 'registerLegacy']);
+                $router->get('/rules', [EnterpriseInventoryController::class, 'rules']);
+                $router->post('/rules', [EnterpriseInventoryController::class, 'registerRule']);
+                $router->get('/alerts', [EnterpriseInventoryController::class, 'alerts']);
+                $router->post('/alerts/ack', [EnterpriseInventoryController::class, 'ackAlert']);
+                $router->get('/intents', [EnterpriseInventoryController::class, 'intents']);
             });
 
             // Update

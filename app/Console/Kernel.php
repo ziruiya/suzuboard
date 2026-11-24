@@ -44,6 +44,12 @@ class Kernel extends ConsoleKernel
         $schedule->command('horizon:snapshot')->everyFiveMinutes()->onOneServer();
         // cleanup stale online_count (GC for Redis TTL expiration)
         $schedule->command('cleanup:online-status')->everyFiveMinutes()->onOneServer();
+        // SB-ENT-INV-01 enterprise inventory: lifecycle every 10 minutes
+        // (hold timeouts, expiry grace, waiting-queue drain/escalation);
+        // stock health: light probe every 6h, full probe daily.
+        $schedule->command('suzu:enterprise-lifecycle')->everyTenMinutes()->onOneServer()->withoutOverlapping(10);
+        $schedule->command('suzu:enterprise-health', ['--mode' => 'light'])->everySixHours()->onOneServer()->withoutOverlapping(30);
+        $schedule->command('suzu:enterprise-health', ['--mode' => 'full'])->dailyAt('04:30')->onOneServer()->withoutOverlapping(60);
         // backup Timing
         // if (env('ENABLE_AUTO_BACKUP_AND_UPDATE', false)) {
         //     $schedule->command('backup:database', ['true'])->daily()->onOneServer();

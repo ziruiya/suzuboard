@@ -1,0 +1,20 @@
+/* SB-ENT-INV-01 member center card (companion to suzu-enterprise.js). */
+.suzu-ent-card {
+  margin: 16px auto 0;
+  max-width: 960px;
+  padding: 16px 20px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fff7ed, #ffffff);
+  border: 1px solid #fed7aa;
+  box-shadow: 0 2px 8px rgba(234, 88, 12, 0.08);
+  color: #1f2430;
+  font-size: 14px;
+  position: relative;
+  z-index: 5;
+}
+.suzu-ent-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.suzu-ent-title { font-size: 16px; font-weight: 700; color: #c2410c; }
+.suzu-ent-plan { color: #6b7280; font-size: 13px; }
+.suzu-ent-row { display: flex; gap: 12px; padding: 3px 0; flex-wrap: wrap; }
+.suzu-ent-label { width: 64px; color: #9a3412; font-weight: 600; flex: none; }
+.suzu-ent-addr { color: #2563eb; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

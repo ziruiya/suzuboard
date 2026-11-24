@@ -87,6 +87,14 @@ Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path
     ]);
 });
 
+// SB-ENT-INV-01: enterprise inventory admin page (data via the V2 admin API)
+Route::get('/' . admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key')))) . '/suzu-enterprise', function () {
+    return view('admin.enterprise-inventory', [
+        'title' => admin_setting('app_name', 'XBoard'),
+        'secure_path' => admin_setting('secure_path', admin_setting('frontend_admin_path', hash('crc32b', config('app.key'))))
+    ]);
+});
+
 Route::get('/' . (admin_setting('subscribe_path', 's')) . '/{token}', [\App\Http\Controllers\V1\Client\ClientController::class, 'subscribe'])
     ->middleware('client')
     ->name('client.subscribe');

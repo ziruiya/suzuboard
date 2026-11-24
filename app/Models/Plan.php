@@ -87,12 +87,14 @@ class Plan extends Model
         'capacity_limit',
         'sell',
         'device_limit',
-        'tags'
+        'tags',
+        'enterprise_purpose_required'
     ];
 
     protected $casts = [
         'show' => 'boolean',
         'renew' => 'boolean',
+        'enterprise_purpose_required' => 'boolean',
         'created_at' => 'timestamp',
         'updated_at' => 'timestamp',
         'group_id' => 'integer',

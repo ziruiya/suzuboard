@@ -27,6 +27,8 @@ class OrderService
     ];
     public $order;
     public $user;
+    /** SB-ENT-INV-01: result of the enterprise assignment run inside open(). */
+    public $enterpriseOpenResult;
 
     public function __construct(Order $order)
     {
@@ -63,6 +65,7 @@ class OrderService
         Plan $plan,
         string $period,
         ?string $couponCode = null,
+        ?string $enterprisePurposeCode = null,
     ): Order {
         $userService = app(UserService::class);
         $planService = new PlanService($plan);
@@ -70,7 +73,7 @@ class OrderService
         $planService->validatePurchase($user, $period);
         HookManager::call('order.create.before', [$user, $plan, $period, $couponCode]);
 
-        return DB::transaction(function () use ($user, $plan, $period, $couponCode, $userService) {
+        return DB::transaction(function () use ($user, $plan, $period, $couponCode, $userService, $enterprisePurposeCode) {
             $user = User::lockForUpdate()->find($user->id);
             if (!$user) {
                 throw new ApiException(__('The user does not exist'));
@@ -107,6 +110,27 @@ class OrderService
 
             if (!$order->save()) {
                 throw new ApiException(__('Failed to create order'));
+            }
+
+            // SB-ENT-INV-01: enterprise plans require the primary purpose to
+            // be fixed on the order before payment; a READY kit is held for
+            // 30 minutes inside the same transaction.
+            if ($plan->enterprise_purpose_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
+                $code = $enterprisePurposeCode;
+                if (!$code && $user->enterprise_kit_id) {
+                    $existingKit = \App\Models\EnterpriseInventoryKit::find($user->enterprise_kit_id);
+                    $code = $existingKit?->purpose?->code;
+                }
+                $purpose = $code
+                    ? \App\Models\EnterprisePurpose::where('code', $code)->where('is_active', true)->first()
+                    : null;
+                if (!$purpose) {
+                    throw new ApiException(__('Please select the primary purpose for the enterprise plan'));
+                }
+                $order->enterprise_purpose_code = $purpose->code;
+                $order->save();
+                app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
+                    ->holdForOrder($order, $purpose, $user);
             }
 
             HookManager::call('order.create.after', $order);
@@ -149,6 +173,15 @@ class OrderService
                 default => $this->buyByPeriod($order, $plan),
             };
 
+            // SB-ENT-INV-01 hard constraint 1: buyByPeriod()/buyByOneTime()
+            // just wrote the plan's template group into user.group_id. For
+            // enterprise orders the assignment now runs in this same
+            // transaction and replaces it with the kit's own group.
+            if ($order->enterprise_purpose_code) {
+                $this->enterpriseOpenResult = app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
+                    ->assignWithinOpen($order, $this->user, $plan);
+            }
+
             $this->setSpeedLimit($plan->speed_limit);
             $this->setDeviceLimit($plan->device_limit);
 
@@ -170,6 +203,14 @@ class OrderService
 
         $order = $openedOrder;
         $this->order = $order;
+
+        // SB-ENT-INV-01: post-commit follow-ups (delivery verification job,
+        // event-driven replenishment) for the assignment done above.
+        if ($this->enterpriseOpenResult) {
+            app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
+                ->afterOpenCommitted($this->enterpriseOpenResult);
+            $this->enterpriseOpenResult = null;
+        }
 
         $eventId = match ((int) $order->type) {
             Order::TYPE_NEW_PURCHASE => admin_setting('new_order_event_id', 0),
@@ -387,6 +428,14 @@ class OrderService
             }
 
             $this->order = $cancelledOrder;
+
+            // SB-ENT-INV-01: a cancelled enterprise order releases its kit hold.
+            $intent = \App\Models\EnterpriseOrderIntent::where('order_id', $cancelledOrder->id)->first();
+            if ($intent) {
+                app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
+                    ->releaseHold($intent, 'order cancelled');
+            }
+
             HookManager::call('order.cancel.after', $cancelledOrder);
             return true;
         } catch (\Exception $e) {

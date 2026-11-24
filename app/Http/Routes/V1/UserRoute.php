@@ -8,6 +8,7 @@ use App\Http\Controllers\V1\User\InviteController;
 use App\Http\Controllers\V1\User\KnowledgeController;
 use App\Http\Controllers\V1\User\NoticeController;
 use App\Http\Controllers\V1\User\OrderController;
+use App\Http\Controllers\V1\User\EnterpriseLineController;
 use App\Http\Controllers\V1\User\PlanController;
 use App\Http\Controllers\V1\User\ServerController;
 use App\Http\Controllers\V1\User\StatController;
@@ -46,6 +47,8 @@ class UserRoute
             $router->post('/order/cancel', [OrderController::class, 'cancel']);
             // Plan
             $router->get('/plan/fetch', [PlanController::class, 'fetch']);
+            // Enterprise dedicated lines (SB-ENT-INV-01)
+            $router->get('/enterprise/lines', [EnterpriseLineController::class, 'lines']);
             // Invite
             $router->get('/invite/save', [InviteController::class, 'save']);
             $router->get('/invite/fetch', [InviteController::class, 'fetch']);
