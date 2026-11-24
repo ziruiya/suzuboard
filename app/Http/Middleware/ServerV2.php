@@ -83,7 +83,7 @@ class ServerV2
                 ->where('enabled', true)
                 ->first();
 
-            if (!$serverInfo) {
+            if (!$serverInfo || !ServerService::isAgentDeliverable($serverInfo)) {
                 throw new ApiException('Node not found on this machine');
             }
 

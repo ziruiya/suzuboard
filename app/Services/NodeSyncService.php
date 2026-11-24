@@ -31,6 +31,9 @@ class NodeSyncService
         if (!$node)
             return;
 
+        if (!ServerService::isAgentDeliverable($node))
+            return;
+
         self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
     }
 
@@ -114,6 +117,9 @@ class NodeSyncService
 
         $node = Server::find($nodeId);
         if (!$node)
+            return;
+
+        if (!ServerService::isAgentDeliverable($node))
             return;
 
         self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);

@@ -37,14 +37,49 @@ class ServerService
     }
 
     /**
-     * 获取机器下所有已启用节点
+     * 获取机器下所有已启用节点（仅含可向 agent 下发的节点）
      */
     public static function getMachineNodes(ServerMachine $machine): Collection
     {
         return Server::where('machine_id', $machine->id)
             ->where('enabled', true)
             ->orderBy('sort', 'ASC')
-            ->get();
+            ->get()
+            ->filter(fn(Server $node) => self::isAgentDeliverable($node))
+            ->values();
+    }
+
+    /**
+     * 节点是否可向 agent 下发配置与用户列表（AUD-010 / AUD-011）。
+     *
+     * 三个条件缺一不可：
+     * 1. 节点已启用（enabled）；
+     * 2. 若节点挂有 Suzu 协议档案，其 rollout_stage 必须为 production；
+     * 3. 企业库存节点在分配前不得下发：库存节点由建造器以 show=false 建入
+     *    suzu_enterprise_inventory_nodes，分配时才翻 show=true、回收时翻回。
+     *    非库存的订阅隐藏节点（如浏览器插件 http 节点）不在此列，保持原有下发。
+     */
+    public static function isAgentDeliverable(Server $node): bool
+    {
+        if (!$node->enabled) {
+            return false;
+        }
+
+        $hasNonProductionProfile = \App\Models\SuzuNodeProfile::query()
+            ->where('server_id', $node->id)
+            ->where('rollout_stage', '!=', 'production')
+            ->exists();
+        if ($hasNonProductionProfile) {
+            return false;
+        }
+
+        if (!$node->show
+            && \App\Models\EnterpriseInventoryNode::query()->where('server_id', $node->id)->exists()
+        ) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -98,6 +133,9 @@ class ServerService
      */
     public static function getAvailableUsers(Server $node)
     {
+        if (!self::isAgentDeliverable($node)) {
+            return collect();
+        }
         $groupIds = $node->group_ids ?? [];
         if (empty($groupIds)) {
             return collect();
@@ -413,7 +451,7 @@ class ServerService
      */
     public static function getServer($serverId, ?string $serverType = null): Server | null
     {
-        return Server::query()
+        $server = Server::query()
             ->when($serverType, function ($query) use ($serverType) {
                 $query->where('type', Server::normalizeType($serverType));
             })
@@ -423,5 +461,11 @@ class ServerService
             })
             ->orderByRaw('CASE WHEN code = ? THEN 0 ELSE 1 END', [$serverId])
             ->first();
+
+        if ($server && !self::isAgentDeliverable($server)) {
+            return null;
+        }
+
+        return $server;
     }
 }
