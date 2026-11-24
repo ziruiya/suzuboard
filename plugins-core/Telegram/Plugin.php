@@ -51,16 +51,26 @@ class Plugin extends AbstractPlugin
       return;
     }
 
+    $user = User::find($order->user_id);
+    if (!$user) {
+      Log::warning('支付通知失败：订单关联的用户不存在', ['order_id' => $order->id]);
+      return;
+    }
+
     $message = sprintf(
       "💰成功收款%s元\n" .
       "———————————————\n" .
       "支付接口：%s\n" .
       "支付渠道：%s\n" .
-      "本站订单：`%s`",
+      "本站订单：`%s`\n" .
+      "用户编号：%s\n" .
+      "用户账号：%s",
       $order->total_amount / 100,
       Helper::escapeMarkdown($payment->payment),
       Helper::escapeMarkdown($payment->name),
-      $order->trade_no
+      $order->trade_no,
+      $order->user_id,
+      Helper::escapeMarkdown($user->email)
     );
     $this->telegramService->sendMessageWithAdmin($message, true);
   }
