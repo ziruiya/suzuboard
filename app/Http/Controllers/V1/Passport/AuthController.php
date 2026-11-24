@@ -12,6 +12,7 @@ use App\Services\Auth\LoginService;
 use App\Services\Auth\MailLinkService;
 use App\Services\Auth\RegisterService;
 use App\Services\AuthService;
+use App\Services\CaptchaService;
 use Illuminate\Http\Request;
 
 class AuthController extends Controller
@@ -64,7 +65,9 @@ class AuthController extends Controller
         [$success, $result] = $this->registerService->register($request);
 
         if (!$success) {
-            return $this->fail($result);
+            // Surface the local-captcha machine error code (AUD-001)
+            // when registration failed on the captcha step; null otherwise.
+            return $this->fail($result, CaptchaService::errorDataFor($request));
         }
 
         $authService = new AuthService($result);

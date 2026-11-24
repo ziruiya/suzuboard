@@ -9,6 +9,7 @@ use App\Models\InviteCode;
 use App\Models\User;
 use App\Services\AppRateLimitService;
 use App\Services\CaptchaService;
+use App\Services\EmailVerifyGuardService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
@@ -24,11 +25,23 @@ class CommController extends Controller
             return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
         }
 
+        // Layered abuse guard (AUD-001): count the attempt for the
+        // anomaly tripwire, then enforce the per-domain limit and the
+        // site-wide hourly budget on top of the per-IP limit above.
+        $guard = app(EmailVerifyGuardService::class);
+        $guard->recordAttemptAndDetectAnomaly((string) $request->ip());
+        if (!$guard->domainAllowed((string) $request->input('email'))) {
+            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
+        }
+        if (!$guard->globalAllowed()) {
+            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
+        }
+
         // 验证人机验证码
         $captchaService = app(CaptchaService::class);
         [$captchaValid, $captchaError] = $captchaService->verify($request);
         if (!$captchaValid) {
-            return $this->fail($captchaError);
+            return $this->fail($captchaError, CaptchaService::errorDataFor($request));
         }
 
         $inputEmail = $request->input('email');

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\V1\Guest;
 
 use App\Http\Controllers\Controller;
 use App\Services\CaptchaService;
+use App\Services\LocalCaptchaService;
 use App\Services\Plugin\HookManager;
 use App\Utils\Dict;
 use App\Utils\Helper;
@@ -41,5 +42,21 @@ class CommController extends Controller
         $data = HookManager::filter('guest_comm_config', $data);
 
         return $this->success($data);
+    }
+
+    /**
+     * Issue a self-hosted image captcha challenge (AUD-001 local mode).
+     * The answer is stored server-side only; the response carries the
+     * challenge id and the PNG as a base64 data URI.
+     */
+    public function captcha()
+    {
+        $challenge = app(LocalCaptchaService::class)->issue();
+
+        return $this->success([
+            'captcha_id' => $challenge['id'],
+            'captcha_image' => $challenge['image'],
+            'expires_in' => $challenge['expires_in'],
+        ]);
     }
 }

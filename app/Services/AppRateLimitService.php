@@ -27,9 +27,21 @@ class AppRateLimitService
      */
     public function attempt(string $bucket, string $ip, int $maxAttempts, int $decaySeconds = 3600): bool
     {
-        $key = CacheKey::get($bucket, $ip);
+        return $this->hit($bucket, $ip, $decaySeconds) <= $maxAttempts;
+    }
+
+    /**
+     * Record one hit in a fixed window and return the running count.
+     *
+     * @param string $bucket      CacheKey bucket name
+     * @param string $key         Window identity (IP, domain, 'ALL', ...)
+     * @param int    $decaySeconds Window length in seconds
+     */
+    public function hit(string $bucket, string $key, int $decaySeconds = 3600): int
+    {
+        $cacheKey = CacheKey::get($bucket, $key);
         // Open the window on first sight; add() is a no-op afterwards.
-        Cache::add($key, 0, $decaySeconds);
-        return Cache::increment($key) <= $maxAttempts;
+        Cache::add($cacheKey, 0, $decaySeconds);
+        return (int) Cache::increment($cacheKey);
     }
 }

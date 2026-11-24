@@ -22,6 +22,7 @@ class GuestRoute
             $router->match(['get', 'post'], '/payment/notify/{method}/{uuid}', [PaymentController::class, 'notify']);
             // Comm
             $router->get('/comm/config', [CommController::class, 'config']);
+            $router->get('/comm/captcha', [CommController::class, 'captcha']);
         });
     }
 }
