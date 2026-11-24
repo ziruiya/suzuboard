@@ -39,6 +39,7 @@ class TelegramPaymentNotifyTest extends TestCase
             'updated_at' => time(),
         ]);
         $payment = Payment::create([
+            'uuid' => '00000000-0000-0000-0000-000000000201',
             'payment' => 'EPay',
             'name' => '微信支付',
             'enable' => 1,
@@ -89,6 +90,7 @@ class TelegramPaymentNotifyTest extends TestCase
     public function test_payment_notify_skips_when_user_missing(): void
     {
         $payment = Payment::create([
+            'uuid' => '00000000-0000-0000-0000-000000000201',
             'payment' => 'EPay',
             'name' => '微信支付',
             'enable' => 1,
