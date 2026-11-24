@@ -54,6 +54,10 @@ class SubscribeUpdateIntervalTest extends TestCase
             Cache::store('redis')->forget('admin_settings');
         } catch (\Throwable) {
         }
+        // Simulate the next request: scoped instances (App\Support\Setting
+        // with its in-memory snapshot) are rebuilt, so readers actually
+        // observe the corrupted stored value.
+        $this->app->forgetScopedInstances();
     }
 
     public function test_default_interval_is_6_when_setting_absent(): void
@@ -66,6 +70,7 @@ class SubscribeUpdateIntervalTest extends TestCase
             Cache::store('redis')->forget('admin_settings');
         } catch (\Throwable) {
         }
+        $this->app->forgetScopedInstances();
 
         $this->assertSame(6, app(SubscribeUpdateIntervalService::class)->hours());
 
