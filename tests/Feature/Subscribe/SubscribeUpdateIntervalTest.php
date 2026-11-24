@@ -118,7 +118,10 @@ class SubscribeUpdateIntervalTest extends TestCase
 
     public function test_singbox_interval_comes_from_setting_and_tracks_changes(): void
     {
-        // Seeded default (6) is served before any change.
+        // Set the value explicitly: the settings snapshot can carry across
+        // tests inside one phpunit process, so do not rely on the seed here
+        // (the absent-setting default is covered by the service tests).
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 6]);
         $response = (new SingBox($this->protocolUser(), []))->handle();
         $this->assertSame('6', $response->headers->get('profile-update-interval'));
 
@@ -134,7 +137,10 @@ class SubscribeUpdateIntervalTest extends TestCase
 
     public function test_stash_interval_comes_from_setting_and_tracks_changes(): void
     {
-        // Seeded default (6) is served before any change.
+        // Set the value explicitly: the settings snapshot can carry across
+        // tests inside one phpunit process, so do not rely on the seed here
+        // (the absent-setting default is covered by the service tests).
+        admin_setting([SubscribeUpdateIntervalService::SETTING_KEY => 6]);
         $response = (new Stash($this->protocolUser(), []))->handle();
         $this->assertSame('6', $response->headers->get('profile-update-interval'));
 
