@@ -256,6 +256,9 @@ class EnterpriseInventoryFlowTest extends EnterpriseTestCase
     /** E09: three consecutive failed health checks quarantine a READY kit and alert. */
     public function test_e09_three_health_failures_quarantine_kit(): void
     {
+        // Zero the health-verify backoff: this test exercises the
+        // three-consecutive-failures rule, not the retry timing.
+        config(['suzu_enterprise.health_verify_backoff_seconds' => [0, 0, 0]]);
         $kit = $this->buildReadyKit();
         $this->probe->healthy = false;
 

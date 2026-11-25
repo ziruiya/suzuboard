@@ -32,4 +32,16 @@ return [
      * signal), never between passing attempts.
      */
     'build_verify_backoff_seconds' => array_map('intval', explode(',', (string) env('SUZU_ENT_BUILD_VERIFY_BACKOFF', '15,30,45,60'))),
+
+    /*
+     * Same doctrine for kit health verification (verifyKit full mode):
+     * the probe identity is moved into the kit group and the landing
+     * agents only pick that up on their next user pull (~60 s cycle),
+     * so an immediate tunnel probe reads the sync lag as a 502. The
+     * probe section retries on this backoff while the probe user stays
+     * grouped; only the exhausted final attempt is recorded as a
+     * health result. Default total window ≈ 210 s of sleeps plus
+     * probe time, comfortably covering the pull cycle.
+     */
+    'health_verify_backoff_seconds' => array_map('intval', explode(',', (string) env('SUZU_ENT_HEALTH_VERIFY_BACKOFF', '20,40,60,90'))),
 ];

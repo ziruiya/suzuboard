@@ -12,6 +12,7 @@ use App\Models\EnterprisePurpose;
 use App\Models\Order;
 use App\Models\Plan;
 use App\Models\User;
+use App\Services\Enterprise\EnterpriseInventoryHealthService;
 use App\Services\Enterprise\KitProbe;
 use App\Services\OrderService;
 
@@ -24,6 +25,12 @@ use App\Services\OrderService;
  *     probed once, immediately, so ordinary agent-sync lag was
  *     misjudged as failure. Both now retry with bounded backoff, and
  *     persistent failure still fails closed.
+ *  3. health verification (verifyKit) had the same single-probe race
+ *     on the probe identity's group change (v1.3.7 acceptance): the
+ *     probe section now retries on the same doctrine — the retry trace
+ *     may therefore come from either the builder layer
+ *     (kit.verify.retry) or the health layer (health.verify.retry) —
+ *     and only an exhausted run records a health failure.
  */
 class EnterpriseVerifyRetryTest extends EnterpriseTestCase
 {
@@ -33,6 +40,7 @@ class EnterpriseVerifyRetryTest extends EnterpriseTestCase
         config([
             'suzu_enterprise.delivery_verify_backoff_seconds' => [0, 0],
             'suzu_enterprise.build_verify_backoff_seconds' => [0, 0, 0, 0],
+            'suzu_enterprise.health_verify_backoff_seconds' => [0, 0, 0],
         ]);
     }
 
@@ -138,7 +146,9 @@ class EnterpriseVerifyRetryTest extends EnterpriseTestCase
 
         $this->assertSame(EnterpriseInventoryKit::STATUS_READY, $kit->fresh()->status);
         $this->assertTrue(
-            EnterpriseInventoryLog::where('kit_id', $kit->id)->where('event', 'kit.verify.retry')->exists(),
+            EnterpriseInventoryLog::where('kit_id', $kit->id)
+                ->whereIn('event', ['kit.verify.retry', 'health.verify.retry'])
+                ->exists(),
             'the failed first attempt must be retried, with a log trace'
         );
     }
@@ -159,6 +169,78 @@ class EnterpriseVerifyRetryTest extends EnterpriseTestCase
         $this->assertTrue(
             EnterpriseInventoryLog::where('kit_id', $kit->id)->where('event', 'delivery.verify.retry')->exists(),
             'the lagging first attempt must leave a retry trace'
+        );
+    }
+
+    public function test_health_verify_retries_until_agent_sync_catches_up(): void
+    {
+        $kit = $this->buildReadyKit();
+        // First full attempt: both nodes fail (the agent has not pulled
+        // the probe identity into the kit group yet); the bounded retry
+        // rides out the lag and the kit verifies healthy.
+        $this->bindFlakyProbe(failuresByKitId: [$kit->id => 2]);
+        $health = app(EnterpriseInventoryHealthService::class);
+        // A distinctive home group makes restoration observable.
+        $probeUser = $health->probeUser();
+        $probeUser->group_id = $this->ordinaryGroup->id;
+        $probeUser->save();
+
+        $result = $health->verifyKit($kit->fresh(), 'full');
+
+        $this->assertTrue($result['ok']);
+        $this->assertSame(
+            0,
+            (int) $kit->fresh()->health_fail_count,
+            'a lagging first attempt must not count as a health failure'
+        );
+        $this->assertSame(EnterpriseInventoryKit::STATUS_READY, $kit->fresh()->status);
+        $this->assertTrue(
+            EnterpriseInventoryLog::where('kit_id', $kit->id)->where('event', 'health.verify.retry')->exists(),
+            'the lagging attempt must leave a retry trace'
+        );
+        $this->assertSame(
+            $this->ordinaryGroup->id,
+            (int) $probeUser->fresh()->group_id,
+            'probe user must be restored to its original group after verification'
+        );
+    }
+
+    public function test_health_verify_persistent_failure_counts_once_after_exhaustion(): void
+    {
+        $kit = $this->buildReadyKit();
+        $health = app(EnterpriseInventoryHealthService::class);
+        $probeUser = $health->probeUser();
+        $probeUser->group_id = $this->ordinaryGroup->id;
+        $probeUser->save();
+        $this->probe->healthy = false; // every probe fails, for the whole window
+
+        $result = $health->verifyKit($kit->fresh(), 'full');
+
+        $this->assertFalse($result['ok']);
+        $this->assertSame(
+            1,
+            (int) $kit->fresh()->health_fail_count,
+            'one verification run counts exactly one health failure, however many attempts it made'
+        );
+        $this->assertGreaterThanOrEqual(
+            2,
+            EnterpriseInventoryLog::where('kit_id', $kit->id)->where('event', 'health.verify.retry')->count(),
+            'all bounded attempts must be exhausted (and traced) before failing'
+        );
+        $this->assertSame(
+            1,
+            EnterpriseInventoryLog::where('kit_id', $kit->id)->where('event', 'health.full.fail')->count(),
+            'the failure must be recorded once, after exhaustion — not per attempt'
+        );
+        $this->assertSame(
+            EnterpriseInventoryKit::STATUS_READY,
+            $kit->fresh()->status,
+            'a single failed run must not quarantine the kit'
+        );
+        $this->assertSame(
+            $this->ordinaryGroup->id,
+            (int) $probeUser->fresh()->group_id,
+            'probe user must be restored to its original group even after exhaustion'
         );
     }
 

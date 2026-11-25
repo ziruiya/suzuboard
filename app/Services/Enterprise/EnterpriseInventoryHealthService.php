@@ -19,6 +19,16 @@ use Illuminate\Support\Str;
  * reachability through the KitProbe edge. A kit enters READY only after
  * three consecutive full passes; a READY kit that fails three consecutive
  * checks is quarantined.
+ *
+ * Full-mode tunnel probes run under the probe identity, whose kit-group
+ * membership the landing agents only pick up on their next user pull
+ * (~60 s cycle). Probing immediately after the group change therefore
+ * reports the sync lag as a tunnel failure (v1.3.7 acceptance: a probe
+ * 75 s after the group change passed both nodes cleanly). The probe
+ * section retries with bounded backoff while the probe user stays in
+ * the kit group — the same doctrine as delivery verification (v1.3.5) —
+ * and only the exhausted final attempt is recorded as a health result,
+ * so a lagging first attempt never counts as a kit failure.
  */
 class EnterpriseInventoryHealthService
 {
@@ -69,41 +79,46 @@ class EnterpriseInventoryHealthService
         }
 
         $probeUser = $this->probeUser();
-        $lock = Cache::lock('enterprise-probe-user', 120);
+        // Retries only make sense in full mode: light checks (content +
+        // TCP) do not depend on the probe identity's group membership.
+        $backoff = $mode === 'full'
+            ? array_map('intval', (array) config('suzu_enterprise.health_verify_backoff_seconds', [20, 40, 60, 90]))
+            : [];
+        $maxAttempts = count($backoff) + 1;
+        // The probe-user lock must outlive the whole retry window,
+        // otherwise a concurrent verifier could steal the identity
+        // mid-verification and restore a stale group under us.
+        $lock = Cache::lock('enterprise-probe-user', 120 + array_sum($backoff) + 120);
         try {
             $lock->block(30);
             $originalGroup = $probeUser->group_id;
             $probeUser->group_id = $kit->stock_group_id;
             $probeUser->save();
             try {
-                foreach ($nodes as $invNode) {
-                    $host = $invNode->dns_alias ?: ($invNode->server?->host ?? '');
-                    $tcpOk = $host && $this->probe->tcpReachable($host, (int) $invNode->port);
-                    $checks[] = [
-                        'name' => "tcp_{$invNode->node_role}",
-                        'ok' => (bool) $tcpOk,
-                        'detail' => $tcpOk ? "{$host}:{$invNode->port} reachable" : "{$host}:{$invNode->port} unreachable",
-                    ];
-                    if ($mode === 'full' && $invNode->server_id) {
-                        $result = $this->probe->probeThroughNode($kit, (int) $invNode->server_id, $probeUser);
-                        $checks[] = [
-                            'name' => "tunnel204_{$invNode->node_role}",
-                            'ok' => $result['ok'] && $result['status'] === 204,
-                            'detail' => $result['ok'] ? 'generate_204 through tunnel' : ('probe failed: ' . ($result['error'] ?? 'unknown')),
-                        ];
-                        $expectedExit = $this->expectedExitIp($kit, $invNode->node_role);
-                        if ($result['ok'] && $expectedExit) {
-                            $checks[] = [
-                                'name' => "exit_ip_{$invNode->node_role}",
-                                'ok' => $result['exit_ip'] === $expectedExit,
-                                'detail' => "exit {$result['exit_ip']} " . ($result['exit_ip'] === $expectedExit ? 'matches' : "!= expected {$expectedExit}"),
-                            ];
+                $probeChecks = [];
+                for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+                    $probeChecks = $this->probeNodes($kit, $nodes, $probeUser, $mode);
+                    if (collect($probeChecks)->every(fn($c) => $c['ok'])) {
+                        break;
+                    }
+                    if ($attempt < $maxAttempts) {
+                        $delay = (int) ($backoff[$attempt - 1] ?? 0);
+                        EnterpriseInventoryLog::record($kit->id, 'health.verify.retry', "health verification attempt {$attempt}/{$maxAttempts} failed; retrying in {$delay}s (agent sync may lag)");
+                        if ($delay > 0) {
+                            sleep($delay);
                         }
                     }
                 }
+                $checks = array_merge($checks, $probeChecks);
             } finally {
                 $probeUser->group_id = $originalGroup;
                 $probeUser->save();
+                $probeUser->refresh();
+                if ((int) $probeUser->group_id !== (int) $originalGroup) {
+                    $probeUser->group_id = $originalGroup;
+                    $probeUser->save();
+                    EnterpriseInventoryLog::record($kit->id, 'health.probe_group_restore_failed', 'probe user group restore did not read back after verification; re-applied');
+                }
             }
         } catch (\Throwable $e) {
             $checks[] = ['name' => 'probe_lock', 'ok' => false, 'detail' => $e->getMessage()];
@@ -112,6 +127,44 @@ class EnterpriseInventoryHealthService
         }
 
         return $this->recordResult($kit, $mode, $checks);
+    }
+
+    /**
+     * One probe attempt over both kit nodes under the probe identity
+     * (which the caller has already grouped into the kit). TCP first,
+     * then — in full mode — the through-tunnel 204 and exit-IP checks.
+     *
+     * @return array<int, array{name: string, ok: bool, detail: string}>
+     */
+    private function probeNodes(EnterpriseInventoryKit $kit, iterable $nodes, User $probeUser, string $mode): array
+    {
+        $checks = [];
+        foreach ($nodes as $invNode) {
+            $host = $invNode->dns_alias ?: ($invNode->server?->host ?? '');
+            $tcpOk = $host && $this->probe->tcpReachable($host, (int) $invNode->port);
+            $checks[] = [
+                'name' => "tcp_{$invNode->node_role}",
+                'ok' => (bool) $tcpOk,
+                'detail' => $tcpOk ? "{$host}:{$invNode->port} reachable" : "{$host}:{$invNode->port} unreachable",
+            ];
+            if ($mode === 'full' && $invNode->server_id) {
+                $result = $this->probe->probeThroughNode($kit, (int) $invNode->server_id, $probeUser);
+                $checks[] = [
+                    'name' => "tunnel204_{$invNode->node_role}",
+                    'ok' => $result['ok'] && $result['status'] === 204,
+                    'detail' => $result['ok'] ? 'generate_204 through tunnel' : ('probe failed: ' . ($result['error'] ?? 'unknown')),
+                ];
+                $expectedExit = $this->expectedExitIp($kit, $invNode->node_role);
+                if ($result['ok'] && $expectedExit) {
+                    $checks[] = [
+                        'name' => "exit_ip_{$invNode->node_role}",
+                        'ok' => $result['exit_ip'] === $expectedExit,
+                        'detail' => "exit {$result['exit_ip']} " . ($result['exit_ip'] === $expectedExit ? 'matches' : "!= expected {$expectedExit}"),
+                    ];
+                }
+            }
+        }
+        return $checks;
     }
 
     /**
