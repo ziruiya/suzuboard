@@ -427,58 +427,86 @@ class RelayConfigService
             return true;
         }
 
-        $outbox->forceFill(['status' => RelayConfigOutbox::STATUS_ACKED])->save();
-        $isLatest = $version === (int) $machine->relay_config_version;
-        $machine->forceFill([
-            'relay_applied_version' => $version,
-            'relay_applied_hash' => $outbox->config_hash,
-            'relay_applied_at' => now(),
-            'relay_last_error' => null,
-        ])->save();
-
         $document = json_decode($outbox->payload, true);
         $codes = collect($document['rules'] ?? [])->pluck('rule_code')->all();
-        if ($isLatest) {
-            RelayRule::where('machine_id', $machine->id)->whereIn('rule_code', $codes)
-                ->update(['status' => RelayRule::STATUS_APPLIED]);
-            RelayRule::where('machine_id', $machine->id)->where('enabled', true)
-                ->whereNotIn('rule_code', $codes)
-                ->where('status', RelayRule::STATUS_APPLYING)
-                ->update(['status' => RelayRule::STATUS_NOT_APPLIED]);
-        }
-        // B01: revocation confirmation is PER RULE, judged against the
-        // document this ACK actually covers — never a blanket clear.
-        // An obligation is confirmed only when the ACKed applied
-        // document does not contain the rule AND the ACKed version is
-        // at least the version that first excluded it. An ACK whose
-        // document still contains the rule (e.g. a stale ACK of an
-        // older version arriving late) confirms nothing about it; the
-        // obligation stays open for a later, excluding ACK. This runs
-        // for every applied ACK, not only the latest: a late ACK of an
-        // excluding version is still the agent's proof it stopped.
-        $confirmed = [];
-        RelayRevocation::where('machine_id', $machine->id)->whereNull('confirmed_at')->get()
-            ->each(function (RelayRevocation $obligation) use ($codes, $version, &$confirmed) {
-                if (in_array($obligation->rule_code, $codes, true)) {
-                    return;
-                }
-                if ((int) $obligation->since_version > 0 && $version < (int) $obligation->since_version) {
-                    return;
-                }
-                $obligation->forceFill([
-                    'confirmed_at' => now(),
-                    'confirmed_version' => $version,
-                    'confirm_note' => 'agent acked v' . $version . ' without the rule',
+
+        // N01 (GPT round 3): the machine's applied state is MONOTONIC.
+        // Round 2 wrote relay_applied_version / relay_applied_hash from
+        // whichever applied ACK arrived last, so a delayed ACK of an
+        // older version rolled the panel's view of the agent backwards
+        // (agent already on v20, a late v19 ACK rewrote applied to 19) —
+        // and every consumer of that field (address-change convergence
+        // in MachineRoleService, the reconcile loop) then reasoned from
+        // a state the agent had already left. The applied-ACK
+        // bookkeeping therefore runs in a transaction under the machine
+        // row lock, comparing versions against the locked row: an ACK
+        // older than the confirmed applied version is audit-recorded
+        // but moves nothing — not the applied version/hash/time, not
+        // the last-error field, not the rule statuses.
+        //
+        // Revocation confirmation below is deliberately NOT part of
+        // that refusal: it is judged per rule against the document this
+        // ACK actually carries, so a late ACK of an excluding document
+        // still proves the agent stopped serving the rule. Refusing the
+        // version rollback must not cancel a legitimate revocation
+        // confirmation (N01 fix standard).
+        DB::transaction(function () use ($machine, $version, $outbox, $codes) {
+            $locked = ServerMachine::where('id', $machine->id)->lockForUpdate()->first() ?? $machine;
+            $outbox->forceFill(['status' => RelayConfigOutbox::STATUS_ACKED])->save();
+            $appliedVersion = (int) $locked->relay_applied_version;
+            $stale = $version < $appliedVersion;
+            if (!$stale) {
+                $isLatest = $version === (int) $locked->relay_config_version;
+                $locked->forceFill([
+                    'relay_applied_version' => $version,
+                    'relay_applied_hash' => $outbox->config_hash,
+                    'relay_applied_at' => now(),
+                    'relay_last_error' => null,
                 ])->save();
-                $confirmed[] = $obligation->rule_code;
-            });
-        if ($confirmed) {
-            RelayRule::where('machine_id', $machine->id)->whereIn('rule_code', $confirmed)
-                ->whereNotNull('revocation_pending_at')
-                ->update(['revocation_pending_at' => null]);
-            RelayAuditLog::record($machine->id, null, 'agent', null, 'rule.revocation_confirmed', 'v' . $version . ' acked; confirmed: ' . implode(',', $confirmed));
-        }
-        RelayAuditLog::record($machine->id, null, 'agent', null, 'config.ack', 'v' . $version);
+                if ($isLatest) {
+                    RelayRule::where('machine_id', $locked->id)->whereIn('rule_code', $codes)
+                        ->update(['status' => RelayRule::STATUS_APPLIED]);
+                    RelayRule::where('machine_id', $locked->id)->where('enabled', true)
+                        ->whereNotIn('rule_code', $codes)
+                        ->where('status', RelayRule::STATUS_APPLYING)
+                        ->update(['status' => RelayRule::STATUS_NOT_APPLIED]);
+                }
+            }
+            // B01: revocation confirmation is PER RULE, judged against
+            // the document this ACK actually covers — never a blanket
+            // clear. An obligation is confirmed only when the ACKed
+            // applied document does not contain the rule AND the ACKed
+            // version is at least the version that first excluded it.
+            // An ACK whose document still contains the rule confirms
+            // nothing about it; the obligation stays open for a later,
+            // excluding ACK. This runs for every applied ACK, stale or
+            // not: a late ACK of an excluding version is still the
+            // agent's proof it stopped.
+            $confirmed = [];
+            RelayRevocation::where('machine_id', $locked->id)->whereNull('confirmed_at')->get()
+                ->each(function (RelayRevocation $obligation) use ($codes, $version, &$confirmed) {
+                    if (in_array($obligation->rule_code, $codes, true)) {
+                        return;
+                    }
+                    if ((int) $obligation->since_version > 0 && $version < (int) $obligation->since_version) {
+                        return;
+                    }
+                    $obligation->forceFill([
+                        'confirmed_at' => now(),
+                        'confirmed_version' => $version,
+                        'confirm_note' => 'agent acked v' . $version . ' without the rule',
+                    ])->save();
+                    $confirmed[] = $obligation->rule_code;
+                });
+            if ($confirmed) {
+                RelayRule::where('machine_id', $locked->id)->whereIn('rule_code', $confirmed)
+                    ->whereNotNull('revocation_pending_at')
+                    ->update(['revocation_pending_at' => null]);
+                RelayAuditLog::record($locked->id, null, 'agent', null, 'rule.revocation_confirmed', 'v' . $version . ' acked; confirmed: ' . implode(',', $confirmed));
+            }
+            RelayAuditLog::record($locked->id, null, 'agent', null, 'config.ack',
+                'v' . $version . ($stale ? ' (stale ack; applied stays v' . $appliedVersion . ')' : ''));
+        });
         return true;
     }
 }

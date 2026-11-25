@@ -157,4 +157,113 @@ class RelayRevocationTest extends RelayTestCase
         $this->assertStringContainsString('published again', (string) $obligation->confirm_note);
         $this->assertNull($rule->fresh()->revocation_pending_at);
     }
+
+    /**
+     * N01 (GPT round 3): GPT's acceptance sequence — ACK v_old, ACK
+     * v_new, then a late duplicate ACK of v_old. Round 2 rewrote the
+     * machine's applied version/hash from whichever ACK arrived last,
+     * so the late ACK rolled the panel's view of the agent back to
+     * v_old. The applied state must be monotonic.
+     */
+    public function test_stale_ack_never_rolls_back_applied_version(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-N01'));
+        $this->manualRuleOn($relay, 20231, '甲线');
+        $this->manualRuleOn($relay, 20232, '乙线');
+        $config = $this->config();
+
+        $latest = $config->latestForAgent($relay->fresh());
+        $previous = RelayConfigOutbox::where('machine_id', $relay->id)
+            ->where('version', $latest['version'] - 1)->first();
+        $this->assertNotNull($previous);
+
+        // The agent applies the older document, then the newer one.
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $previous->version, $previous->config_hash, true));
+        $this->assertSame((int) $previous->version, (int) $relay->fresh()->relay_applied_version);
+        $this->assertTrue($config->handleAck($relay->fresh(), $latest['version'], $latest['hash'], true));
+        $machine = $relay->fresh();
+        $this->assertSame($latest['version'], (int) $machine->relay_applied_version);
+        $this->assertSame($latest['hash'], $machine->relay_applied_hash);
+        // Sentinel: if the late ACK rewrote the applied bookkeeping,
+        // this timestamp would jump back to "now".
+        $machine->forceFill(['relay_applied_at' => '2020-01-01 00:00:00'])->save();
+        $sentinel = (int) $relay->fresh()->relay_applied_at;
+
+        // The late ACK of the older version arrives.
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $previous->version, $previous->config_hash, true));
+        $machine = $relay->fresh();
+        $this->assertSame($latest['version'], (int) $machine->relay_applied_version,
+            'a stale ACK must not roll the applied version back');
+        $this->assertSame($latest['hash'], $machine->relay_applied_hash,
+            'a stale ACK must not roll the applied hash back');
+        $this->assertSame($sentinel, (int) $machine->relay_applied_at,
+            'a stale ACK must not rewrite the applied timestamp');
+        $this->assertTrue(RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'config.ack')
+            ->where('detail', 'like', '%stale ack%')->exists(), 'the stale ACK is audit-recorded as stale');
+    }
+
+    /**
+     * N01, the revocation half of the fix standard: refusing the stale
+     * ACK's version rollback must not cancel legitimate per-document
+     * revocation confirmation. A stale ACK whose document still
+     * contains a rule confirms nothing about it; a stale ACK of an
+     * excluding document still confirms the obligations it covers.
+     */
+    public function test_stale_ack_still_confirms_revocations_per_document(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-N01-REV'));
+        $ruleA = $this->manualRuleOn($relay, 20241, '甲线');
+        $ruleB = $this->manualRuleOn($relay, 20242, '乙线');
+        $config = $this->config();
+        $this->ackLatest($relay);
+        $bothDoc = RelayConfigOutbox::where('machine_id', $relay->id)->orderByDesc('version')->first();
+
+        // Disable B: the excluding document is published; the agent
+        // ACKs it, so B's obligation confirms on the normal path.
+        $this->rules()->setEnabled($ruleB->fresh(), false);
+        $excludingDoc = RelayConfigOutbox::where('machine_id', $relay->id)->orderByDesc('version')->first();
+        $this->assertGreaterThan((int) $bothDoc->version, (int) $excludingDoc->version);
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $excludingDoc->version, $excludingDoc->config_hash, true));
+        $obligationB = RelayRevocation::where('rule_code', $ruleB->rule_code)->first();
+        $this->assertSame((int) $excludingDoc->version, (int) $obligationB->confirmed_version);
+
+        // Disable A as well: a newer excluding document exists, its
+        // obligation is open with since_version at that document.
+        $this->rules()->setEnabled($ruleA->fresh(), false);
+        $emptyDoc = RelayConfigOutbox::where('machine_id', $relay->id)->orderByDesc('version')->first();
+        $obligationA = RelayRevocation::openFor($relay->id, $ruleA->rule_code);
+        $this->assertNotNull($obligationA);
+        $this->assertSame((int) $emptyDoc->version, (int) $obligationA->since_version);
+
+        // A stale ACK of the {A,B} document: applied state must not
+        // move, and it confirms nothing — its document still contains
+        // A, and its version predates A's exclusion anyway.
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $bothDoc->version, $bothDoc->config_hash, true));
+        $this->assertSame((int) $excludingDoc->version, (int) $relay->fresh()->relay_applied_version);
+        $this->assertNotNull(RelayRevocation::openFor($relay->id, $ruleA->rule_code),
+            'a stale ACK must not confirm an obligation it does not cover');
+
+        // The current document's ACK confirms A on the normal path.
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $emptyDoc->version, $emptyDoc->config_hash, true));
+        $this->assertNull(RelayRevocation::openFor($relay->id, $ruleA->rule_code));
+        $this->assertSame((int) $emptyDoc->version, (int) $relay->fresh()->relay_applied_version);
+
+        // The race N01 names: an obligation captured against the
+        // excluding document whose ACK arrives only after a newer
+        // version was applied. (Seeded directly: the service-layer
+        // flows — republication closing, since_version supplement —
+        // normally confirm such an obligation earlier; this isolates
+        // handleAck's contract that a stale ACK still confirms what
+        // its document legitimately covers.)
+        $late = RelayRevocation::record($relay->id, $ruleB->rule_code, $ruleB->id,
+            RelayRevocation::REASON_DISABLED, (int) $excludingDoc->version);
+        $this->assertNull($late->confirmed_at);
+        $this->assertTrue($config->handleAck($relay->fresh(), (int) $excludingDoc->version, $excludingDoc->config_hash, true));
+        $late = $late->fresh();
+        $this->assertNotNull($late->confirmed_at, 'a stale ACK of an excluding document still confirms its revocations');
+        $this->assertSame((int) $excludingDoc->version, (int) $late->confirmed_version);
+        $this->assertSame((int) $emptyDoc->version, (int) $relay->fresh()->relay_applied_version,
+            '... while the applied version itself stays at the newer version');
+    }
 }

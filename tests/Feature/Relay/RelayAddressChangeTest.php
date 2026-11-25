@@ -8,6 +8,7 @@ use App\Models\RelayConfigOutbox;
 use App\Models\ServerMachine;
 use App\Services\Relay\MachineRoleService;
 use App\Services\Relay\RelayConfigService;
+use App\Services\Relay\RelayReconcileService;
 use App\Services\Relay\RelayRuleService;
 use App\Services\Relay\RelayValidationException;
 
@@ -211,5 +212,137 @@ class RelayAddressChangeTest extends RelayTestCase
     private function rules2Publish(ServerMachine $relay): void
     {
         app(RelayRuleService::class)->create($relay, $this->manualRule(['name' => '第二条', 'listen_port' => 20332]), 'admin', 1);
+    }
+
+    /**
+     * N02 (GPT round 3): the crash window round 2 left open — the
+     * change record exists with a `pending` follower (the address was
+     * saved, then the process died before the publish loop ran), and
+     * resume only retried `failed`, so the record could never
+     * converge. Simulated by writing the durable record directly,
+     * then driving ONLY the reconcile entry point: the follower must
+     * be published, ACK, and the change must complete.
+     */
+    public function test_pending_follower_record_recovers_through_reconcile(): void
+    {
+        $landing = $this->bareMachine('LAND-N02', ServerMachine::ROLE_LANDING);
+        $relay = $this->enableRelay($this->makeMachine('R-N02'));
+        $node = $this->makeNode($landing);
+        app(RelayRuleService::class)->create($relay, $this->nodeRule($node->id, 20401), 'admin', 1);
+
+        // The address reached the database and the record was created;
+        // the process died before any follower was published.
+        $newAddress = '198.51.100.110';
+        $landing->forceFill(['public_address' => $newAddress])->save();
+        $change = RelayAddressChange::create([
+            'machine_id' => $landing->id,
+            'address' => $newAddress,
+            'actor_type' => 'admin',
+            'actor_id' => 1,
+            'status' => RelayAddressChange::STATUS_IN_PROGRESS,
+            'followers' => [$relay->id => ['status' => 'pending', 'attempts' => 0]],
+            'precheck' => null,
+        ]);
+        $versionBefore = (int) $relay->fresh()->relay_config_version;
+
+        // The reconcile loop is the only driver from here on.
+        app(RelayReconcileService::class)->run();
+        $change = $change->fresh();
+        $follower = $change->followers[$relay->id];
+        $this->assertSame('published', $follower['status'], 'a pending follower must be resumed, not skipped');
+        $this->assertSame((int) $relay->fresh()->relay_config_version, (int) $follower['version']);
+        $this->assertGreaterThan($versionBefore, (int) $follower['version']);
+        $this->assertSame(RelayAddressChange::STATUS_AWAITING_ACK, $change->status);
+
+        // A repeated resume before the ACK must not inflate the
+        // follower's config version (idempotency).
+        $roles = app(MachineRoleService::class);
+        $roles->resumeAddressChange($change->fresh(), 'system');
+        $this->assertSame((int) $follower['version'], (int) $relay->fresh()->relay_config_version);
+
+        // The agent ACKs the published document; the next reconcile
+        // pass confirms the follower and completes the change.
+        $config = app(RelayConfigService::class);
+        $doc = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $doc['version'], $doc['hash'], true));
+        app(RelayReconcileService::class)->run();
+        $change = $change->fresh();
+        $this->assertSame(RelayAddressChange::STATUS_COMPLETE, $change->status);
+        $this->assertSame('confirmed', $change->followers[$relay->id]['status']);
+        $this->assertNotNull($change->completed_at);
+    }
+
+    /**
+     * N02 idempotency, the other crash window: the publish DID land
+     * before the interruption, only the outcome note is missing (the
+     * follower reads `pending` although the new document is already
+     * the machine's latest). Resume must recognise the published
+     * version instead of publishing again and inflating the version.
+     */
+    public function test_resume_recognises_already_published_follower_without_republishing(): void
+    {
+        $landing = $this->bareMachine('LAND-N02-IDEM', ServerMachine::ROLE_LANDING);
+        $relay = $this->enableRelay($this->makeMachine('R-N02-IDEM'));
+        $node = $this->makeNode($landing);
+        app(RelayRuleService::class)->create($relay, $this->nodeRule($node->id, 20411), 'admin', 1);
+
+        $roles = new MachineRoleService(app(RelayConfigService::class), fn () => true);
+        $report = $roles->setPublicAddressWithReport($landing->fresh(), '198.51.100.111', 'admin', 1);
+        $change = RelayAddressChange::find($report['address_change_id']);
+        $publishedVersion = (int) $change->followers[$relay->id]['version'];
+
+        // Rewind the follower state to the crash window.
+        $followers = $change->followers;
+        $followers[$relay->id] = ['status' => 'pending', 'attempts' => 0];
+        $change->forceFill([
+            'followers' => $followers,
+            'status' => RelayAddressChange::STATUS_IN_PROGRESS,
+        ])->save();
+
+        $change = $roles->resumeAddressChange($change->fresh(), 'admin', 1);
+        $follower = $change->followers[$relay->id];
+        $this->assertSame('published', $follower['status']);
+        $this->assertSame($publishedVersion, (int) $follower['version'],
+            'resume must adopt the version that already carries the change, not publish a new one');
+        $this->assertSame(0, (int) $follower['attempts'], 'no publish was attempted');
+        $this->assertSame($publishedVersion, (int) $relay->fresh()->relay_config_version,
+            'the config version must not inflate on resume');
+    }
+
+    /**
+     * N02 task association: consecutive changes A -> B on the same
+     * landing machine. The agent applies only B's document. Judging
+     * change A afterwards must NOT complete it off the back of B's
+     * higher applied version — the applied document does not embody
+     * A's retarget. A closes as superseded; B completes.
+     */
+    public function test_newer_change_supersedes_older_change_instead_of_completing_it(): void
+    {
+        $landing = $this->bareMachine('LAND-N02-AB', ServerMachine::ROLE_LANDING);
+        $relay = $this->enableRelay($this->makeMachine('R-N02-AB'));
+        $node = $this->makeNode($landing);
+        app(RelayRuleService::class)->create($relay, $this->nodeRule($node->id, 20421), 'admin', 1);
+
+        $roles = new MachineRoleService(app(RelayConfigService::class), fn () => true);
+        $first = $roles->setPublicAddressWithReport($landing->fresh(), '198.51.100.120', 'admin', 1);
+        $second = $roles->setPublicAddressWithReport($landing->fresh(), '198.51.100.121', 'admin', 1);
+        $this->assertNotSame($first['address_change_id'], $second['address_change_id']);
+
+        // The agent applies only the newest document (B's retarget).
+        $config = app(RelayConfigService::class);
+        $doc = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $doc['version'], $doc['hash'], true));
+
+        $firstChange = $roles->resumeAddressChange(RelayAddressChange::find($first['address_change_id']), 'admin', 1);
+        $this->assertSame('superseded', $firstChange->followers[$relay->id]['status'],
+            'an applied document carrying B\'s target must not confirm A\'s change');
+        $this->assertSame(RelayAddressChange::STATUS_SUPERSEDED, $firstChange->status);
+        $this->assertNull($firstChange->completed_at, 'a superseded change is never announced complete');
+        $this->assertFalse($firstChange->isOpen());
+
+        $secondChange = $roles->resumeAddressChange(RelayAddressChange::find($second['address_change_id']), 'admin', 1);
+        $this->assertSame('confirmed', $secondChange->followers[$relay->id]['status']);
+        $this->assertSame(RelayAddressChange::STATUS_COMPLETE, $secondChange->status);
+        $this->assertNotNull($secondChange->completed_at);
     }
 }

@@ -4,6 +4,7 @@ namespace App\Services\Relay;
 
 use App\Models\RelayAddressChange;
 use App\Models\RelayAuditLog;
+use App\Models\RelayConfigOutbox;
 use App\Models\RelayRule;
 use App\Models\Server;
 use App\Models\ServerMachine;
@@ -150,13 +151,14 @@ class MachineRoleService
      *    published independently; the outcome is persisted per machine
      *    in the audit log (machine.public_address.follow, published vN /
      *    FAILED: reason) and returned in the report.
-     *  - Durable recovery (B03): the change is also recorded as a
-     *    RelayAddressChange with per-follower state (published version /
-     *    failure / attempts / ACK convergence). A failed follower is no
-     *    longer just an audit line: resumeAddressChange() — driven by
-     *    the reconcile loop and the admin API — retries it until every
-     *    follower's applied version covers the version this change
-     *    published for it, and the change completes.
+     *  - Durable recovery (B03, completed by N02): the change is also
+     *    recorded as a RelayAddressChange with per-follower state
+     *    (published version / failure / attempts / ACK convergence). A
+     *    follower that never got published is no longer just an audit
+     *    line: resumeAddressChange() — driven by the reconcile loop and
+     *    the admin API — retries pending and failed followers alike
+     *    until every follower is confirmed under the content standard
+     *    in refreshChangeStatus(), and the change completes.
      *
      * @return array{machine: ServerMachine, followers: array<int, array{machine_id: int, status: string, version?: int, error?: string}>, precheck: ?array, address_change_id: int, address_change_status: string}
      */
@@ -231,27 +233,52 @@ class MachineRoleService
     }
 
     /**
-     * B03: resume an address change — retry every follower whose publish
-     * failed, then re-check ACK convergence for the rest. Idempotent
-     * and safe to run repeatedly (the reconcile loop runs it for every
-     * open change; the admin API exposes it for manual runs). A follower
-     * counts as converged once its machine's applied version covers the
-     * version this change published for it; the change completes when
-     * every follower has converged.
+     * B03 + N02: resume an address change — retry every follower that
+     * has not been published yet, then re-check ACK convergence for the
+     * rest. Safe to run repeatedly (the reconcile loop runs it for every
+     * open change; the admin API exposes it for manual runs).
+     *
+     * N02 (GPT round 3): round 2 retried only followers marked
+     * `failed`. A follower still `pending` — the record was created and
+     * the process died before the publish loop reached it (crash,
+     * container restart) — was skipped forever and the change could
+     * never converge. `pending` is a resumable state. Both the first
+     * run and a resume are idempotent: before publishing, a follower
+     * whose latest published document already equals the document that
+     * would be derived now is recognised as done (an interrupted
+     * publish that did land, or an unrelated republish that already
+     * carried the new address) and is NOT published again — repeated
+     * resumes must not inflate the machine's config version.
+     *
+     * Convergence itself is judged by refreshChangeStatus() under the
+     * content standard documented there, not by version numbers alone.
      */
     public function resumeAddressChange(RelayAddressChange $change, string $actorType = 'system', ?int $actorId = null): RelayAddressChange
     {
         foreach (($change->followers ?? []) as $relayMachineId => $state) {
-            if (($state['status'] ?? '') !== 'failed') {
+            $followerStatus = $state['status'] ?? '';
+            if ($followerStatus !== 'failed' && $followerStatus !== 'pending') {
                 continue;
             }
             $relayMachineId = (int) $relayMachineId;
-            $attempts = (int) ($state['attempts'] ?? 0) + 1;
             $relayMachine = ServerMachine::find($relayMachineId);
             if (!$relayMachine) {
-                $this->noteFollowerOutcome($change, $relayMachineId, ['status' => 'failed', 'error' => 'relay machine no longer exists', 'attempts' => $attempts]);
+                $this->noteFollowerOutcome($change, $relayMachineId, ['status' => 'failed', 'error' => 'relay machine no longer exists', 'attempts' => (int) ($state['attempts'] ?? 0) + 1]);
                 continue;
             }
+            $alreadyPublished = $this->publishedVersionCoveringCurrentDocument($relayMachine);
+            if ($alreadyPublished !== null) {
+                $this->noteFollowerOutcome($change, $relayMachineId, [
+                    'status' => 'published',
+                    'version' => $alreadyPublished,
+                    'error' => null,
+                    'attempts' => (int) ($state['attempts'] ?? 0),
+                    'note' => 'already published as v' . $alreadyPublished . '; resume recognised it, no republish',
+                ]);
+                RelayAuditLog::record($relayMachineId, null, $actorType, $actorId, 'machine.public_address.follow', 'already at v' . $alreadyPublished . ' (address change #' . $change->id . ' on machine ' . $change->machine_id . ' resumed; no republish needed)');
+                continue;
+            }
+            $attempts = (int) ($state['attempts'] ?? 0) + 1;
             try {
                 $outbox = $this->config->publish($relayMachine, $actorType, $actorId);
                 $this->noteFollowerOutcome($change, $relayMachineId, ['status' => 'published', 'version' => (int) $outbox->version, 'error' => null, 'attempts' => $attempts]);
@@ -279,28 +306,52 @@ class MachineRoleService
     }
 
     /**
-     * Recompute a change's status from its followers: upgrade published
-     * followers whose machine has ACKed at least the published version
-     * to `confirmed`; any failure keeps the change `partial`; all
-     * confirmed (or no followers at all) completes it.
+     * Recompute a change's status from its followers.
+     *
+     * N02 confirmation standard (final definition, GPT round 3): a
+     * published follower is `confirmed` for THIS change only when the
+     * document the agent has actually applied embodies this change's
+     * retarget — concretely, for every NODE rule in the document this
+     * change published whose target node lives on the changed machine,
+     * the applied document either carries the same target_host or no
+     * longer carries the rule at all (a later removal makes the
+     * retarget question moot). An applied version NUMBER larger than
+     * the published one proves nothing by itself: under consecutive
+     * changes A->B the agent may have applied B's document only, and
+     * the A change must not be announced complete off the back of B's
+     * ACK. Such a follower is `superseded` once a newer change for the
+     * same landing machine has published a higher version for it, and
+     * the change closes as `superseded` — terminal, never `complete`.
+     * Any failure keeps the change `partial`; all confirmed (or no
+     * followers at all) completes it.
      */
     private function refreshChangeStatus(RelayAddressChange $change): void
     {
         $followers = $change->followers ?? [];
         foreach ($followers as $relayMachineId => $state) {
-            if (($state['status'] ?? '') === 'published' && isset($state['version'])) {
-                $relayMachine = ServerMachine::find((int) $relayMachineId);
-                if ($relayMachine && (int) $relayMachine->relay_applied_version >= (int) $state['version']) {
-                    $state['status'] = 'confirmed';
-                    $state['updated_at'] = now()->toIso8601String();
-                    $followers[$relayMachineId] = $state;
-                }
+            if (($state['status'] ?? '') !== 'published' || !isset($state['version'])) {
+                continue;
             }
+            $relayMachine = ServerMachine::find((int) $relayMachineId);
+            if (!$relayMachine || (int) $relayMachine->relay_applied_version < (int) $state['version']) {
+                continue;
+            }
+            if ($this->appliedDocumentMatchesChange($change, $relayMachine, (int) $state['version'])) {
+                $state['status'] = 'confirmed';
+            } elseif ($this->followerSupersededByNewerChange($change, (int) $relayMachineId, (int) $state['version'])) {
+                $state['status'] = 'superseded';
+            } else {
+                continue;
+            }
+            $state['updated_at'] = now()->toIso8601String();
+            $followers[$relayMachineId] = $state;
         }
         $statuses = array_values(array_map(fn ($s) => $s['status'] ?? 'pending', $followers));
         $status = match (true) {
             in_array('failed', $statuses, true) => RelayAddressChange::STATUS_PARTIAL,
             $statuses === [] || array_filter($statuses, fn ($s) => $s !== 'confirmed') === [] => RelayAddressChange::STATUS_COMPLETE,
+            array_filter($statuses, fn ($s) => !in_array($s, ['confirmed', 'superseded'], true)) === [] => RelayAddressChange::STATUS_SUPERSEDED,
+            in_array('pending', $statuses, true) => RelayAddressChange::STATUS_IN_PROGRESS,
             default => RelayAddressChange::STATUS_AWAITING_ACK,
         };
         $change->forceFill([
@@ -308,6 +359,93 @@ class MachineRoleService
             'status' => $status,
             'completed_at' => $status === RelayAddressChange::STATUS_COMPLETE ? ($change->completed_at ?? now()) : null,
         ])->save();
+    }
+
+    /**
+     * N02 idempotency probe: if the machine's latest published document
+     * already equals the document that would be derived from current
+     * state (same relay_enabled / machine_status / rules — version and
+     * generated_at excluded, they differ on every build), return that
+     * version. The publish this change owes has then already happened,
+     * whoever ran it, and publishing again would only inflate the
+     * config version.
+     */
+    private function publishedVersionCoveringCurrentDocument(ServerMachine $relayMachine): ?int
+    {
+        $latest = RelayConfigOutbox::where('machine_id', $relayMachine->id)
+            ->orderByDesc('version')->first();
+        if (!$latest) {
+            return null;
+        }
+        $published = json_decode($latest->payload, true);
+        if (!is_array($published)) {
+            return null;
+        }
+        $shape = fn (array $doc): array => [
+            'relay_enabled' => (bool) ($doc['relay_enabled'] ?? false),
+            'machine_status' => $doc['machine_status'] ?? null,
+            'rules' => $doc['rules'] ?? [],
+        ];
+        $current = $this->config->buildDocument($relayMachine);
+        return $shape($current) === $shape($published) ? (int) $latest->version : null;
+    }
+
+    /**
+     * The content half of the N02 confirmation standard: compare the
+     * NODE targets this change published (the outbox at the recorded
+     * version) with the targets in the document the agent has actually
+     * applied (the outbox at relay_applied_version), restricted to
+     * rules whose target node lives on the changed machine. When
+     * either document is unavailable there is nothing to judge
+     * against, and the caller's version comparison stands.
+     */
+    private function appliedDocumentMatchesChange(RelayAddressChange $change, ServerMachine $relayMachine, int $publishedVersion): bool
+    {
+        $expected = RelayConfigOutbox::where('machine_id', $relayMachine->id)
+            ->where('version', $publishedVersion)->first();
+        $applied = RelayConfigOutbox::where('machine_id', $relayMachine->id)
+            ->where('version', (int) $relayMachine->relay_applied_version)->first();
+        if (!$expected || !$applied) {
+            return true;
+        }
+        $nodeIds = Server::where('machine_id', $change->machine_id)
+            ->pluck('id')->map(fn ($id) => (int) $id)->all();
+        $targetsOf = function (string $payload) use ($nodeIds): array {
+            $doc = json_decode($payload, true);
+            $map = [];
+            foreach (($doc['rules'] ?? []) as $entry) {
+                if (($entry['target_type'] ?? null) === RelayRule::TARGET_NODE
+                    && in_array((int) ($entry['target_node_id'] ?? 0), $nodeIds, true)) {
+                    $map[(string) $entry['rule_code']] = (string) $entry['target_host'];
+                }
+            }
+            return $map;
+        };
+        $expectedTargets = $targetsOf($expected->payload);
+        $appliedTargets = $targetsOf($applied->payload);
+        foreach ($expectedTargets as $code => $host) {
+            if (array_key_exists($code, $appliedTargets) && $appliedTargets[$code] !== $host) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * A follower whose applied document does not embody this change is
+     * superseded when a NEWER address change for the same landing
+     * machine has published a higher version for this same follower —
+     * the newer change owns the follower's convergence from there.
+     */
+    private function followerSupersededByNewerChange(RelayAddressChange $change, int $relayMachineId, int $publishedVersion): bool
+    {
+        return RelayAddressChange::where('machine_id', $change->machine_id)
+            ->where('id', '>', $change->id)
+            ->get()
+            ->contains(function (RelayAddressChange $newer) use ($relayMachineId, $publishedVersion) {
+                $state = ($newer->followers ?? [])[$relayMachineId] ?? null;
+                return $state !== null && isset($state['version']) && (int) $state['version'] > $publishedVersion;
+            });
     }
 
     /**
