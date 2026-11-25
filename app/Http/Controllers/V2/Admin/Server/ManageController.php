@@ -8,6 +8,7 @@ use App\Http\Requests\Admin\ServerSave;
 use App\Models\Server;
 use App\Models\ServerGroup;
 use App\Models\SuzuNodeProfile;
+use App\Services\Relay\MachineRoleService;
 use App\Services\ServerService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -57,6 +58,12 @@ class ManageController extends Controller
         $params = $request->validated();
         $profile = $params['suzu_profile'] ?? null;
         unset($params['suzu_profile']);
+        if (!empty($params['machine_id'])) {
+            $assignError = MachineRoleService::nodeAssignmentError((int) $params['machine_id']);
+            if ($assignError) {
+                return $this->fail([400210, $assignError]);
+            }
+        }
         try {
             DB::transaction(function () use ($request, $params, $profile) {
                 if ($request->input('id')) {
@@ -104,6 +111,12 @@ class ManageController extends Controller
             $server->show = (int) $params['show'];
         }
         if (array_key_exists('machine_id', $params)) {
+            if (!empty($params['machine_id'])) {
+                $assignError = MachineRoleService::nodeAssignmentError((int) $params['machine_id']);
+                if ($assignError) {
+                    return $this->fail([400210, $assignError]);
+                }
+            }
             $server->machine_id = $params['machine_id'] ?: null;
         }
         if (array_key_exists('enabled', $params)) {
@@ -253,6 +266,12 @@ class ManageController extends Controller
             $update['enabled'] = (bool) $params['enabled'];
         }
         if (array_key_exists('machine_id', $params)) {
+            if (!empty($params['machine_id'])) {
+                $assignError = MachineRoleService::nodeAssignmentError((int) $params['machine_id']);
+                if ($assignError) {
+                    return $this->fail([400210, $assignError]);
+                }
+            }
             $update['machine_id'] = $params['machine_id'] ?: null;
         }
 

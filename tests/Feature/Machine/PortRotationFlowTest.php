@@ -103,7 +103,12 @@ class PortRotationFlowTest extends MachineTestCase
         // Put a relay machine + rule in front of the Reality node.
         $relayMachine = ServerMachine::create([
             'name' => '中转机', 'token' => Str::random(40), 'is_active' => true, 'relay_tier' => 'small',
+            'role' => ServerMachine::ROLE_RELAY,
         ]);
+        // The node's machine needs its authoritative public landing
+        // address before a NODE rule may target its nodes.
+        ServerMachine::findOrFail($node->machine_id)
+            ->forceFill(['public_address' => '203.0.113.10'])->save();
         app(RelayMachineService::class)->enable($relayMachine);
         $rule = app(RelayRuleService::class)->create($relayMachine->fresh(), [
             'name' => '整机-Reality 入口',
@@ -143,6 +148,20 @@ class PortRotationFlowTest extends MachineTestCase
             $this->fail('expected refusal');
         } catch (PortRotationException $e) {
             $this->assertTrue(true);
+        }
+    }
+
+    /** Front-proxied nodes (direct_port set) refuse rotation outright. */
+    public function test_front_proxied_node_refuses_rotation(): void
+    {
+        $user = $this->makeUser();
+        $f = $this->deliverFor($user);
+        Server::whereIn('id', $f->nodeIds())->update(['direct_port' => 8444]);
+        try {
+            $this->rotation()->rotateForUser($user->fresh());
+            $this->fail('expected rotation refusal for front-proxied nodes');
+        } catch (PortRotationException $e) {
+            $this->assertStringContainsString('前置型节点', $e->getMessage());
         }
     }
 

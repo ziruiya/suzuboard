@@ -43,6 +43,8 @@ class RelayController extends Controller
             return [
                 'id' => $m->id,
                 'name' => $m->name,
+                'role' => $m->role,
+                'public_address' => $m->public_address,
                 'is_active' => $m->is_active,
                 'last_seen_at' => $m->last_seen_at,
                 'node_count' => Server::where('machine_id', $m->id)->count(),

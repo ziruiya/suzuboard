@@ -67,7 +67,7 @@ class RelayApiTest extends RelayTestCase
         ]);
         $created->assertOk();
         $this->assertSame('RL000001', $created->json('data.rule_code'));
-        $this->assertSame($node->host, $created->json('data.target_host'));
+        $this->assertSame($landing->fresh()->public_address, $created->json('data.target_host'));
 
         $list = $this->getJson($this->uriBySuffix('suzu/relay/rules') . '?machine_id=' . $machine->id);
         $list->assertOk();

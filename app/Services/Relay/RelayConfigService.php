@@ -16,11 +16,13 @@ use Illuminate\Support\Facades\DB;
  * config document under a higher version; rollback republishes an older
  * document's content under a fresh version (versions only ever move up).
  *
- * NODE-target rules follow their node: host/port are read live from the
- * node at publish time (SB-Endpoint philosophy — the binding follows the
- * node's current landing). A target node that was deleted or lost agent
- * eligibility turns the rule BROKEN: it is excluded from the document and
- * never silently rebound to anything else.
+ * NODE-target rules follow their node's LANDING endpoint: the hosting
+ * machine's public_address + the node's effective landing port
+ * (direct_port ?? server_port), derived live at publish time. The node's
+ * subscription host is an entry alias and is never used as a target. A
+ * target node that was deleted, lost agent eligibility, or whose machine
+ * has no public_address turns the rule BROKEN: it is excluded from the
+ * document and never silently rebound to anything else.
  */
 class RelayConfigService
 {
@@ -34,7 +36,7 @@ class RelayConfigService
     public function buildDocument(ServerMachine $machine): array
     {
         $rules = [];
-        if ($machine->relay_enabled && $machine->relay_status !== ServerMachine::RELAY_STATUS_DRAINING) {
+        if ($machine->isRelayRole() && $machine->relay_enabled && $machine->relay_status !== ServerMachine::RELAY_STATUS_DRAINING) {
             RelayRule::where('machine_id', $machine->id)
                 ->where('enabled', true)
                 ->orderBy('id')
@@ -51,7 +53,7 @@ class RelayConfigService
         return [
             'protocol' => self::PROTOCOL,
             'machine_id' => (int) $machine->id,
-            'relay_enabled' => (bool) $machine->relay_enabled
+            'relay_enabled' => (bool) ($machine->isRelayRole() && $machine->relay_enabled)
                 && $machine->relay_status !== ServerMachine::RELAY_STATUS_DRAINING,
             'machine_status' => $machine->relay_status,
             'generated_at' => now()->toIso8601String(),
@@ -75,9 +77,25 @@ class RelayConfigService
                 }
                 return null;
             }
-            // Follow the node's current landing; refresh the snapshot.
-            $host = (string) $node->host;
-            $port = (int) $node->server_port;
+            // Follow the node's current LANDING endpoint (its machine's
+            // public_address + effective landing port), never the node's
+            // subscription host: that host is a client-facing entry alias.
+            // A landing that cannot be derived (machine address cleared
+            // after the rule was created) breaks the rule, same as a lost
+            // eligibility — it is excluded and never silently rebound.
+            [$endpoint, $endpointError] = RelayRuleService::nodeLandingEndpoint($node);
+            if ($endpoint === null) {
+                if ($rule->status !== RelayRule::STATUS_BROKEN) {
+                    $rule->forceFill([
+                        'status' => RelayRule::STATUS_BROKEN,
+                        'last_error' => $endpointError,
+                    ])->save();
+                    RelayAuditLog::record($rule->machine_id, $rule->id, 'system', null, 'rule.broken', $rule->rule_code);
+                }
+                return null;
+            }
+            $host = $endpoint['host'];
+            $port = $endpoint['port'];
             $hash = RelayRuleService::nodeContractHash($node);
             if ($rule->target_snapshot_host !== $host || (int) $rule->target_snapshot_port !== $port
                 || $rule->target_contract_hash !== $hash) {

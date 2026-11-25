@@ -141,9 +141,12 @@
           ? '<span class="muted">排空…</span>'
           : (m.relay_enabled
               ? '<button data-act="disable" data-id="' + m.id + '" class="danger">取消中转机</button>'
-              : '<button data-act="enable" data-id="' + m.id + '">设为中转机</button>');
+              : (m.role === 'relay'
+                  ? '<button data-act="enable" data-id="' + m.id + '">设为中转机</button>'
+                  : '<span class="muted">落地机 · 角色二选一</span>'));
         return '<tr data-mid="' + m.id + '" style="cursor:pointer">'
-          + '<td>' + esc(m.name) + ' <span class="muted">#' + m.id + '</span></td>'
+          + '<td>' + esc(m.name) + ' <span class="muted">#' + m.id + '</span><br><span class="muted">'
+          + (m.role === 'relay' ? '中转机' : '落地机') + ' · ' + esc(m.public_address || '未填公网地址') + '</span></td>'
           + '<td>' + (m.last_seen_at ? new Date(m.last_seen_at * 1000).toLocaleString() : '<span class="muted">未见</span>') + '</td>'
           + '<td>' + badge(m.relay_status) + '</td>'
           + '<td>' + esc(m.relay_tier) + ' · 规则≤' + m.limits.rules + ' TCP≤' + m.limits.tcp + ' UDP≤' + m.limits.udp + '</td>'

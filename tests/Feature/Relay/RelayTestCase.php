@@ -31,12 +31,17 @@ abstract class RelayTestCase extends TestCase
 
     protected function makeMachine(string $name, string $tier = 'small'): ServerMachine
     {
-        return ServerMachine::create([
+        $machine = ServerMachine::create([
             'name' => $name,
             'token' => Str::random(40),
             'is_active' => true,
             'relay_tier' => $tier,
+            // The relay suite's machines are relay-role machines with a
+            // configured public landing address (TEST-NET-3, per machine).
+            'role' => ServerMachine::ROLE_RELAY,
         ]);
+        $machine->forceFill(['public_address' => '203.0.113.' . (10 + $machine->id)])->save();
+        return $machine->fresh();
     }
 
     protected function enableRelay(ServerMachine $machine): ServerMachine

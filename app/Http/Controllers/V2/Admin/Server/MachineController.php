@@ -8,6 +8,8 @@ use App\Models\Server;
 use App\Models\ServerMachine;
 use App\Models\ServerMachineLoadHistory;
 use App\Services\NodeSyncService;
+use App\Services\Relay\MachineRoleService;
+use App\Services\Relay\RelayValidationException;
 use Illuminate\Http\Request;
 
 class MachineController extends Controller
@@ -24,6 +26,8 @@ class MachineController extends Controller
                 return [
                     'id' => $machine->id,
                     'name' => $machine->name,
+                    'role' => $machine->role,
+                    'public_address' => $machine->public_address,
                     'notes' => $machine->notes,
                     'is_active' => $machine->is_active,
                     'last_seen_at' => $machine->last_seen_at,
@@ -47,6 +51,7 @@ class MachineController extends Controller
             'name' => 'required|string|max:255',
             'notes' => 'nullable|string',
             'is_active' => 'nullable|boolean',
+            'public_address' => 'nullable|string|max:255',
         ]);
 
         if (!empty($params['id'])) {
@@ -59,6 +64,15 @@ class MachineController extends Controller
                 $update['is_active'] = $params['is_active'];
             }
             $machine->update($update);
+            if (array_key_exists('public_address', $params)) {
+                try {
+                    app(MachineRoleService::class)->setPublicAddress(
+                        $machine, $params['public_address'], 'admin', $request->user()?->id
+                    );
+                } catch (RelayValidationException $e) {
+                    return $this->fail([422, $e->getMessage()]);
+                }
+            }
             return $this->success(true);
         }
 
@@ -66,6 +80,7 @@ class MachineController extends Controller
             'name' => $params['name'],
             'notes' => $params['notes'] ?? null,
             'is_active' => $params['is_active'] ?? true,
+            'public_address' => $params['public_address'] ?? null,
             'token' => ServerMachine::generateToken(),
         ]);
 
@@ -74,6 +89,26 @@ class MachineController extends Controller
             'token' => $machine->token,
             'install_command' => $this->buildInstallCommand($request, $machine),
         ]);
+    }
+
+    /**
+     * 设置机器角色（落地机 / 中转机，二选一）。角色变更只走守卫路径：
+     * 有存量节点/规则时拒绝并给出清理路径，绝不静默连带处理。
+     */
+    public function setRole(Request $request, MachineRoleService $roles)
+    {
+        $params = $request->validate([
+            'id' => 'required|integer|exists:v2_server_machine,id',
+            'role' => 'required|string|in:landing,relay',
+        ]);
+
+        $machine = ServerMachine::find($params['id']);
+        try {
+            $roles->setRole($machine, $params['role'], 'admin', $request->user()?->id);
+        } catch (RelayValidationException $e) {
+            return $this->fail([422, $e->getMessage()]);
+        }
+        return $this->success(true);
     }
 
     /**

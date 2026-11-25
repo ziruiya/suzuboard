@@ -21,6 +21,11 @@ class RelayMachineService
 
     public function enable(ServerMachine $machine, string $actorType = 'admin', ?int $actorId = null): ServerMachine
     {
+        if (!$machine->isRelayRole()) {
+            throw new RelayValidationException(
+                'machine "' . $machine->name . '" is a landing machine (role=landing) and cannot run the relay; set its role to relay first (it must host no nodes)'
+            );
+        }
         $machine->forceFill([
             'relay_enabled' => true,
             'relay_status' => ServerMachine::RELAY_STATUS_ENABLED,

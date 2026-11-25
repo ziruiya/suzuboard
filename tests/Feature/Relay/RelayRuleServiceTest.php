@@ -102,7 +102,10 @@ class RelayRuleServiceTest extends RelayTestCase
             'name' => '绑节点', 'transport' => 'tcp', 'listen_ip' => '0.0.0.0', 'listen_port' => 20020,
             'target_type' => 'NODE', 'target_node_id' => $good->id,
         ]);
-        $this->assertSame($good->host, $rule->target_host);
+        // NODE targets store the derived LANDING endpoint (the hosting
+        // machine's public_address + effective landing port), never the
+        // node's subscription host.
+        $this->assertSame($landing->fresh()->public_address, $rule->target_host);
         $this->assertSame(443, (int) $rule->target_port);
 
         $disabled = $this->makeNode($landing, ['enabled' => false]);

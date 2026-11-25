@@ -105,6 +105,11 @@ class RelayRuleService
 
     private function assertMachineCanTakeRules(ServerMachine $machine): void
     {
+        if (!$machine->isRelayRole()) {
+            throw new RelayValidationException(
+                'machine "' . $machine->name . '" is a landing machine (role=landing); only relay-role machines can hold relay rules'
+            );
+        }
         if (!$machine->relay_enabled || $machine->relay_status === ServerMachine::RELAY_STATUS_DRAINING) {
             throw new RelayValidationException('machine is not an active relay machine');
         }
@@ -146,6 +151,15 @@ class RelayRuleService
         $targetHost = '';
         $targetPort = 0;
         $contractHash = null;
+        // target_resolve_mode is narrowed to its single live meaning:
+        // 'auto' — the agent dials the published host, resolving hostnames
+        // per connection. Anything else is rejected instead of being
+        // silently stored as a dead value.
+        $resolveMode = strtolower(trim((string) ($data['target_resolve_mode'] ?? 'auto')));
+        if ($resolveMode !== 'auto') {
+            throw new RelayValidationException('target_resolve_mode must be "auto" (the only supported mode)');
+        }
+
         if ($targetType === RelayRule::TARGET_NODE) {
             $targetNodeId = (int) ($data['target_node_id'] ?? 0);
             $node = Server::find($targetNodeId);
@@ -155,8 +169,21 @@ class RelayRuleService
             if (!ServerService::isAgentDeliverable($node)) {
                 throw new RelayValidationException('target node is not agent-deliverable (disabled, hidden stock node, or non-production profile)');
             }
-            $targetHost = (string) $node->host;
-            $targetPort = (int) $node->server_port;
+            if ($node->machine_id && (int) $node->machine_id === (int) $machine->id) {
+                throw new RelayValidationException(
+                    'target node is hosted on this relay machine itself; machine roles are exclusive (landing or relay, never both), so a relay rule can never target a node on its own machine'
+                );
+            }
+            // The target is the node's LANDING endpoint — its machine's
+            // public address + the node's effective landing port — never
+            // the node's subscription host (an entry alias) and never the
+            // raw server_port of a front-proxied node.
+            [$endpoint, $endpointError] = self::nodeLandingEndpoint($node);
+            if ($endpoint === null) {
+                throw new RelayValidationException($endpointError);
+            }
+            $targetHost = $endpoint['host'];
+            $targetPort = $endpoint['port'];
             $contractHash = self::nodeContractHash($node);
         } elseif ($targetType === RelayRule::TARGET_MANUAL) {
             $targetHost = trim((string) ($data['target_host'] ?? ''));
@@ -219,6 +246,7 @@ class RelayRuleService
             'target_host' => $targetHost,
             'target_port' => $targetPort,
             'target_contract_hash' => $contractHash,
+            'target_resolve_mode' => 'auto',
             'target_snapshot_host' => $targetType === RelayRule::TARGET_NODE ? $targetHost : null,
             'target_snapshot_port' => $targetType === RelayRule::TARGET_NODE ? $targetPort : null,
             'allowlist_cidrs' => $allowlist ?: null,
@@ -385,11 +413,52 @@ class RelayRuleService
         return (int) $bits >= 0 && (int) $bits <= $max;
     }
 
+    /**
+     * The landing endpoint a NODE relay target actually dials:
+     * [ {host, port} | null, error | null ].
+     *
+     * host = the public_address of the machine hosting the node (the
+     * panel's authoritative machine address — the node's own host is a
+     * client-facing entry alias and is never a landing address);
+     * port = direct_port ?? server_port (direct_port covers front-proxied
+     * nodes whose server_port is a loopback-only backend port).
+     */
+    public static function nodeLandingEndpoint(Server $node): array
+    {
+        if (!$node->machine_id) {
+            return [null, 'target node is not hosted on any machine; NODE relay targets require a machine-hosted node'];
+        }
+        $machine = $node->relationLoaded('machine')
+            ? $node->machine
+            : ServerMachine::find($node->machine_id);
+        if (!$machine) {
+            return [null, 'target node\'s machine no longer exists'];
+        }
+        $address = trim((string) ($machine->public_address ?? ''));
+        if ($address === '') {
+            return [null, 'target machine "' . $machine->name . '" has no public_address configured; set it in server management before a relay rule can target its nodes'];
+        }
+        $port = (int) ($node->direct_port ?: $node->server_port);
+        if ($port < 1 || $port > 65535) {
+            return [null, 'target node has no valid landing port (direct_port/server_port)'];
+        }
+        return [['host' => $address, 'port' => $port], null];
+    }
+
+    /**
+     * Contract hash over the DERIVED landing endpoint: it changes exactly
+     * when the published target would change (machine address, effective
+     * landing port, hosting machine, eligibility) — the node's
+     * subscription host is deliberately NOT part of it anymore.
+     */
     public static function nodeContractHash(Server $node): string
     {
+        [$endpoint] = self::nodeLandingEndpoint($node);
         return hash('sha256', implode('|', [
-            $node->id, $node->type, $node->host, $node->server_port,
-            $node->machine_id ?? '', $node->enabled ? '1' : '0', $node->show ? '1' : '0',
+            $node->id, $node->type,
+            $node->machine_id ?? '',
+            $endpoint['host'] ?? '', $endpoint['port'] ?? '',
+            $node->enabled ? '1' : '0', $node->show ? '1' : '0',
         ]));
     }
 

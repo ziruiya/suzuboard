@@ -14,6 +14,8 @@ use Illuminate\Support\Str;
  * @property string $token 认证 Token
  * @property string|null $notes 备注
  * @property bool $is_active 是否启用
+ * @property string $role 机器角色 landing|relay（二选一，权威字段）
+ * @property string|null $public_address 机器公网落地地址（IP 或主机名）
  * @property int|null $last_seen_at 最后心跳时间
  * @property array|null $load_status 负载状态
  * @property \Illuminate\Support\Carbon $created_at
@@ -53,6 +55,25 @@ class ServerMachine extends Model
     }
 
     // ---- SB-RELAY-01 -------------------------------------------------
+
+    /**
+     * Machine role (owner ruling 2026-11-25): a machine is a landing
+     * machine OR a relay machine, never both. `role` is the authoritative
+     * field; relay_enabled/relay_status are only the operational switch
+     * INSIDE the relay role and are inert on landing machines.
+     */
+    public const ROLE_LANDING = 'landing';
+    public const ROLE_RELAY = 'relay';
+
+    public function isRelayRole(): bool
+    {
+        return $this->role === self::ROLE_RELAY;
+    }
+
+    public function isLandingRole(): bool
+    {
+        return $this->role !== self::ROLE_RELAY;
+    }
 
     public const RELAY_STATUS_DISABLED = 'DISABLED';
     public const RELAY_STATUS_ENABLED = 'ENABLED';

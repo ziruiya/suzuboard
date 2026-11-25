@@ -87,13 +87,17 @@ class RelaySyncTest extends RelayTestCase
             'target_type' => 'NODE', 'target_node_id' => $node->id,
         ]);
 
-        // Node landing changes: the next publish follows it.
+        // The node's LANDING changes (its machine's public address and
+        // the node's landing port): the next publish follows the derived
+        // endpoint. The node's subscription host is an entry alias and
+        // deliberately plays no role in the published target.
         $node->forceFill(['host' => 'new.example.test', 'server_port' => 8443])->save();
+        $landing->forceFill(['public_address' => '203.0.113.99'])->save();
         app(RelayConfigService::class)->publish($machine->fresh());
         $latest = app(RelayConfigService::class)->latestForAgent($machine->fresh());
-        $this->assertSame('new.example.test', $latest['config']['rules'][0]['target_host']);
+        $this->assertSame('203.0.113.99', $latest['config']['rules'][0]['target_host']);
         $this->assertSame(8443, $latest['config']['rules'][0]['target_port']);
-        $this->assertSame('new.example.test', $rule->fresh()->target_snapshot_host);
+        $this->assertSame('203.0.113.99', $rule->fresh()->target_snapshot_host);
 
         // Node deleted: rule turns BROKEN and leaves the document.
         $node->delete();

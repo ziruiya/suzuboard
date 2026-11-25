@@ -136,6 +136,12 @@ class PortRotationService
     /** Rotate one dedicated node; only its ports may change. */
     private function rotateNode(Server $server): array
     {
+        // Front-proxied nodes (direct_port set) are shared-fleet nodes,
+        // never rotation customers: rotating server_port would move the
+        // derived landing endpoint out from under the front proxy.
+        if ($server->direct_port) {
+            throw new PortRotationException('该节点为前置型节点（设有落地直达端口），不支持自动更换端口');
+        }
         $oldPort = (int) $server->server_port;
         $rule = RelayRule::where('target_type', RelayRule::TARGET_NODE)
             ->where('target_node_id', $server->id)

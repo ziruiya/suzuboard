@@ -20,6 +20,7 @@ use Illuminate\Database\Eloquent\Casts\Attribute;
  * @property string $host 主机地址
  * @property string|int $port 端口
  * @property int|null $server_port 服务器端口
+ * @property int|null $direct_port 落地直达端口覆盖（前置型节点用；有效落地端口 = direct_port ?? server_port）
  * @property array|null $group_ids 分组IDs
  * @property array|null $route_ids 路由IDs
  * @property array|null $tags 标签
@@ -133,6 +134,7 @@ class Server extends Model
         'u' => 'integer',
         'd' => 'integer',
         'machine_id' => 'integer',
+        'direct_port' => 'integer',
     ];
 
     private const MULTIPLEX_CONFIGURATION = [
