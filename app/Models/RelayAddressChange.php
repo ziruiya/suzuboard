@@ -17,8 +17,13 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * until every follower is `confirmed`, at which point the change is
  * `complete`. Confirmation is content-based (N02): the applied
  * document must embody this change's retarget, not merely carry a
- * large enough version number; a follower overtaken by a newer change
- * for the same machine closes as `superseded`, and so does the change
+ * large enough version number, and both documents must exist as
+ * evidence — a missing document blocks confirmation, fail-closed
+ * (N02-2, GPT round 4). An unpublished follower whose change was
+ * overtaken by a newer change for the same machine closes as
+ * `superseded` without adopting or publishing the newer change's
+ * configuration (N02-1, GPT round 4); a follower overtaken after
+ * publishing closes as `superseded` too, and so does the change
  * when no follower is left converging. This replaces round 1's
  * audit-log-only accounting, which left a failed follower with
  * nothing to retry from.

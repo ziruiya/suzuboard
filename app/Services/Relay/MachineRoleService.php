@@ -252,9 +252,18 @@ class MachineRoleService
      *
      * Convergence itself is judged by refreshChangeStatus() under the
      * content standard documented there, not by version numbers alone.
+     *
+     * N02-1 (GPT round 4): the idempotent adoption is bound to THIS
+     * change's target address. Before an unpublished follower is
+     * adopted or published, the change must still own the landing
+     * machine's effective address; a change overtaken by a newer one
+     * closes its unpublished followers as `superseded` and publishes
+     * and adopts nothing — an address that was never published for a
+     * change must never be announced as that change's work.
      */
     public function resumeAddressChange(RelayAddressChange $change, string $actorType = 'system', ?int $actorId = null): RelayAddressChange
     {
+        $landingMachine = ServerMachine::find($change->machine_id);
         foreach (($change->followers ?? []) as $relayMachineId => $state) {
             $followerStatus = $state['status'] ?? '';
             if ($followerStatus !== 'failed' && $followerStatus !== 'pending') {
@@ -264,6 +273,34 @@ class MachineRoleService
             $relayMachine = ServerMachine::find($relayMachineId);
             if (!$relayMachine) {
                 $this->noteFollowerOutcome($change, $relayMachineId, ['status' => 'failed', 'error' => 'relay machine no longer exists', 'attempts' => (int) ($state['attempts'] ?? 0) + 1]);
+                continue;
+            }
+            // N02-1 ownership guard: publishedVersionCoveringCurrent
+            // Document() compares the follower's latest published
+            // document with the document derived from CURRENT state —
+            // it never asks whether that document belongs to this
+            // change. Under consecutive changes X -> A -> B, change #1
+            // (A, still pending) would adopt B's published version and
+            // be confirmed by B's ACK although A was never published.
+            // The adoption — and any fresh publish under this change's
+            // name — is only legitimate while this change's address is
+            // still the machine's effective address, i.e. while the
+            // current document genuinely embodies THIS change's
+            // retarget. Otherwise the follower is superseded, exactly
+            // like a published follower overtaken by a newer change.
+            if ($landingMachine && $landingMachine->public_address !== $change->address) {
+                $this->noteFollowerOutcome($change, $relayMachineId, [
+                    'status' => 'superseded',
+                    'error' => null,
+                    'attempts' => (int) ($state['attempts'] ?? 0),
+                    'note' => 'superseded before publish: machine ' . $change->machine_id . ' is now at '
+                        . ($landingMachine->public_address ?? '(cleared)') . '; this change targeted '
+                        . ($change->address ?? '(cleared)') . ' and never published it',
+                ]);
+                RelayAuditLog::record($relayMachineId, null, $actorType, $actorId, 'machine.public_address.follow',
+                    'superseded: address change #' . $change->id . ' on machine ' . $change->machine_id
+                    . ' targeted ' . ($change->address ?? '(cleared)') . ' but the machine is now at '
+                    . ($landingMachine->public_address ?? '(cleared)') . '; nothing published or adopted for the stale change');
                 continue;
             }
             $alreadyPublished = $this->publishedVersionCoveringCurrentDocument($relayMachine);
@@ -324,6 +361,12 @@ class MachineRoleService
      * the change closes as `superseded` — terminal, never `complete`.
      * Any failure keeps the change `partial`; all confirmed (or no
      * followers at all) completes it.
+     *
+     * Round-4 amendment (N02-2): the content check is fail-closed —
+     * when the published or applied document needed as evidence is
+     * missing, the follower is NOT confirmed (round 3 fell back to
+     * the version comparison alone; that fallback is withdrawn) and
+     * the block is audit-logged for investigation.
      */
     private function refreshChangeStatus(RelayAddressChange $change): void
     {
@@ -395,9 +438,16 @@ class MachineRoleService
      * NODE targets this change published (the outbox at the recorded
      * version) with the targets in the document the agent has actually
      * applied (the outbox at relay_applied_version), restricted to
-     * rules whose target node lives on the changed machine. When
+     * rules whose target node lives on the changed machine.
+     *
+     * N02-2 (GPT round 4, supersedes the round-3 fallback): when
      * either document is unavailable there is nothing to judge
-     * against, and the caller's version comparison stands.
+     * against — and missing evidence must never read as a match.
+     * Round 3 fell back to the caller's version comparison in that
+     * case, which is fail-open: a change could be confirmed with no
+     * content evidence at all. The check is now fail-closed: the
+     * follower stays unconfirmed and the gap is written to the audit
+     * log so the missing document can be investigated.
      */
     private function appliedDocumentMatchesChange(RelayAddressChange $change, ServerMachine $relayMachine, int $publishedVersion): bool
     {
@@ -406,7 +456,14 @@ class MachineRoleService
         $applied = RelayConfigOutbox::where('machine_id', $relayMachine->id)
             ->where('version', (int) $relayMachine->relay_applied_version)->first();
         if (!$expected || !$applied) {
-            return true;
+            $missing = !$expected
+                ? 'published document v' . $publishedVersion . ' is missing'
+                : 'applied document v' . (int) $relayMachine->relay_applied_version . ' is missing';
+            RelayAuditLog::record($relayMachine->id, null, 'system', null, 'machine.public_address.confirm_blocked',
+                'address change #' . $change->id . ' on machine ' . $change->machine_id
+                . ': follower confirmation blocked — ' . $missing
+                . '; no content evidence, follower stays unconfirmed (fail-closed)');
+            return false;
         }
         $nodeIds = Server::where('machine_id', $change->machine_id)
             ->pluck('id')->map(fn ($id) => (int) $id)->all();

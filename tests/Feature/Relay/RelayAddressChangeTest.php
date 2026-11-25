@@ -345,4 +345,145 @@ class RelayAddressChangeTest extends RelayTestCase
         $this->assertSame(RelayAddressChange::STATUS_COMPLETE, $secondChange->status);
         $this->assertNotNull($secondChange->completed_at);
     }
+
+    /**
+     * N02-1 (GPT round 4): the adoption hole round 3 left in the
+     * pending path. Change #1 (X -> A) was recorded and its follower
+     * left `pending` — A was never published. Change #2 (A -> B) then
+     * published and was ACKed. Round 3's resume compared the
+     * follower's latest published document with the document derived
+     * from current state (both B's) and let change #1 ADOPT B's
+     * version, after which B's ACK "confirmed" A. The adoption is now
+     * bound to the change's own target address: resuming the stale
+     * change must close it as superseded, publish nothing, and leave
+     * change #2 complete.
+     */
+    public function test_pending_change_superseded_by_newer_change_does_not_adopt_its_config(): void
+    {
+        $landing = $this->bareMachine('LAND-N02-CLAIM', ServerMachine::ROLE_LANDING);
+        $relay = $this->enableRelay($this->makeMachine('R-N02-CLAIM'));
+        $node = $this->makeNode($landing);
+        app(RelayRuleService::class)->create($relay, $this->nodeRule($node->id, 20441), 'admin', 1);
+
+        // Change #1: the address reached the database as A and the
+        // record was created; the process died before A was published
+        // to any follower.
+        $addressA = '198.51.100.130';
+        $landing->forceFill(['public_address' => $addressA])->save();
+        $stale = RelayAddressChange::create([
+            'machine_id' => $landing->id,
+            'address' => $addressA,
+            'actor_type' => 'admin',
+            'actor_id' => 1,
+            'status' => RelayAddressChange::STATUS_IN_PROGRESS,
+            'followers' => [$relay->id => ['status' => 'pending', 'attempts' => 0]],
+            'precheck' => null,
+        ]);
+
+        // Change #2 (A -> B) runs to completion on the same follower.
+        $roles = new MachineRoleService(app(RelayConfigService::class), fn () => true);
+        $second = $roles->setPublicAddressWithReport($landing->fresh(), '198.51.100.131', 'admin', 1);
+        $config = app(RelayConfigService::class);
+        $doc = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $doc['version'], $doc['hash'], true));
+        $secondChange = $roles->resumeAddressChange(RelayAddressChange::find($second['address_change_id']), 'admin', 1);
+        $this->assertSame(RelayAddressChange::STATUS_COMPLETE, $secondChange->status);
+        $versionAfterB = (int) $relay->fresh()->relay_config_version;
+
+        // The reconcile loop now resumes the stale change #1. It must
+        // NOT adopt B's published version as its own, NOT publish
+        // anything, and close as superseded — never complete.
+        app(RelayReconcileService::class)->run();
+        $stale = $stale->fresh();
+        $this->assertSame('superseded', $stale->followers[$relay->id]['status'],
+            'a pending change overtaken by a newer address must not adopt the newer change\'s config');
+        $this->assertSame(RelayAddressChange::STATUS_SUPERSEDED, $stale->status);
+        $this->assertNull($stale->completed_at, 'a superseded change is never announced complete');
+        $this->assertFalse($stale->isOpen());
+        $this->assertSame($versionAfterB, (int) $relay->fresh()->relay_config_version,
+            'resuming the stale change must not publish or inflate the follower\'s config version');
+        $this->assertTrue(RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'machine.public_address.follow')
+            ->where('detail', 'like', 'superseded: address change #' . $stale->id . '%')->exists());
+
+        $secondChange = $secondChange->fresh();
+        $this->assertSame(RelayAddressChange::STATUS_COMPLETE, $secondChange->status,
+            'the newer change stays complete');
+        $this->assertNotNull($secondChange->completed_at);
+    }
+
+    /**
+     * Shared setup for the N02-2 fail-closed tests: a real address
+     * change publishes v1 for the follower; an unrelated rule publish
+     * moves the follower to v2 and the agent ACKs v2. Returns
+     * [change, relay, publishedVersion(v1), appliedVersion(v2)].
+     */
+    private function changeWithNewerAppliedDocument(string $suffix, int $listenPort): array
+    {
+        $landing = $this->bareMachine('LAND-N02-FC-' . $suffix, ServerMachine::ROLE_LANDING);
+        $relay = $this->enableRelay($this->makeMachine('R-N02-FC-' . $suffix));
+        $node = $this->makeNode($landing);
+        $rules = app(RelayRuleService::class);
+        $rules->create($relay, $this->nodeRule($node->id, $listenPort), 'admin', 1);
+
+        $roles = new MachineRoleService(app(RelayConfigService::class), fn () => true);
+        $report = $roles->setPublicAddressWithReport($landing->fresh(), '198.51.100.140', 'admin', 1);
+        $change = RelayAddressChange::find($report['address_change_id']);
+        $publishedVersion = (int) $change->followers[$relay->id]['version'];
+
+        // An unrelated publish moves the follower past the change's
+        // version, and the agent applies that newer document.
+        $rules->create($relay, $this->manualRule(['name' => '无关发布', 'listen_port' => $listenPort + 1]), 'admin', 1);
+        $config = app(RelayConfigService::class);
+        $doc = $config->latestForAgent($relay->fresh());
+        $this->assertGreaterThan($publishedVersion, (int) $doc['version']);
+        $this->assertTrue($config->handleAck($relay->fresh(), $doc['version'], $doc['hash'], true));
+        return [$change, $relay, $publishedVersion, (int) $doc['version'], $roles];
+    }
+
+    /**
+     * N02-2 (GPT round 4): round 3's confirmation fell back to the
+     * bare version comparison when a document was missing — fail-open.
+     * With the document THIS change published gone, there is no
+     * content evidence: the follower must stay unconfirmed and the
+     * block must be audit-logged.
+     */
+    public function test_missing_expected_document_blocks_confirmation_fail_closed(): void
+    {
+        [$change, $relay, $publishedVersion, $appliedVersion, $roles] = $this->changeWithNewerAppliedDocument('EXP', 20451);
+
+        RelayConfigOutbox::where('machine_id', $relay->id)->where('version', $publishedVersion)->delete();
+
+        $change = $roles->resumeAddressChange($change->fresh(), 'admin', 1);
+        $this->assertSame('published', $change->followers[$relay->id]['status'],
+            'missing content evidence must not confirm the follower');
+        $this->assertNotSame(RelayAddressChange::STATUS_COMPLETE, $change->status);
+        $this->assertNull($change->completed_at);
+        $this->assertTrue(RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'machine.public_address.confirm_blocked')
+            ->where('detail', 'like', '%published document v' . $publishedVersion . ' is missing%')->exists(),
+            'the fail-closed block must be recorded for investigation');
+    }
+
+    /**
+     * N02-2, the other missing side: the published document exists
+     * but the document the agent reports as applied is gone. Same
+     * fail-closed outcome.
+     */
+    public function test_missing_applied_document_blocks_confirmation_fail_closed(): void
+    {
+        [$change, $relay, $publishedVersion, $appliedVersion, $roles] = $this->changeWithNewerAppliedDocument('APP', 20461);
+
+        RelayConfigOutbox::where('machine_id', $relay->id)->where('version', $appliedVersion)->delete();
+
+        $change = $roles->resumeAddressChange($change->fresh(), 'admin', 1);
+        $this->assertSame('published', $change->followers[$relay->id]['status'],
+            'missing content evidence must not confirm the follower');
+        $this->assertNotSame(RelayAddressChange::STATUS_COMPLETE, $change->status);
+        $this->assertNull($change->completed_at);
+        $this->assertTrue(RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'machine.public_address.confirm_blocked')
+            ->where('detail', 'like', '%applied document v' . $appliedVersion . ' is missing%')->exists(),
+            'the fail-closed block must be recorded for investigation');
+    }
 }
