@@ -148,7 +148,18 @@ class EnterpriseLifecycleService
                     break;
                 }
                 if (!$this->assignment->assignWaitingIntent($intent)) {
-                    break;
+                    // SB-MONEY-008: a false return normally means "no
+                    // READY kit" and the whole purpose queue must wait.
+                    // But if the attempt closed the head intent itself
+                    // (its subscription lapsed and it was moved to
+                    // manual handling), later intents may still be
+                    // deliverable — keep scanning instead of letting
+                    // one dead intent block the purpose indefinitely.
+                    $headStatus = EnterpriseOrderIntent::whereKey($intent->id)->value('status');
+                    if ($headStatus === EnterpriseOrderIntent::STATUS_PAID_WAITING_INVENTORY) {
+                        break;
+                    }
+                    continue;
                 }
                 $assigned++;
             }

@@ -215,7 +215,23 @@ class EnterpriseAssignmentService
                 return null;
             }
             if ($user->expired_at !== null && $user->expired_at < time()) {
-                return null; // plan lapsed while waiting; leave queued
+                // SB-MONEY-008: the subscription this paid order bought
+                // has lapsed while queued, so the intent can never be
+                // delivered from the queue. Leaving it at the head of
+                // the FIFO blocked every later intent for the same
+                // purpose indefinitely. Move it to an explicit
+                // manual-handling state instead (D02: no refund).
+                $intent->status = EnterpriseOrderIntent::STATUS_FAILED;
+                $intent->note = 'subscription lapsed while waiting for inventory; moved to manual handling (D02: no refund)';
+                $intent->save();
+                EnterpriseInventoryAlert::raise(
+                    $intent->purpose_id,
+                    null,
+                    EnterpriseInventoryAlert::TYPE_WAITING_TOO_LONG,
+                    "Order {$order->trade_no} lapsed while waiting for a kit (purpose {$intent->purpose_id}); intent closed for manual handling (D02: no refund)"
+                );
+                EnterpriseInventoryLog::record(null, 'intent.lapsed_closed', "order {$order->trade_no}");
+                return null;
             }
             $purpose = EnterprisePurpose::find($intent->purpose_id);
             $kit = $purpose ? $this->pickReadyKit($purpose, lock: true) : null;

@@ -44,8 +44,18 @@ class PaymentController extends Controller
         if (!$order) {
             return $this->fail([400202, 'order is not found']);
         }
-        if ($order->status !== Order::STATUS_PENDING)
+        if ($order->status !== Order::STATUS_PENDING) {
+            // SB-MONEY-002: a verified successful callback for an order
+            // that was already cancelled is real money received. Record
+            // the receipt on the order before acknowledging, so the
+            // payment stays traceable (re-open or refund is then an
+            // admin decision) instead of being confirmed to the gateway
+            // and silently lost with no trace in the books.
+            if ($order->status === Order::STATUS_CANCELLED) {
+                $this->recordReceiptOnCancelledOrder($order, $callbackNo, $verify);
+            }
             return true;
+        }
         // SB-AUD-002/030: when the gateway's verified callback reports the
         // paid amount, it must reconcile with the order total (integer
         // cents, orders are CNY-denominated) before the order may
@@ -59,11 +69,17 @@ class PaymentController extends Controller
             ]);
             return false;
         }
+        // SB-MONEY-001: checkout quoted the gateway (order total + the
+        // handling fee persisted on the order) and the gateway charges
+        // and reports that quote — reconcile against the quote, not the
+        // bare total, or every fee-bearing payment is rejected.
+        $expectedAmount = (int) $order->total_amount + (int) ($order->handling_amount ?? 0);
         if (isset($verify['paid_amount_cents'])
-            && (int) $verify['paid_amount_cents'] !== (int) $order->total_amount) {
+            && (int) $verify['paid_amount_cents'] !== $expectedAmount) {
             Log::warning('payment notify amount mismatch', [
                 'trade_no' => $order->trade_no,
                 'paid_amount_cents' => $verify['paid_amount_cents'],
+                'expected_amount_cents' => $expectedAmount,
                 'order_total_amount' => $order->total_amount,
             ]);
             return false;
@@ -72,8 +88,58 @@ class PaymentController extends Controller
         if (!$orderService->paid($callbackNo)) {
             return false;
         }
+        // SB-MONEY-002 (race): the order was PENDING at the first read
+        // but the cancellation committed before paid() took its lock, so
+        // paid() no-oped and the receipt would still be lost.
+        $freshOrder = Order::find($order->id);
+        if ($freshOrder && $freshOrder->status === Order::STATUS_CANCELLED) {
+            $this->recordReceiptOnCancelledOrder($freshOrder, $callbackNo, $verify);
+            return true;
+        }
 
         HookManager::call('payment.notify.success', $order);
         return true;
+    }
+
+    /**
+     * SB-MONEY-002: persist a verified receipt that arrived after the
+     * order was cancelled. The order itself stays CANCELLED (its balance
+     * was already refunded at cancel time, so silently re-opening it
+     * would double-grant); saving callback_no + paid_at makes the
+     * receipt findable in the books for a manual re-open or refund.
+     * Reports that fail the same reconciliation as the pending path are
+     * logged, not persisted.
+     */
+    private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): void
+    {
+        if (isset($verify['paid_currency'])
+            && strtoupper((string) $verify['paid_currency']) !== 'CNY') {
+            Log::warning('payment notify for cancelled order: currency mismatch, receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'paid_currency' => $verify['paid_currency'],
+            ]);
+            return;
+        }
+        $expectedAmount = (int) $order->total_amount + (int) ($order->handling_amount ?? 0);
+        if (isset($verify['paid_amount_cents'])
+            && (int) $verify['paid_amount_cents'] !== $expectedAmount) {
+            Log::warning('payment notify for cancelled order: amount mismatch, receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'paid_amount_cents' => $verify['paid_amount_cents'],
+                'expected_amount_cents' => $expectedAmount,
+            ]);
+            return;
+        }
+        try {
+            $order->callback_no = $order->callback_no ?: $callbackNo;
+            $order->paid_at = $order->paid_at ?: time();
+            $order->save();
+        } catch (\Exception $e) {
+            Log::error($e);
+        }
+        Log::warning('payment received for cancelled order; receipt recorded for manual handling (re-open or refund)', [
+            'trade_no' => $order->trade_no,
+            'callback_no' => $callbackNo,
+        ]);
     }
 }

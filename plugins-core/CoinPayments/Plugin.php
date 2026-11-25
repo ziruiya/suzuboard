@@ -99,24 +99,28 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $status = $params['status'];
         if ($status >= 100 || $status == 2) {
-            $result = [
-                'trade_no' => $params['item_number'],
-                'callback_no' => $params['txn_id'],
-                'custom_result' => 'IPN OK'
-            ];
-            // SB-AUD-002/030: when the IPN amount is denominated in the
-            // order currency (CNY), report it for reconciliation. Crypto
-            // denominations cannot be compared to a CNY order total and
-            // are left unreported rather than mis-compared.
+            // SB-MONEY-003 (AUD-002/030 recurrence): a success IPN must
+            // carry a CNY-reconcilable amount. Previously the paid fields
+            // were simply omitted whenever the denomination could not be
+            // reconciled, and the generic handler treats missing fields
+            // as "nothing to check" — the order completed without any
+            // provable receipt. Fail closed instead: without a verifiable
+            // amount and currency, the success is not acknowledged.
+            $paidAmountCents = null;
             if (strtoupper((string) ($params['currency1'] ?? '')) === 'CNY'
                 && strtoupper((string) $this->getConfig('coinpayments_currency')) === 'CNY') {
                 $paidAmountCents = MoneyAmount::majorToCents($params['amount1'] ?? null);
-                if ($paidAmountCents !== null) {
-                    $result['paid_amount_cents'] = $paidAmountCents;
-                    $result['paid_currency'] = 'CNY';
-                }
             }
-            return $result;
+            if ($paidAmountCents === null) {
+                throw new ApiException('CoinPayments IPN amount cannot be reconciled to a CNY order total');
+            }
+            return [
+                'trade_no' => $params['item_number'],
+                'callback_no' => $params['txn_id'],
+                'custom_result' => 'IPN OK',
+                'paid_amount_cents' => $paidAmountCents,
+                'paid_currency' => 'CNY',
+            ];
         } else if ($status < 0) {
             throw new ApiException('Payment Timed Out or Error');
         } else {

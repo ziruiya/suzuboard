@@ -186,6 +186,10 @@ class OrderService
             HookManager::call('order.open.before', $order);
 
             $this->user = User::lockForUpdate()->find($order->user_id);
+            // SB-MONEY-007 (money side): snapshot the group the customer
+            // currently holds before buyByPeriod() overwrites it with
+            // the new plan's template group.
+            $previousGroupId = $this->user->group_id;
 
             if ($order->surplus_credit) {
                 $this->user->balance += $order->surplus_credit;
@@ -220,6 +224,28 @@ class OrderService
                     ->assignWithinOpen($order, $this->user, $plan);
             }
 
+            // SB-MONEY-007 (money side): when the new tier did not
+            // actually become usable in this open — the enterprise order
+            // queued for stock, or the dedicated machine is still
+            // awaiting delivery — restore the customer's previous group
+            // so the entitlement they still hold keeps working until
+            // the new tier is delivered. (Delivery-time group switches
+            // already happen inside the assignment/fulfilment services.)
+            $newTierWaiting = false;
+            if ($order->enterprise_purpose_code && $this->enterpriseOpenResult) {
+                $newTierWaiting = ($this->enterpriseOpenResult['intent']->status ?? null)
+                    === \App\Models\EnterpriseOrderIntent::STATUS_PAID_WAITING_INVENTORY;
+            } elseif (($plan->machine_region_required || $order->machine_region_code)
+                && $this->machineOpenResult) {
+                $newTierWaiting = $this->machineOpenResult->status
+                    !== \App\Models\MachineFulfillment::STATUS_DELIVERED;
+            }
+            if ($newTierWaiting
+                && $previousGroupId !== null
+                && (int) $previousGroupId !== (int) $this->user->group_id) {
+                $this->user->group_id = $previousGroupId;
+            }
+
             $this->setSpeedLimit($plan->speed_limit);
             $this->setDeviceLimit($plan->device_limit);
 
@@ -245,14 +271,23 @@ class OrderService
         // SB-ENT-INV-01: post-commit follow-ups (delivery verification job,
         // event-driven replenishment) for the assignment done above.
         if ($this->enterpriseOpenResult) {
+            $enterpriseResult = $this->enterpriseOpenResult;
             app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
-                ->afterOpenCommitted($this->enterpriseOpenResult);
+                ->afterOpenCommitted($enterpriseResult);
             $this->enterpriseOpenResult = null;
             // Tier exclusivity (D06): the kit assignment above is instantly
             // usable, so a DELIVERED machine fulfilment is superseded now
             // (48h retention, then reclaim) — never before this moment.
-            app(\App\Services\Machine\MachineFulfillmentService::class)
-                ->supersedeActiveMachine($this->user, 'customer switched to the dedicated-port tier');
+            // SB-MONEY-007: a queued (stock-out) result is NOT instantly
+            // usable — it previously still sent the customer's delivered
+            // machine into its reclaim grace window while they had
+            // nothing. Supersede only on an actual assignment.
+            $enterpriseWaiting = ($enterpriseResult['intent']->status ?? null)
+                === \App\Models\EnterpriseOrderIntent::STATUS_PAID_WAITING_INVENTORY;
+            if (!$enterpriseWaiting) {
+                app(\App\Services\Machine\MachineFulfillmentService::class)
+                    ->supersedeActiveMachine($this->user, 'customer switched to the dedicated-port tier');
+            }
         }
 
         $eventId = match ((int) $order->type) {
@@ -372,12 +407,42 @@ class OrderService
                 ->where('user_id', $user->id)
                 ->whereNotIn('period', [Plan::PERIOD_RESET_TRAFFIC, Plan::PERIOD_ONETIME])
                 ->where('status', Order::STATUS_COMPLETED)
+                ->orderBy('created_at')
+                ->orderBy('id')
                 ->get();
 
             if ($orders->isEmpty()) {
                 $order->surplus_amount = 0;
                 $order->surplus_order_ids = [];
                 return;
+            }
+
+            // SB-MONEY-006: only the current continuous subscription
+            // segment still carries unconsumed entitlement. Orders from
+            // an earlier, fully lapsed subscription inflated the credit
+            // base (and were then marked discounted) even though their
+            // value was already consumed. Replay the orders in order:
+            // a new segment starts whenever an order was paid after the
+            // running expiry of all previous ones had already passed.
+            $segmentStart = 0;
+            $runningExpiry = 0;
+            foreach ($orders as $index => $segmentOrder) {
+                $paidAt = (int) ($segmentOrder->paid_at ?: 0);
+                if (!$paidAt) {
+                    $createdAt = $segmentOrder->created_at;
+                    $paidAt = $createdAt instanceof \DateTimeInterface
+                        ? $createdAt->getTimestamp()
+                        : (int) $createdAt;
+                }
+                if ($paidAt > $runningExpiry) {
+                    $segmentStart = $index;
+                }
+                $months = self::STR_TO_TIME[PlanService::getPeriodKey($segmentOrder->period)] ?? 0;
+                $runningExpiry = Carbon::createFromTimestamp(max($paidAt, $runningExpiry))
+                    ->addMonths($months)->timestamp;
+            }
+            if ($segmentStart > 0) {
+                $orders = $orders->slice($segmentStart)->values();
             }
 
             $orderAmountSum = $orders->sum(fn($item) => $item->total_amount + $item->balance_amount + $item->surplus_amount - $item->surplus_credit);

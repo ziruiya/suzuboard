@@ -66,6 +66,20 @@ class CheckCommission extends Command
         foreach ($orders as $order) {
             try{
                 DB::beginTransaction();
+                // SB-MONEY-005: the candidate list is only a snapshot.
+                // Lock the order row and re-verify inside the payout
+                // transaction that it is still a completed order queued
+                // for payout — otherwise an admin status reset or a
+                // second concurrent run pays the same commission twice,
+                // and orders that were never paid can be paid out here.
+                $order = Order::whereKey($order->id)->lockForUpdate()->first();
+                if (!$order
+                    || (int) $order->status !== Order::STATUS_COMPLETED
+                    || (int) $order->commission_status !== 1
+                    || !$order->invite_user_id) {
+                    DB::rollBack();
+                    continue;
+                }
                 if (!$this->payHandle($order->invite_user_id, $order)) {
                     DB::rollBack();
                     continue;

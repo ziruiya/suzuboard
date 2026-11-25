@@ -356,7 +356,12 @@ namespace Tests\Unit\Plugins {
 
         public function test_coinpayments_crypto_amount_is_not_misreported(): void
         {
-            $verify = $this->coinPaymentsNotify([
+            // SB-MONEY-003 supersedes the AUD-era expectation: a success
+            // IPN whose amount cannot be reconciled to the CNY order
+            // total must fail closed, not complete the order with the
+            // paid fields silently omitted.
+            $this->expectException(ApiException::class);
+            $this->coinPaymentsNotify([
                 'merchant' => 'merchant-1',
                 'item_number' => 'ORDER20261125005',
                 'txn_id' => 'CP-TX-1',
@@ -364,8 +369,19 @@ namespace Tests\Unit\Plugins {
                 'currency1' => 'USDT',
                 'amount1' => '4.10',
             ]);
-            $this->assertIsArray($verify);
-            $this->assertArrayNotHasKey('paid_amount_cents', $verify);
+        }
+
+        public function test_coinpayments_success_without_amount_fails_closed(): void
+        {
+            $this->expectException(ApiException::class);
+            $this->coinPaymentsNotify([
+                'merchant' => 'merchant-1',
+                'item_number' => 'ORDER20261125005',
+                'txn_id' => 'CP-TX-1',
+                'status' => '100',
+                'currency1' => 'CNY',
+                // amount1 missing entirely: nothing verifiable to report.
+            ]);
         }
     }
 }

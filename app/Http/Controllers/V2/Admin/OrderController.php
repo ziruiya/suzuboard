@@ -151,7 +151,11 @@ class OrderController extends Controller
             return $this->fail([400, '只能对待支付的订单进行操作']);
 
         $orderService = new OrderService($order);
-        if (!$orderService->paid('manual_operation')) {
+        // SB-MONEY-004: callback_no carries a unique index (AUD-040), so
+        // the constant 'manual_operation' made every manual confirmation
+        // after the first one fail. Manual receipts get a per-order
+        // identifier instead.
+        if (!$orderService->paid('manual_operation_' . $order->trade_no)) {
             return $this->fail([500, '更新失败']);
         }
         return $this->success(true);
@@ -184,6 +188,21 @@ class OrderController extends Controller
             ->first();
         if (!$order) {
             return $this->fail([400202, '订单不存在']);
+        }
+
+        // SB-MONEY-005: commission_status drives real payouts, so its
+        // transitions are constrained. A paid-out order is final (it
+        // could previously be re-queued and paid a second time), and
+        // only a completed order may enter the payout queue (unpaid or
+        // cancelled orders could previously be queued and paid).
+        if (isset($params['commission_status'])) {
+            if ((int) $order->commission_status === 2) {
+                return $this->fail([400, '佣金已发放，不可再变更状态']);
+            }
+            if ((int) $params['commission_status'] === 1
+                && (int) $order->status !== Order::STATUS_COMPLETED) {
+                return $this->fail([400, '只有已完成订单可以进入佣金发放队列']);
+            }
         }
 
         try {
