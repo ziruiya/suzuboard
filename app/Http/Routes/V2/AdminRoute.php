@@ -321,6 +321,8 @@ class AdminRoute
                 $router->get('/outbox', [RelayController::class, 'outbox']);
                 $router->post('/rollback', [RelayController::class, 'rollback']);
                 $router->post('/republish', [RelayController::class, 'republish']);
+                $router->get('/address-changes', [RelayController::class, 'addressChanges']);
+                $router->post('/address-changes/resume', [RelayController::class, 'resumeAddressChange']);
                 $router->get('/audit', [RelayController::class, 'audit']);
             });
 

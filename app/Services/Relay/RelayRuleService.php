@@ -4,6 +4,7 @@ namespace App\Services\Relay;
 
 use App\Models\RelayAuditLog;
 use App\Models\RelayPortClaim;
+use App\Models\RelayRevocation;
 use App\Models\RelayRule;
 use App\Models\Server;
 use App\Models\ServerMachine;
@@ -57,6 +58,14 @@ class RelayRuleService
                 'rate_in_bps', 'rate_out_bps', 'burst_bytes', 'enabled',
             ]), $data);
             $attrs = $this->validateAndNormalize($machine, $merged, $rule);
+            // B01: an update that disables a rule the agent has
+            // confirmed it is serving creates the revocation obligation
+            // NOW, before the status flip below erases the evidence —
+            // publish()'s document diff is the second net, not the only
+            // one.
+            if (($attrs['enabled'] ?? true) === false && $rule->status === RelayRule::STATUS_APPLIED) {
+                RelayRevocation::record($machine->id, $rule->rule_code, $rule->id, RelayRevocation::REASON_DISABLED);
+            }
             $rule->fill($attrs);
             $rule->version = $rule->version + 1; // optimistic lock bump
             if ($rule->status === RelayRule::STATUS_APPLIED) {
@@ -83,6 +92,16 @@ class RelayRuleService
                 'allowlist_approved', 'max_connections', 'udp_max_sessions',
             ]), $rule);
         }
+        // B01 (GPT round 2, reproduced defect): capture the revocation
+        // obligation BEFORE the status flips to DISABLED. Round 1's
+        // publish-time capture queried status=APPLIED *after* this flip
+        // had already run, so a disabled-while-serving rule never
+        // entered the pending window at all — the panel assumed the
+        // agent stopped serving it, with no record anywhere.
+        if (!$enabled && $rule->status === RelayRule::STATUS_APPLIED) {
+            RelayRevocation::record($machine->id, $rule->rule_code, $rule->id, RelayRevocation::REASON_DISABLED);
+            $rule->forceFill(['revocation_pending_at' => now()])->save();
+        }
         $rule->forceFill([
             'enabled' => $enabled,
             'status' => $enabled ? RelayRule::STATUS_NOT_APPLIED : RelayRule::STATUS_DISABLED,
@@ -96,6 +115,16 @@ class RelayRuleService
     {
         $machine = $rule->machine;
         DB::transaction(function () use ($rule, $machine, $actorType, $actorId) {
+            // B01: the obligation is recorded BEFORE the row goes away —
+            // it lives in its own table precisely so this delete cannot
+            // take the "agent has not confirmed it stopped" fact with
+            // it. publish() below cannot capture it either (the row is
+            // gone), which is why round 1 lost deleted rules entirely;
+            // the publish-time document diff still sees the code vanish
+            // from the document and keeps this same obligation fresh.
+            if ($rule->status === RelayRule::STATUS_APPLIED) {
+                RelayRevocation::record($machine->id, $rule->rule_code, $rule->id, RelayRevocation::REASON_DELETED);
+            }
             RelayPortClaim::where('rule_id', $rule->id)->delete();
             RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, 'rule.delete', $rule->rule_code . ' ' . $rule->name);
             $rule->delete(); // rule_code is never reused: codes derive from the row id

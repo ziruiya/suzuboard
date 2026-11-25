@@ -4,6 +4,7 @@ namespace App\Services\Relay;
 
 use App\Models\RelayAuditLog;
 use App\Models\RelayConfigOutbox;
+use App\Models\RelayRevocation;
 use App\Models\RelayRule;
 use App\Models\Server;
 use App\Models\ServerMachine;
@@ -27,6 +28,18 @@ use Illuminate\Support\Facades\DB;
 class RelayConfigService
 {
     public const PROTOCOL = 'relay.config.v1';
+
+    /**
+     * TCP reachability prober for the rollback gate (B04): fn(string
+     * $host, int $port, float $timeoutSeconds): bool. Null = not wired
+     * (unit tests, agent channel) and the rollback gate is skipped; the
+     * admin controller wires RelayTargetProbe::tcp() so production
+     * rollbacks are always probed. Same injectable pattern as
+     * MachineRoleService's address precheck.
+     */
+    public function __construct(private mixed $tcpProber = null)
+    {
+    }
 
     /**
      * Build the effective config document for a machine (no persistence).
@@ -177,20 +190,70 @@ class RelayConfigService
                     'config_version' => $version,
                     'config_hash' => $hash,
                 ]);
-            // R03: previously-APPLIED rules excluded from this document
-            // enter the revocation-pending window. Their panel status may
-            // already say BROKEN/DISABLED, but the agent is only known to
-            // have stopped serving them once it ACKs this version.
-            $revoked = array_values(array_diff($previouslyApplied, $included));
-            if ($revoked) {
-                RelayRule::where('machine_id', $machine->id)
-                    ->whereIn('rule_code', $revoked)
-                    ->whereNull('revocation_pending_at')
-                    ->update(['revocation_pending_at' => now()]);
-                foreach ($revoked as $code) {
-                    $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $code)->first();
-                    RelayAuditLog::record($machine->id, $rule?->id, $actorType, $actorId, 'rule.revocation_pending', $code . ' excluded from v' . $version . '; awaiting agent ack');
+            // R03 + B01: previously-serving rules excluded from this
+            // document enter the revocation-pending window — the agent is
+            // only known to have stopped serving them once it ACKs a
+            // document without them. The revoked set is computed from the
+            // DOCUMENTS, not only from rule-row statuses: the agent is
+            // known to serve exactly the document it last ACKed as
+            // applied (relay_applied_version), so any code in that
+            // document but not in the new one is an unconfirmed
+            // revocation — including rules whose row was flipped to
+            // DISABLED before this publish ran (round 1's status-only
+            // capture, kept below as a second net, missed those) and
+            // rules whose row was deleted outright (no row remains to
+            // carry a marker — the obligation table is the only record).
+            $appliedDocCodes = [];
+            if ((int) $machine->relay_applied_version > 0) {
+                $appliedOutbox = RelayConfigOutbox::where('machine_id', $machine->id)
+                    ->where('version', (int) $machine->relay_applied_version)->first();
+                if ($appliedOutbox) {
+                    $appliedDoc = json_decode($appliedOutbox->payload, true);
+                    $appliedDocCodes = collect($appliedDoc['rules'] ?? [])->pluck('rule_code')->all();
                 }
+            }
+            $revoked = array_values(array_unique(array_merge(
+                array_diff($previouslyApplied, $included),
+                array_diff($appliedDocCodes, $included)
+            )));
+            foreach ($revoked as $code) {
+                $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $code)->first();
+                $reason = match (true) {
+                    $rule === null => RelayRevocation::REASON_DELETED,
+                    $rule->status === RelayRule::STATUS_BROKEN => RelayRevocation::REASON_BROKEN,
+                    !$rule->enabled => RelayRevocation::REASON_DISABLED,
+                    default => RelayRevocation::REASON_EXCLUDED,
+                };
+                $wasOpen = RelayRevocation::openFor($machine->id, $code) !== null;
+                RelayRevocation::record($machine->id, $code, $rule?->id, $reason, $version);
+                if ($rule && $rule->revocation_pending_at === null) {
+                    $rule->forceFill(['revocation_pending_at' => now()])->save();
+                }
+                if (!$wasOpen) {
+                    RelayAuditLog::record($machine->id, $rule?->id, $actorType, $actorId, 'rule.revocation_pending', $code . ' excluded from v' . $version . ' (' . $reason . '); awaiting agent ack');
+                }
+            }
+            // B01: a rule published again closes any open obligation for
+            // it — the agent serving it is once more exactly what the
+            // panel wants, so the revocation premise no longer exists.
+            $republished = RelayRevocation::where('machine_id', $machine->id)
+                ->whereNull('confirmed_at')
+                ->whereIn('rule_code', $included)
+                ->get();
+            if ($republished->isNotEmpty()) {
+                foreach ($republished as $obligation) {
+                    $obligation->forceFill([
+                        'confirmed_at' => now(),
+                        'confirmed_version' => $version,
+                        'confirm_note' => 'rule published again in v' . $version,
+                    ])->save();
+                    RelayRule::where('machine_id', $machine->id)
+                        ->where('rule_code', $obligation->rule_code)
+                        ->whereNotNull('revocation_pending_at')
+                        ->update(['revocation_pending_at' => null]);
+                }
+                RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'rule.revocation_confirmed',
+                    'republished in v' . $version . ': ' . $republished->pluck('rule_code')->implode(','));
             }
             RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.publish', 'v' . $version . ' ' . $hash);
             return $outbox;
@@ -204,18 +267,50 @@ class RelayConfigService
         if (!$source) {
             throw new RelayValidationException('outbox version ' . $toVersion . ' not found for this machine');
         }
-        return DB::transaction(function () use ($machine, $source, $actorType, $actorId) {
+        // R12: a historical document is a snapshot, not a truth. Its
+        // NODE targets were derived from the landing state of their
+        // day — the node's machine address or landing port may have
+        // moved since, and the node may have lost eligibility or been
+        // deleted. Re-derive every NODE entry from CURRENT state and
+        // refuse the rollback when a historical endpoint no longer
+        // resolves: republishing it verbatim would resurrect a dead
+        // endpoint (or a revoked rule) under a fresh version.
+        $machine = $machine->fresh() ?? $machine;
+        $document = $this->revalidateRollbackDocument($machine, json_decode($source->payload, true), (int) $source->version);
+        // B04: re-derivation proves an endpoint is well-formed, not that
+        // it answers. When a prober is wired (the admin controller wires
+        // the real TCP prober), every re-derived NODE target must accept
+        // a TCP connection — the same all-targets standard as the
+        // address-change precheck (B03), not a rollback-only mechanism —
+        // or the rollback is refused before anything is published. The
+        // validation runs outside the publish transaction so a refusal
+        // leaves its audit row behind; the residual race (state moving
+        // between validation and publish) is milliseconds wide, and the
+        // publish-side BROKEN gates plus the reconcile loop still guard
+        // the fleet afterwards.
+        if ($this->tcpProber !== null) {
+            $endpoints = [];
+            foreach (($document['rules'] ?? []) as $entry) {
+                if (($entry['target_type'] ?? null) === RelayRule::TARGET_NODE) {
+                    $endpoints[] = [
+                        'host' => (string) $entry['target_host'],
+                        'port' => (int) $entry['target_port'],
+                        'label' => ($entry['rule_code'] ?? '?') . ' -> ' . $entry['target_host'] . ':' . $entry['target_port'],
+                    ];
+                }
+            }
+            $failed = RelayTargetProbe::probeEndpoints($this->tcpProber, $endpoints);
+            if ($failed) {
+                $labels = collect($failed)->pluck('label')->all();
+                RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.rollback_precheck_failed',
+                    'from v' . $source->version . '; TCP-unreachable: ' . implode(', ', $labels));
+                throw new RelayValidationException(
+                    'rollback refused: re-derived target(s) unreachable at TCP level: ' . implode(', ', $labels) . '; nothing was republished'
+                );
+            }
+        }
+        return DB::transaction(function () use ($machine, $source, $document, $actorType, $actorId) {
             $machine = ServerMachine::where('id', $machine->id)->lockForUpdate()->first() ?? $machine;
-            $document = json_decode($source->payload, true);
-            // R12: a historical document is a snapshot, not a truth. Its
-            // NODE targets were derived from the landing state of their
-            // day — the node's machine address or landing port may have
-            // moved since, and the node may have lost eligibility or been
-            // deleted. Re-derive every NODE entry from CURRENT state and
-            // refuse the rollback when a historical endpoint no longer
-            // resolves: republishing it verbatim would resurrect a dead
-            // endpoint (or a revoked rule) under a fresh version.
-            $document = $this->revalidateRollbackDocument($machine, $document, (int) $source->version);
             $version = (int) $machine->relay_config_version + 1;
             $document['version'] = $version;
             $document['generated_at'] = now()->toIso8601String();
@@ -341,27 +436,47 @@ class RelayConfigService
             'relay_last_error' => null,
         ])->save();
 
+        $document = json_decode($outbox->payload, true);
+        $codes = collect($document['rules'] ?? [])->pluck('rule_code')->all();
         if ($isLatest) {
-            $document = json_decode($outbox->payload, true);
-            $codes = collect($document['rules'] ?? [])->pluck('rule_code')->all();
             RelayRule::where('machine_id', $machine->id)->whereIn('rule_code', $codes)
                 ->update(['status' => RelayRule::STATUS_APPLIED]);
             RelayRule::where('machine_id', $machine->id)->where('enabled', true)
                 ->whereNotIn('rule_code', $codes)
                 ->where('status', RelayRule::STATUS_APPLYING)
                 ->update(['status' => RelayRule::STATUS_NOT_APPLIED]);
-            // R03: this ACK confirms the machine now runs exactly this
-            // document — every outstanding revocation is confirmed (the
-            // rule is either in the document and serving legitimately, or
-            // absent and therefore stopped). Clear the pending markers.
-            $pending = RelayRule::where('machine_id', $machine->id)
-                ->whereNotNull('revocation_pending_at')->pluck('rule_code')->all();
-            if ($pending) {
-                RelayRule::where('machine_id', $machine->id)
-                    ->whereNotNull('revocation_pending_at')
-                    ->update(['revocation_pending_at' => null]);
-                RelayAuditLog::record($machine->id, null, 'agent', null, 'rule.revocation_confirmed', 'v' . $version . ' acked; confirmed: ' . implode(',', $pending));
-            }
+        }
+        // B01: revocation confirmation is PER RULE, judged against the
+        // document this ACK actually covers — never a blanket clear.
+        // An obligation is confirmed only when the ACKed applied
+        // document does not contain the rule AND the ACKed version is
+        // at least the version that first excluded it. An ACK whose
+        // document still contains the rule (e.g. a stale ACK of an
+        // older version arriving late) confirms nothing about it; the
+        // obligation stays open for a later, excluding ACK. This runs
+        // for every applied ACK, not only the latest: a late ACK of an
+        // excluding version is still the agent's proof it stopped.
+        $confirmed = [];
+        RelayRevocation::where('machine_id', $machine->id)->whereNull('confirmed_at')->get()
+            ->each(function (RelayRevocation $obligation) use ($codes, $version, &$confirmed) {
+                if (in_array($obligation->rule_code, $codes, true)) {
+                    return;
+                }
+                if ((int) $obligation->since_version > 0 && $version < (int) $obligation->since_version) {
+                    return;
+                }
+                $obligation->forceFill([
+                    'confirmed_at' => now(),
+                    'confirmed_version' => $version,
+                    'confirm_note' => 'agent acked v' . $version . ' without the rule',
+                ])->save();
+                $confirmed[] = $obligation->rule_code;
+            });
+        if ($confirmed) {
+            RelayRule::where('machine_id', $machine->id)->whereIn('rule_code', $confirmed)
+                ->whereNotNull('revocation_pending_at')
+                ->update(['revocation_pending_at' => null]);
+            RelayAuditLog::record($machine->id, null, 'agent', null, 'rule.revocation_confirmed', 'v' . $version . ' acked; confirmed: ' . implode(',', $confirmed));
         }
         RelayAuditLog::record($machine->id, null, 'agent', null, 'config.ack', 'v' . $version);
         return true;

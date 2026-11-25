@@ -3,15 +3,18 @@
 namespace App\Http\Controllers\V2\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Models\RelayAddressChange;
 use App\Models\RelayAuditLog;
 use App\Models\RelayConfigOutbox;
 use App\Models\RelayRule;
 use App\Models\RelayRuleStat;
 use App\Models\Server;
 use App\Models\ServerMachine;
+use App\Services\Relay\MachineRoleService;
 use App\Services\Relay\RelayConfigService;
 use App\Services\Relay\RelayMachineService;
 use App\Services\Relay\RelayRuleService;
+use App\Services\Relay\RelayTargetProbe;
 use App\Services\Relay\RelayValidationException;
 use Illuminate\Http\Request;
 
@@ -274,11 +277,57 @@ class RelayController extends Controller
             return $this->fail([404, 'machine not found']);
         }
         try {
-            $outbox = $config->rollback($machine, (int) $request->input('to_version'), 'admin', $request->user()?->id);
+            // B04: production rollbacks always run the reachability
+            // gate — the re-derived NODE targets must answer a TCP
+            // connect (same all-targets standard as the address-change
+            // precheck) before anything is republished.
+            $outbox = (new RelayConfigService(RelayTargetProbe::tcp()))
+                ->rollback($machine, (int) $request->input('to_version'), 'admin', $request->user()?->id);
         } catch (RelayValidationException $e) {
             return $this->fail([422, $e->getMessage()]);
         }
         return $this->success(['version' => (int) $outbox->version, 'config_hash' => $outbox->config_hash]);
+    }
+
+    /** B03: address-change records — the queryable recovery surface. */
+    public function addressChanges(Request $request)
+    {
+        $query = RelayAddressChange::orderByDesc('id');
+        if ($request->filled('machine_id')) {
+            $query->where('machine_id', (int) $request->input('machine_id'));
+        }
+        if ($request->filled('status')) {
+            $query->where('status', (string) $request->input('status'));
+        }
+        $rows = $query->limit(50)->get()->map(fn(RelayAddressChange $c) => [
+            'id' => $c->id,
+            'machine_id' => $c->machine_id,
+            'address' => $c->address,
+            'status' => $c->status,
+            'followers' => $c->followers,
+            'precheck' => $c->precheck,
+            'created_at' => $c->created_at?->toDateTimeString(),
+            'completed_at' => $c->completed_at?->toDateTimeString(),
+        ]);
+        return $this->success($rows);
+    }
+
+    /** B03: re-run one address change's failed followers + convergence check. */
+    public function resumeAddressChange(Request $request, MachineRoleService $roles)
+    {
+        if (!$this->requireConfirm($request)) {
+            return $this->fail([422, 'write operations require confirm=true']);
+        }
+        $change = RelayAddressChange::find((int) $request->input('id'));
+        if (!$change) {
+            return $this->fail([404, 'address change not found']);
+        }
+        $change = $roles->resumeAddressChange($change, 'admin', $request->user()?->id);
+        return $this->success([
+            'id' => $change->id,
+            'status' => $change->status,
+            'followers' => $change->followers,
+        ]);
     }
 
     public function republish(Request $request, RelayConfigService $config)

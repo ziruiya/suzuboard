@@ -2,6 +2,8 @@
 
 namespace App\Services\Relay;
 
+use App\Models\RelayAddressChange;
+use App\Models\RelayRevocation;
 use App\Models\RelayRule;
 use App\Models\Server;
 use App\Models\ServerMachine;
@@ -91,10 +93,32 @@ class RelayReconcileService
                 }
             });
 
-        // R03: revocations the fleet has published but no agent has
-        // confirmed yet. Reported every run so an offline agent leaves a
-        // standing, visible count instead of a silent assumption.
-        $summary['revocation_pending'] = RelayRule::whereNotNull('revocation_pending_at')->count();
+        // R03 + B01: revocations the fleet has published but no agent
+        // has confirmed yet, counted from the obligation table (the
+        // rule-row marker misses deleted rules by construction).
+        // Reported every run so an offline agent leaves a standing,
+        // visible count instead of a silent assumption.
+        $summary['revocation_pending'] = RelayRevocation::whereNull('confirmed_at')->count();
+
+        // B03: open address changes get their failed followers retried
+        // and their convergence re-checked every run, so a follower
+        // that failed mid-change converges without an operator having
+        // to notice and click anything.
+        $summary['address_changes_resumed'] = 0;
+        $summary['address_changes_completed'] = 0;
+        $roles = app(MachineRoleService::class);
+        RelayAddressChange::whereIn('status', [
+            RelayAddressChange::STATUS_PARTIAL,
+            RelayAddressChange::STATUS_AWAITING_ACK,
+            RelayAddressChange::STATUS_IN_PROGRESS,
+        ])->orderBy('id')->limit(20)->get()
+            ->each(function (RelayAddressChange $change) use (&$summary, $roles) {
+                $after = $roles->resumeAddressChange($change, 'system');
+                $summary['address_changes_resumed']++;
+                if ($after->status === RelayAddressChange::STATUS_COMPLETE) {
+                    $summary['address_changes_completed']++;
+                }
+            });
 
         return $summary;
     }
