@@ -65,14 +65,51 @@ class ResetLog extends Command
         // (status IS NULL OR status <> 'processed'). Claim rows are
         // never processor = 'inbox', so their NULL status (pre-000010
         // rows) can never be mistaken for an unprocessed inbox row.
+        //
+        // SB-TA-B01-R1-C1: the protection is per batch FAMILY, not per
+        // row. Every row of one chunk shares the same batch_hash (the
+        // key encodes node + agent batch id + chunk sequence): the
+        // inbox row plus one claim row per accounting processor
+        // (traffic_fetch / stat_user / stat_server). The claims are
+        // the idempotency mechanism reconcile relies on — if a claim
+        // aged out while its inbox was still unprocessed, reconcile
+        // would re-drive the batch and the processor whose claim was
+        // deleted would book it a SECOND time (the same holds when all
+        // three claims exist but the process crashed before
+        // noteBatchProcessed() flipped the inbox). So an aged row is
+        // deleted only when its whole family is finished:
+        //
+        // Delete predicate (family form): created_at aged out AND the
+        // row's batch_hash has NO unprocessed inbox row (processor =
+        // 'inbox' AND (status IS NULL OR status <> 'processed')).
+        // Families whose inbox is processed, and claim/legacy families
+        // with no inbox row at all, follow the 48-hour retention as
+        // before.
+        //
+        // Implementation: the protected family keys are plucked first,
+        // then the delete excludes them. The unprocessed-inbox set is
+        // tiny by construction (only batches stranded by an outage),
+        // and the lookup rides the (status, created_at) index from
+        // migration 000010 and the batch_hash unique index.
+        //
+        // Fallback: when the status column does not exist (migration
+        // 000010 not applied) there is no inbox and therefore no
+        // unprocessed family, so the original unconditional age prune
+        // below applies unchanged.
         if (\Illuminate\Support\Facades\Schema::hasTable('suzu_traffic_batches')) {
             $prune = \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
                 ->where('created_at', '<', time() - 172800);
             if (\Illuminate\Support\Facades\Schema::hasColumn('suzu_traffic_batches', 'status')) {
-                $prune->where(function ($query) {
-                    $query->where('processor', '<>', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
-                        ->orWhere('status', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
-                });
+                $protectedKeys = \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
+                    ->where('processor', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
+                    ->where(function ($query) {
+                        $query->whereNull('status')
+                            ->orWhere('status', '<>', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
+                    })
+                    ->pluck('batch_hash');
+                if ($protectedKeys->isNotEmpty()) {
+                    $prune->whereNotIn('batch_hash', $protectedKeys->all());
+                }
             }
             $prune->delete();
         }

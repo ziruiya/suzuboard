@@ -25,10 +25,13 @@ use Illuminate\Support\Facades\Schema;
  *
  * A row is only re-driven after it has been 'received' for
  * --older-than seconds, so batches whose jobs are merely queued or
- * in flight are left alone. Unprocessed inbox rows are exempt from
- * the reset:log 48-hour prune (SB-TA-B01-R1), so a batch stranded by
- * an outage longer than that window is still recoverable here; only
- * processed inbox rows and claim markers are pruned by age.
+ * in flight are left alone. An unprocessed inbox row AND all claim
+ * rows of its batch family are exempt from the reset:log 48-hour
+ * prune (SB-TA-B01-R1 / R1-C1), so a batch stranded by an outage
+ * longer than that window is still recoverable here — with its
+ * claims intact, so recovery never double-books; only processed
+ * inbox rows and the claim markers of finished families are pruned
+ * by age.
  *
  * Scheduled in the console kernel next to the other suzu:* jobs.
  */

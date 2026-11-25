@@ -3,6 +3,8 @@
 namespace Tests\Feature\Traffic;
 
 use App\Http\Controllers\V2\Server\ServerController;
+use App\Jobs\StatServerJob;
+use App\Jobs\StatUserJob;
 use App\Jobs\TrafficFetchJob;
 use App\Models\Server;
 use App\Models\StatServer;
@@ -357,5 +359,146 @@ class TrafficBatchInboxTest extends TestCase
 
         $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
         $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+    }
+
+    // ---------------- ⑥ prune protects the whole family of an unprocessed inbox (TA-B01-R1-C1) ----------------
+
+    public function test_reset_log_prune_spares_claims_of_unprocessed_inbox_and_reconcile_completes_exactly_once(): void
+    {
+        $user = $this->makeUser();
+        $server = $this->makeServer();
+        $data = [$user->id => [700, 300]];
+        $contentHash = TrafficBatchGuard::hashFor($server->id, 'vless', $data);
+        $batchId = 'inbox-batch-family-partial';
+        $batchKey = TrafficBatchGuard::keyForBatchId($server->id, $batchId, 0);
+        $collectedFrom = time() - 60;
+        $collectedTo = time();
+        $timestamp = strtotime(date('Y-m-d'));
+
+        $payload = json_encode([
+            'protocol' => 'vless',
+            'timestamp' => $timestamp,
+            'server' => ['id' => $server->id, 'rate' => 1, 'type' => 'vless'],
+            'data' => $data,
+            'collected_from' => $collectedFrom,
+            'collected_to' => $collectedTo,
+        ]);
+        $this->assertSame(
+            TrafficBatchGuard::RECEIPT_OK,
+            TrafficBatchGuard::receiveIdentified($batchKey, $server->id, $contentHash, $payload)
+        );
+
+        // Two of the three processors book the batch and leave their
+        // claim rows behind; the third (stat_server) is lost in the
+        // outage, so the inbox stays 'received'.
+        $serverArray = $server->toArray();
+        $serverArray['rate'] = 1.0;
+        (new TrafficFetchJob($serverArray, $data, 'vless', $timestamp, $batchKey, $batchId, $contentHash, $collectedFrom, $collectedTo))->handle();
+        (new StatUserJob($serverArray, $data, 'vless', 'd', $batchKey, $batchId, $contentHash))->handle();
+
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+        $this->assertSame(700, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        $this->assertSame(0, StatServer::where('server_id', $server->id)->count());
+        $this->assertSame(TrafficBatchGuard::STATUS_RECEIVED, $this->inboxRow($batchKey)->status);
+        $this->assertSame(3, DB::table('suzu_traffic_batches')->where('batch_hash', $batchKey)->count());
+
+        // The whole family ages past the 48-hour prune horizon.
+        DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->update(['created_at' => time() - 200000]);
+
+        $this->artisan('reset:log')->assertExitCode(0);
+
+        // Inbox AND both surviving claims must still be there: the
+        // claims are the only thing stopping reconcile from booking
+        // those two processors a second time.
+        $processors = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->pluck('processor')->sort()->values()->all();
+        $this->assertSame(
+            [TrafficBatchGuard::PROCESSOR_INBOX, TrafficBatchGuard::PROCESSOR_STAT_USER, TrafficBatchGuard::PROCESSOR_FETCH],
+            $processors,
+            'claims of an unprocessed inbox family must not be pruned by age'
+        );
+
+        // Reconcile completes only the missing processor; every leg
+        // of the batch ends up booked exactly once.
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+        $this->assertSame(300, (int) User::findOrFail($user->id)->d);
+        $this->assertSame(700, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        $this->assertSame(700, (int) StatServer::where('server_id', $server->id)->firstOrFail()->u);
+        $this->assertSame(TrafficBatchGuard::STATUS_PROCESSED, $this->inboxRow($batchKey)->status);
+    }
+
+    public function test_reset_log_prune_spares_family_when_all_claims_exist_but_inbox_flip_was_lost(): void
+    {
+        $user = $this->makeUser();
+        $server = $this->makeServer();
+        $data = [$user->id => [700, 300]];
+        $contentHash = TrafficBatchGuard::hashFor($server->id, 'vless', $data);
+        $batchId = 'inbox-batch-family-unflipped';
+        $batchKey = TrafficBatchGuard::keyForBatchId($server->id, $batchId, 0);
+        $collectedFrom = time() - 60;
+        $collectedTo = time();
+        $timestamp = strtotime(date('Y-m-d'));
+
+        $payload = json_encode([
+            'protocol' => 'vless',
+            'timestamp' => $timestamp,
+            'server' => ['id' => $server->id, 'rate' => 1, 'type' => 'vless'],
+            'data' => $data,
+            'collected_from' => $collectedFrom,
+            'collected_to' => $collectedTo,
+        ]);
+        $this->assertSame(
+            TrafficBatchGuard::RECEIPT_OK,
+            TrafficBatchGuard::receiveIdentified($batchKey, $server->id, $contentHash, $payload)
+        );
+
+        // All three processors book the batch and hold their claims.
+        $serverArray = $server->toArray();
+        $serverArray['rate'] = 1.0;
+        (new TrafficFetchJob($serverArray, $data, 'vless', $timestamp, $batchKey, $batchId, $contentHash, $collectedFrom, $collectedTo))->handle();
+        (new StatUserJob($serverArray, $data, 'vless', 'd', $batchKey, $batchId, $contentHash))->handle();
+        (new StatServerJob($serverArray, $data, 'vless', 'd', $batchKey, $batchId, $contentHash))->handle();
+
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+        $this->assertSame(700, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        $this->assertSame(700, (int) StatServer::where('server_id', $server->id)->firstOrFail()->u);
+        $this->assertSame(4, DB::table('suzu_traffic_batches')->where('batch_hash', $batchKey)->count());
+
+        // Simulate the crash window: every claim committed, but the
+        // process died before noteBatchProcessed() flipped the inbox
+        // row, so the durable record still says 'received'.
+        DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->where('processor', TrafficBatchGuard::PROCESSOR_INBOX)
+            ->update(['status' => TrafficBatchGuard::STATUS_RECEIVED, 'processed_at' => null]);
+        $this->assertSame(TrafficBatchGuard::STATUS_RECEIVED, $this->inboxRow($batchKey)->status);
+
+        // Age the whole family past the prune horizon and prune.
+        DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->update(['created_at' => time() - 200000]);
+        $this->artisan('reset:log')->assertExitCode(0);
+
+        // The fully claimed but unflipped family must survive intact —
+        // deleting any claim here would let reconcile book that leg a
+        // second time.
+        $this->assertSame(
+            4,
+            DB::table('suzu_traffic_batches')->where('batch_hash', $batchKey)->count(),
+            'a fully claimed but unflipped family must survive the prune intact'
+        );
+
+        // Reconcile only completes the bookkeeping flip; nothing is
+        // booked a second time.
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame(TrafficBatchGuard::STATUS_PROCESSED, $this->inboxRow($batchKey)->status);
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+        $this->assertSame(300, (int) User::findOrFail($user->id)->d);
+        $this->assertSame(700, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        $this->assertSame(700, (int) StatServer::where('server_id', $server->id)->firstOrFail()->u);
     }
 }
