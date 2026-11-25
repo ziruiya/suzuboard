@@ -124,6 +124,11 @@ class PaymentController extends Controller
      *    Nothing is written as received, and handle() propagates the
      *    failure so the gateway keeps retrying instead of the payment
      *    being confirmed here and lost with no trace in the books.
+     *  - false (SB-MONEY-002-C1): a DIFFERENT transaction arrives for
+     *    an order that already has a recorded receipt. That is a
+     *    second real payment, not a duplicate notification: the
+     *    recorded receipt stays untouched, the conflict is logged for
+     *    manual reconciliation, and the acknowledgement fails.
      */
     private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): bool
     {
@@ -162,10 +167,38 @@ class PaymentController extends Controller
             ]);
             return true;
         }
+        // SB-MONEY-002-C1: a second, DIFFERENT transaction arriving
+        // for an order that already has a recorded receipt is not a
+        // duplicate notification — it is another real payment the
+        // books know nothing about. Folding it into the first receipt
+        // (keeping the old callback_no and acknowledging success)
+        // would lose it exactly like the original 002 defect. Log the
+        // conflict for manual reconciliation and fail the
+        // acknowledgement; the recorded receipt stays untouched. (The
+        // same transaction re-notified takes the idempotent path
+        // below and is acknowledged.)
+        if ($order->callback_no && (string) $order->callback_no !== (string) $callbackNo) {
+            Log::error('payment notify for cancelled order: conflicting callback_no, second receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'recorded_callback_no' => $order->callback_no,
+                'callback_no' => $callbackNo,
+                'paid_amount_cents' => $verify['paid_amount_cents'],
+            ]);
+            return false;
+        }
         try {
             $order->callback_no = $order->callback_no ?: $callbackNo;
             $order->paid_at = $order->paid_at ?: time();
-            $order->save();
+            if (!$order->save()) {
+                // save() can fail without throwing (e.g. a model
+                // listener veto): the receipt is not persisted, so
+                // the gateway must not be told it was handled.
+                Log::error('payment notify for cancelled order: receipt could not be persisted (save returned false)', [
+                    'trade_no' => $order->trade_no,
+                    'callback_no' => $callbackNo,
+                ]);
+                return false;
+            }
         } catch (\Exception $e) {
             // Persistence is the acknowledgement criterion: if the
             // receipt is not in the database (e.g. the AUD-040 unique

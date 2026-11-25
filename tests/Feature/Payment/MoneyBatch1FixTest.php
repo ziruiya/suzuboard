@@ -335,6 +335,89 @@ class MoneyBatch1FixTest extends TestCase
         $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
     }
 
+    // --------- SB-MONEY-002-C1 (GPT incremental re-review) ---------
+
+    public function test_second_receipt_with_different_transaction_conflicts_and_fails(): void
+    {
+        $gateway = $this->makeEpayGateway();
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        // First late payment: recorded on the cancelled order.
+        $first = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-C1-FIRST'));
+        $first->assertStatus(200);
+        $afterFirst = Order::findOrFail($order->id);
+        $this->assertSame('EPAY-C1-FIRST', $afterFirst->callback_no);
+        $this->assertNotNull($afterFirst->paid_at);
+
+        // Collect log entries from here on so the conflict record
+        // can be asserted directly.
+        $logged = [];
+        \Illuminate\Support\Facades\Event::listen(
+            \Illuminate\Log\Events\MessageLogged::class,
+            function ($event) use (&$logged) {
+                $logged[] = $event;
+            }
+        );
+
+        // A second, DIFFERENT transaction for the same cancelled
+        // order is another real payment, not a duplicate
+        // notification: it must not be folded into the first receipt
+        // and acknowledged as if it were the same money.
+        $second = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-C1-SECOND'));
+        $second->assertStatus(400);
+
+        // The recorded receipt is untouched.
+        $afterSecond = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $afterSecond->status);
+        $this->assertSame('EPAY-C1-FIRST', $afterSecond->callback_no);
+        $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
+
+        // And the conflict is on record for manual reconciliation,
+        // carrying both transaction numbers and the amount.
+        $conflict = collect($logged)->first(fn ($event) => $event->level === 'error'
+            && str_contains($event->message, 'conflicting callback_no'));
+        $this->assertNotNull($conflict, 'expected an error log entry for the conflicting callback_no');
+        $this->assertSame('EPAY-C1-FIRST', $conflict->context['recorded_callback_no'] ?? null);
+        $this->assertSame('EPAY-C1-SECOND', $conflict->context['callback_no'] ?? null);
+        $this->assertSame(2900, (int) ($conflict->context['paid_amount_cents'] ?? 0));
+    }
+
+    public function test_receipt_save_returning_false_fails_the_callback_acknowledgement(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        // Make the persistence step fail WITHOUT throwing: an
+        // Eloquent `saving` listener veto makes Model::save() return
+        // false — the exact non-exception failure mode C1 calls out.
+        // (Registered only now, after the cancel above has saved.)
+        Order::saving(function () {
+            return false;
+        });
+
+        $controller = new PaymentController();
+        $method = new \ReflectionMethod($controller, 'handle');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, $order->trade_no, 'CB-SAVE-FALSE', [
+            'paid_amount_cents' => 2900,
+            'paid_currency' => 'CNY',
+        ]);
+
+        // save() reported failure, so the receipt is not on the
+        // books and the gateway must not be told it was handled.
+        $this->assertFalse($result);
+        $fresh = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $fresh->status);
+        $this->assertNull($fresh->callback_no);
+        $this->assertNull($fresh->paid_at);
+    }
+
     // ---------------- SB-MONEY-004 ----------------
 
     public function test_two_manual_admin_confirmations_both_succeed(): void
