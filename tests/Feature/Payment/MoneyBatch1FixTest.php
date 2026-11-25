@@ -418,6 +418,83 @@ class MoneyBatch1FixTest extends TestCase
         $this->assertNull($fresh->paid_at);
     }
 
+    // --------- SB-MONEY-002-C1-R1 (concurrency atomicity) ---------
+
+    public function test_concurrent_second_receipt_decides_from_locked_reread_not_caller_snapshot(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        $controller = new PaymentController();
+        $method = new \ReflectionMethod($controller, 'recordReceiptOnCancelledOrder');
+        $method->setAccessible(true);
+        $verify = ['paid_amount_cents' => 2900, 'paid_currency' => 'CNY'];
+
+        // GPT's race timeline, reproduced at the function boundary:
+        // handler TX-002 reads the order (callback_no still NULL)
+        // BEFORE handler TX-001 commits. This stale snapshot is
+        // exactly the in-memory state the losing callback carries
+        // into recordReceiptOnCancelledOrder() in production, where
+        // handle() reads the row and passes the model along.
+        $staleSnapshot = Order::findOrFail($order->id);
+        $this->assertNull($staleSnapshot->callback_no);
+
+        // TX-001 wins and records its receipt.
+        $first = $method->invoke($controller, Order::findOrFail($order->id), 'EPAY-RACE-1', $verify);
+        $this->assertTrue($first);
+        $afterFirst = Order::findOrFail($order->id);
+        $this->assertSame('EPAY-RACE-1', $afterFirst->callback_no);
+        $this->assertNotNull($afterFirst->paid_at);
+
+        // The losing handler's snapshot was never refreshed: in
+        // memory it still claims there is no receipt.
+        $this->assertNull($staleSnapshot->callback_no);
+
+        $logged = [];
+        \Illuminate\Support\Facades\Event::listen(
+            \Illuminate\Log\Events\MessageLogged::class,
+            function ($event) use (&$logged) {
+                $logged[] = $event;
+            }
+        );
+
+        // TX-002 now runs with its stale snapshot. What this test
+        // proves: the accept/reject decision is taken from the
+        // transaction's locked re-read of the committed row, NOT
+        // from the caller's snapshot — the function sees TX-001,
+        // treats TX-002 as the C1 conflict and refuses it. Under
+        // the pre-R1 code the stale NULL passed the conflict check,
+        // TX-002 overwrote TX-001 and this call returned true.
+        //
+        // What it does NOT prove: true two-connection lock
+        // contention. This harness runs on per-connection in-memory
+        // SQLite (a second connection would see a different, empty
+        // database) and SQLite's grammar drops the FOR UPDATE
+        // clause, so the row lock itself cannot be exercised here.
+        // In production (MySQL/InnoDB) SELECT ... FOR UPDATE is
+        // what serializes the two callbacks so the loser blocks
+        // until the winner commits and then re-reads its row —
+        // that lock is the final guarantee; this test pins the
+        // decision logic that runs once the lock is held.
+        $second = $method->invoke($controller, $staleSnapshot, 'EPAY-RACE-2', $verify);
+        $this->assertFalse($second);
+
+        // The first receipt survives untouched.
+        $afterSecond = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $afterSecond->status);
+        $this->assertSame('EPAY-RACE-1', $afterSecond->callback_no);
+        $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
+
+        // And the conflict is on record for manual reconciliation.
+        $conflict = collect($logged)->first(fn ($event) => $event->level === 'error'
+            && str_contains($event->message, 'conflicting callback_no'));
+        $this->assertNotNull($conflict, 'expected an error log entry for the conflicting callback_no');
+        $this->assertSame('EPAY-RACE-1', $conflict->context['recorded_callback_no'] ?? null);
+        $this->assertSame('EPAY-RACE-2', $conflict->context['callback_no'] ?? null);
+    }
+
     // ---------------- SB-MONEY-004 ----------------
 
     public function test_two_manual_admin_confirmations_both_succeed(): void

@@ -9,6 +9,7 @@ use App\Services\PaymentService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use App\Services\Plugin\HookManager;
+use Illuminate\Support\Facades\DB;
 
 class PaymentController extends Controller
 {
@@ -129,8 +130,53 @@ class PaymentController extends Controller
      *    second real payment, not a duplicate notification: the
      *    recorded receipt stays untouched, the conflict is logged for
      *    manual reconciliation, and the acknowledgement fails.
+     *
+     * SB-MONEY-002-C1-R1: the whole check-and-record sequence runs
+     * inside a transaction that re-reads the order row under a row
+     * lock (keyed by order id). Two callbacks for the same cancelled
+     * order can be in flight simultaneously, each holding a snapshot
+     * read before the other committed; deciding from the caller's
+     * snapshot let the second callback pass the C1 conflict check
+     * with its stale NULL and overwrite the first receipt. The
+     * locked re-read is the only state the decision may use, so on
+     * MySQL/InnoDB (SELECT ... FOR UPDATE) the losing callback waits
+     * for the winner's commit and then sees its recorded receipt.
      */
     private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): bool
+    {
+        try {
+            return DB::transaction(function () use ($order, $callbackNo, $verify) {
+                $locked = Order::where('id', $order->id)->lockForUpdate()->first();
+                if (!$locked) {
+                    Log::error('payment notify for cancelled order: order row not found on locked re-read, receipt not recorded', [
+                        'trade_no' => $order->trade_no,
+                        'callback_no' => $callbackNo,
+                    ]);
+                    return false;
+                }
+                return $this->recordReceiptOnLockedCancelledOrder($locked, $callbackNo, $verify);
+            });
+        } catch (\Exception $e) {
+            // Persistence is the acknowledgement criterion: if the
+            // receipt is not in the database (e.g. the AUD-040 unique
+            // index rejects the callback_no), the gateway must not be
+            // told the payment was handled.
+            Log::error('payment notify for cancelled order: receipt could not be persisted', [
+                'trade_no' => $order->trade_no,
+                'callback_no' => $callbackNo,
+                'exception' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * The body of the cancelled-order receipt recording, executed by
+     * recordReceiptOnCancelledOrder() inside a transaction on the
+     * row-locked, freshly re-read order. Every decision below reads
+     * $order (the locked row), never a caller-side snapshot.
+     */
+    private function recordReceiptOnLockedCancelledOrder(Order $order, $callbackNo, array $verify): bool
     {
         // The receipt must be provable: both the paid amount and the
         // currency have to be reported. A verified signature without
@@ -186,28 +232,15 @@ class PaymentController extends Controller
             ]);
             return false;
         }
-        try {
-            $order->callback_no = $order->callback_no ?: $callbackNo;
-            $order->paid_at = $order->paid_at ?: time();
-            if (!$order->save()) {
-                // save() can fail without throwing (e.g. a model
-                // listener veto): the receipt is not persisted, so
-                // the gateway must not be told it was handled.
-                Log::error('payment notify for cancelled order: receipt could not be persisted (save returned false)', [
-                    'trade_no' => $order->trade_no,
-                    'callback_no' => $callbackNo,
-                ]);
-                return false;
-            }
-        } catch (\Exception $e) {
-            // Persistence is the acknowledgement criterion: if the
-            // receipt is not in the database (e.g. the AUD-040 unique
-            // index rejects the callback_no), the gateway must not be
-            // told the payment was handled.
-            Log::error('payment notify for cancelled order: receipt could not be persisted', [
+        $order->callback_no = $order->callback_no ?: $callbackNo;
+        $order->paid_at = $order->paid_at ?: time();
+        if (!$order->save()) {
+            // save() can fail without throwing (e.g. a model
+            // listener veto): the receipt is not persisted, so
+            // the gateway must not be told it was handled.
+            Log::error('payment notify for cancelled order: receipt could not be persisted (save returned false)', [
                 'trade_no' => $order->trade_no,
                 'callback_no' => $callbackNo,
-                'exception' => $e->getMessage(),
             ]);
             return false;
         }
