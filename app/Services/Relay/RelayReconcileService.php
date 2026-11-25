@@ -3,6 +3,7 @@
 namespace App\Services\Relay;
 
 use App\Models\RelayRule;
+use App\Models\Server;
 use App\Models\ServerMachine;
 
 /**
@@ -28,7 +29,7 @@ class RelayReconcileService
 
     public function run(): array
     {
-        $summary = ['drained' => 0, 'unknown' => 0, 'republished' => 0];
+        $summary = ['drained' => 0, 'unknown' => 0, 'republished' => 0, 'revocation_pending' => 0];
 
         ServerMachine::where('relay_status', ServerMachine::RELAY_STATUS_DRAINING)->get()
             ->each(function (ServerMachine $machine) use (&$summary) {
@@ -60,17 +61,40 @@ class RelayReconcileService
                     $summary['unknown'] += $n;
                 }
 
+                // Contract-hash drift on NODE targets (R08): the hash
+                // covers the derived endpoint AND the eligibility-derived
+                // state (rollout stage, stock registration, deliverable
+                // verdict). It must be compared BEFORE buildDocument(),
+                // whose snapshot refresh would otherwise absorb the drift
+                // silently without a republish.
+                $hashDrift = false;
+                RelayRule::where('machine_id', $machine->id)
+                    ->where('enabled', true)
+                    ->where('target_type', RelayRule::TARGET_NODE)
+                    ->get()
+                    ->each(function (RelayRule $rule) use (&$hashDrift) {
+                        $node = $rule->target_node_id ? Server::find($rule->target_node_id) : null;
+                        if ($node && RelayRuleService::nodeContractHash($node) !== $rule->target_contract_hash) {
+                            $hashDrift = true;
+                        }
+                    });
+
                 // Eligibility drift on NODE targets -> republish (marks BROKEN).
                 $before = RelayRule::where('machine_id', $machine->id)
                     ->where('status', RelayRule::STATUS_BROKEN)->count();
                 $document = $this->config->buildDocument($machine);
                 $after = RelayRule::where('machine_id', $machine->id)
                     ->where('status', RelayRule::STATUS_BROKEN)->count();
-                if ($after > $before) {
+                if ($after > $before || $hashDrift) {
                     $this->config->publish($machine);
                     $summary['republished']++;
                 }
             });
+
+        // R03: revocations the fleet has published but no agent has
+        // confirmed yet. Reported every run so an offline agent leaves a
+        // standing, visible count instead of a silent assumption.
+        $summary['revocation_pending'] = RelayRule::whereNotNull('revocation_pending_at')->count();
 
         return $summary;
     }

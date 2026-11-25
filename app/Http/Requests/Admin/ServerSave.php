@@ -125,6 +125,9 @@ class ServerSave extends FormRequest
             'host' => 'required',
             'port' => 'required',
             'server_port' => 'required',
+            // GPT review R07: direct_port is a strict override — either
+            // absent/null or a real port. 0 is rejected, never stored.
+            'direct_port' => 'nullable|integer|min:1|max:65535',
             'tags' => 'nullable|array',
             'excludes' => 'nullable|array',
             'ips' => 'nullable|array',

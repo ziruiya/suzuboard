@@ -135,6 +135,14 @@ class RelayConfigService
     {
         return DB::transaction(function () use ($machine, $actorType, $actorId) {
             $machine = ServerMachine::where('id', $machine->id)->lockForUpdate()->first() ?? $machine;
+            // R03: capture what the agent has confirmed it is serving
+            // BEFORE buildDocument() rewrites statuses. Any of those
+            // rules missing from the new document is a revocation the
+            // agent has not confirmed yet — flag it pending until the
+            // ACK of a document without it arrives (see handleAck()).
+            $previouslyApplied = RelayRule::where('machine_id', $machine->id)
+                ->where('status', RelayRule::STATUS_APPLIED)
+                ->pluck('rule_code')->all();
             $document = $this->buildDocument($machine);
             $version = (int) $machine->relay_config_version + 1;
             $document['version'] = $version;
@@ -169,6 +177,21 @@ class RelayConfigService
                     'config_version' => $version,
                     'config_hash' => $hash,
                 ]);
+            // R03: previously-APPLIED rules excluded from this document
+            // enter the revocation-pending window. Their panel status may
+            // already say BROKEN/DISABLED, but the agent is only known to
+            // have stopped serving them once it ACKs this version.
+            $revoked = array_values(array_diff($previouslyApplied, $included));
+            if ($revoked) {
+                RelayRule::where('machine_id', $machine->id)
+                    ->whereIn('rule_code', $revoked)
+                    ->whereNull('revocation_pending_at')
+                    ->update(['revocation_pending_at' => now()]);
+                foreach ($revoked as $code) {
+                    $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $code)->first();
+                    RelayAuditLog::record($machine->id, $rule?->id, $actorType, $actorId, 'rule.revocation_pending', $code . ' excluded from v' . $version . '; awaiting agent ack');
+                }
+            }
             RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.publish', 'v' . $version . ' ' . $hash);
             return $outbox;
         });
@@ -184,6 +207,15 @@ class RelayConfigService
         return DB::transaction(function () use ($machine, $source, $actorType, $actorId) {
             $machine = ServerMachine::where('id', $machine->id)->lockForUpdate()->first() ?? $machine;
             $document = json_decode($source->payload, true);
+            // R12: a historical document is a snapshot, not a truth. Its
+            // NODE targets were derived from the landing state of their
+            // day — the node's machine address or landing port may have
+            // moved since, and the node may have lost eligibility or been
+            // deleted. Re-derive every NODE entry from CURRENT state and
+            // refuse the rollback when a historical endpoint no longer
+            // resolves: republishing it verbatim would resurrect a dead
+            // endpoint (or a revoked rule) under a fresh version.
+            $document = $this->revalidateRollbackDocument($machine, $document, (int) $source->version);
             $version = (int) $machine->relay_config_version + 1;
             $document['version'] = $version;
             $document['generated_at'] = now()->toIso8601String();
@@ -211,6 +243,54 @@ class RelayConfigService
             RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.rollback', 'from v' . $source->version . ' republished as v' . $version);
             return $outbox;
         });
+    }
+
+    /**
+     * R12 rollback gate: re-derive a historical document's NODE targets
+     * from current state. Throws RelayValidationException — refusing the
+     * rollback — when the machine is no longer a relay machine, when a
+     * rule in the document no longer exists on this machine, or when a
+     * NODE target's endpoint can no longer be derived (node deleted,
+     * eligibility lost, landing address cleared). MANUAL entries pass
+     * through untouched: their target is literal text the admin owns.
+     */
+    private function revalidateRollbackDocument(ServerMachine $machine, array $document, int $fromVersion): array
+    {
+        if (!$machine->isRelayRole()) {
+            throw new RelayValidationException(
+                'rollback refused: machine "' . $machine->name . '" is no longer a relay machine (role=' . $machine->role . ')'
+            );
+        }
+        foreach (($document['rules'] ?? []) as $i => $entry) {
+            $code = $entry['rule_code'] ?? null;
+            $rule = $code
+                ? RelayRule::where('machine_id', $machine->id)->where('rule_code', $code)->first()
+                : null;
+            if (!$rule) {
+                throw new RelayValidationException(
+                    'rollback refused: rule ' . ($code ?? '(unknown)') . ' from v' . $fromVersion . ' no longer exists on this machine; the historical ruleset cannot be restored as-is'
+                );
+            }
+            if (($entry['target_type'] ?? null) !== RelayRule::TARGET_NODE) {
+                continue;
+            }
+            $node = Server::find($entry['target_node_id'] ?? $rule->target_node_id);
+            if (!$node || !ServerService::isAgentDeliverable($node)) {
+                throw new RelayValidationException(
+                    'rollback refused: rule ' . $code . ' target node ' . ($entry['target_node_id'] ?? '?')
+                    . ' is deleted or no longer agent-deliverable; the v' . $fromVersion . ' endpoint cannot be re-derived'
+                );
+            }
+            [$endpoint, $endpointError] = RelayRuleService::nodeLandingEndpoint($node);
+            if ($endpoint === null) {
+                throw new RelayValidationException(
+                    'rollback refused: rule ' . $code . ' landing endpoint cannot be re-derived (' . $endpointError . ')'
+                );
+            }
+            $document['rules'][$i]['target_host'] = $endpoint['host'];
+            $document['rules'][$i]['target_port'] = $endpoint['port'];
+        }
+        return $document;
     }
 
     /** Latest published document for the agent pull endpoint. */
@@ -270,6 +350,18 @@ class RelayConfigService
                 ->whereNotIn('rule_code', $codes)
                 ->where('status', RelayRule::STATUS_APPLYING)
                 ->update(['status' => RelayRule::STATUS_NOT_APPLIED]);
+            // R03: this ACK confirms the machine now runs exactly this
+            // document — every outstanding revocation is confirmed (the
+            // rule is either in the document and serving legitimately, or
+            // absent and therefore stopped). Clear the pending markers.
+            $pending = RelayRule::where('machine_id', $machine->id)
+                ->whereNotNull('revocation_pending_at')->pluck('rule_code')->all();
+            if ($pending) {
+                RelayRule::where('machine_id', $machine->id)
+                    ->whereNotNull('revocation_pending_at')
+                    ->update(['revocation_pending_at' => null]);
+                RelayAuditLog::record($machine->id, null, 'agent', null, 'rule.revocation_confirmed', 'v' . $version . ' acked; confirmed: ' . implode(',', $pending));
+            }
         }
         RelayAuditLog::record($machine->id, null, 'agent', null, 'config.ack', 'v' . $version);
         return true;

@@ -164,10 +164,17 @@ class PortRotationService
                     ->where('id', '!=', $server->id)
                     ->exists();
             });
-            $this->relayRules->update($rule, ['listen_port' => $newEntry], 'user', null);
+            // Order matters (GPT review R01): the node row must carry the
+            // NEW landing port BEFORE the rule update republishes, because
+            // the published document derives its target_port from the
+            // node's server_port at publish time. Publishing first would
+            // pin the relay to the old landing port while the node agent
+            // moves to the new one. Both writes sit in rotateForUser()'s
+            // transaction, so a failed rule update rolls the node back too.
             $server->server_port = $newLanding;
             $server->port = (string) $newEntry; // client-facing entry follows the relay listener
             $server->save();
+            $this->relayRules->update($rule, ['listen_port' => $newEntry], 'user', null);
             return [
                 'server_id' => (int) $server->id,
                 'name' => $server->name,

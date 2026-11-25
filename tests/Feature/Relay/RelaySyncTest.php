@@ -64,10 +64,18 @@ class RelaySyncTest extends RelayTestCase
         $v2 = app(RelayConfigService::class)->latestForAgent($machine->fresh());
         $this->assertSame(2, $v2['version']);
 
-        app(RelayRuleService::class)->delete($rule);
+        // Change the rule so v3 differs from v2. (Pre-R12 this test used
+        // a DELETE as the change; GPT review R12 deliberately narrows
+        // rollback: it restores a prior configuration of rules that
+        // still exist — it is not an undelete. Republishing a rule the
+        // panel no longer tracks would serve an orphan with no status,
+        // hash or audit row, so rollback now refuses that case; see
+        // RelayNodeAddressingTest::test_rollback_refused_when_node_no_longer_deliverable
+        // and the design doc's GPT-review disposition.)
+        app(RelayRuleService::class)->update($rule->fresh(), ['name' => '改名后', 'listen_port' => 20063]);
         $v3 = app(RelayConfigService::class)->latestForAgent($machine->fresh());
         $this->assertSame(3, $v3['version']);
-        $this->assertCount(0, $v3['config']['rules']);
+        $this->assertSame('改名后', $v3['config']['rules'][0]['name']);
 
         $outbox = app(RelayConfigService::class)->rollback($machine->fresh(), 2);
         $this->assertSame(4, (int) $outbox->version);
@@ -75,6 +83,7 @@ class RelaySyncTest extends RelayTestCase
         $this->assertSame(2, $doc['rolled_back_from']);
         $this->assertCount(1, $doc['rules']);
         $this->assertSame('第一条', $doc['rules'][0]['name']);
+        $this->assertSame(20061, (int) $doc['rules'][0]['listen_port']);
     }
 
     public function test_node_target_follows_node_and_breaks_when_node_deleted(): void

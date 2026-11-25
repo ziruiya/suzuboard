@@ -136,6 +136,55 @@ class PortRotationFlowTest extends MachineTestCase
         $this->assertSame('203.0.113.10', $node->host, 'host frozen under relay rotation too');
     }
 
+    /**
+     * GPT review R01 regression: rotation must save the node's new
+     * landing port BEFORE the rule update republishes — the published
+     * document derives target_port from the node row at publish time.
+     * The old order (publish first, save after) pinned the relay to the
+     * OLD landing port while the node agent moved to the new one; the
+     * pre-existing rotation test never asserted the outbox document.
+     */
+    public function test_relay_backed_rotation_publishes_the_new_landing_port(): void
+    {
+        $user = $this->makeUser();
+        $f = $this->deliverFor($user);
+        $user = $user->fresh();
+        $node = Server::findOrFail($f->reality_server_id);
+
+        $relayMachine = ServerMachine::create([
+            'name' => '中转机R01', 'token' => Str::random(40), 'is_active' => true, 'relay_tier' => 'small',
+            'role' => ServerMachine::ROLE_RELAY,
+        ]);
+        ServerMachine::findOrFail($node->machine_id)
+            ->forceFill(['public_address' => '203.0.113.10'])->save();
+        app(RelayMachineService::class)->enable($relayMachine);
+        app(RelayRuleService::class)->create($relayMachine->fresh(), [
+            'name' => '整机-Reality 入口 R01',
+            'transport' => 'tcp',
+            'listen_ip' => '0.0.0.0',
+            'listen_port' => 20002,
+            'target_type' => 'NODE',
+            'target_node_id' => $node->id,
+        ], 'admin', 1);
+        $node->port = '20002';
+        $node->save();
+        $oldLanding = (int) $node->server_port;
+
+        $results = $this->rotation()->rotateForUser($user);
+        $relayResult = collect($results)->firstWhere('server_id', $node->id);
+        $this->assertSame('relay', $relayResult['provider']);
+
+        $newLanding = (int) $node->fresh()->server_port;
+        $this->assertNotSame($oldLanding, $newLanding);
+
+        $doc = app(\App\Services\Relay\RelayConfigService::class)->latestForAgent($relayMachine->fresh());
+        $this->assertNotNull($doc);
+        $this->assertCount(1, $doc['config']['rules']);
+        $this->assertSame($newLanding, (int) $doc['config']['rules'][0]['target_port'],
+            'the republished relay document must target the NEW landing port, not the pre-rotation one');
+        $this->assertSame($relayResult['entry_port'], (int) $doc['config']['rules'][0]['listen_port']);
+    }
+
     /** A plain (non-business) account has nothing to rotate. */
     public function test_non_business_user_cannot_rotate(): void
     {

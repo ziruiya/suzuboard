@@ -12,6 +12,7 @@ use App\Models\EnterprisePurpose;
 use App\Models\Server;
 use App\Models\ServerGroup;
 use App\Models\SuzuNodeProfile;
+use App\Services\Relay\MachineRoleService;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -234,6 +235,14 @@ class EnterpriseKitBuilderService
 
     private function createNodeServer(EnterprisePurpose $purpose, EnterpriseInventoryKit $kit, EnterpriseInventoryRule $rule, string $role, string $alias): Server
     {
+        // R05: kit nodes are a node-assignment write path. The purpose's
+        // configured machine must still be a landing machine at build
+        // time — checked under the machine row lock (this runs inside
+        // buildKit()'s transaction), so a purpose pointing at a machine
+        // that has since become a relay machine fails the build loudly
+        // instead of silently parking stock nodes on a relay machine.
+        MachineRoleService::assertAssignableLocked((int) $purpose->machine_id);
+
         $isPrimary = $role === EnterpriseInventoryNode::ROLE_PRIMARY;
         $name = sprintf('[STOCK] %s %s #%03d', $purpose->name, $isPrimary ? '主线' : '备线', $kit->sequence);
         $settings = $purpose->protocol === EnterprisePurpose::PROTOCOL_SW1

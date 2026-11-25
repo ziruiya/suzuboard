@@ -139,7 +139,12 @@ class RelayNodeAddressingTest extends RelayTestCase
         $this->nodeRule($relay, $node->id);
         $before = app(RelayConfigService::class)->latestForAgent($relay->fresh());
 
-        app(MachineRoleService::class)->setPublicAddress($landing->fresh(), '198.51.100.77');
+        // R02 note: setPublicAddress now prechecks the new address by TCP
+        // probe from the panel host. 198.51.100.77 is TEST-NET (never
+        // reachable), so this republish-following test injects a passing
+        // prober; the refusal path has its own test in MachineRoleTest.
+        (new MachineRoleService(app(RelayConfigService::class), fn() => true))
+            ->setPublicAddress($landing->fresh(), '198.51.100.77');
 
         $after = app(RelayConfigService::class)->latestForAgent($relay->fresh());
         $this->assertGreaterThan($before['version'], $after['version']);
@@ -181,5 +186,169 @@ class RelayNodeAddressingTest extends RelayTestCase
         $this->assertSame(20109, $doc['config']['rules'][0]['listen_port']);
         $this->assertSame(20999, $doc['config']['rules'][0]['target_port']);
         $this->assertSame($landing->fresh()->public_address, $doc['config']['rules'][0]['target_host']);
+    }
+
+    /**
+     * GPT review R07: direct_port=0 is corrupt data, not "unset". The old
+     * falsy ?: silently fell back to server_port; strict null semantics
+     * must surface it as an invalid endpoint, and the write-side form
+     * rules must reject 0 outright.
+     */
+    public function test_direct_port_zero_is_rejected_not_treated_as_unset(): void
+    {
+        $landing = $this->makeMachine('L-R07');
+        $node = $this->makeNode($landing, ['server_port' => 8444]);
+        \Illuminate\Support\Facades\DB::table('v2_server')->where('id', $node->id)
+            ->update(['direct_port' => 0]);
+
+        [$endpoint, $error] = RelayRuleService::nodeLandingEndpoint($node->fresh());
+        $this->assertNull($endpoint, 'direct_port=0 must not fall back to server_port');
+        $this->assertStringContainsString('no valid landing port', (string) $error);
+
+        $request = \App\Http\Requests\Admin\ServerSave::create('/admin/server/save', 'POST', ['type' => 'vless']);
+        $rules = $request->rules();
+        $this->assertArrayHasKey('direct_port', $rules);
+        $validator = \Illuminate\Support\Facades\Validator::make(['direct_port' => 0], ['direct_port' => $rules['direct_port']]);
+        $this->assertTrue($validator->fails(), 'direct_port=0 must fail write validation');
+        $validator = \Illuminate\Support\Facades\Validator::make(['direct_port' => 8444], ['direct_port' => $rules['direct_port']]);
+        $this->assertFalse($validator->fails());
+        $validator = \Illuminate\Support\Facades\Validator::make(['direct_port' => null], ['direct_port' => $rules['direct_port']]);
+        $this->assertFalse($validator->fails());
+    }
+
+    /**
+     * GPT review R03: a rule the agent had ACKed as APPLIED and that a
+     * later publish excludes stays "revocation pending" until the agent
+     * ACKs a document without it — an offline agent must not be assumed
+     * to have stopped serving it.
+     */
+    public function test_excluded_applied_rule_is_revocation_pending_until_agent_acks(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-R03'));
+        $landing = $this->makeMachine('L-R03');
+        $node = $this->makeNode($landing, ['server_port' => 8444]);
+        $rule = $this->nodeRule($relay, $node->id, 20121);
+        $config = app(RelayConfigService::class);
+
+        $v1 = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $v1['version'], $v1['hash'], true));
+        $this->assertSame(RelayRule::STATUS_APPLIED, $rule->fresh()->status);
+        $this->assertNull($rule->fresh()->revocation_pending_at);
+
+        // The node loses eligibility; the next publish excludes the rule.
+        $node->forceFill(['enabled' => false])->save();
+        $config->publish($relay->fresh());
+        $v2 = $config->latestForAgent($relay->fresh());
+        $this->assertCount(0, $v2['config']['rules']);
+
+        $rule = $rule->fresh();
+        $this->assertNotNull($rule->revocation_pending_at,
+            'exclusion of an APPLIED rule must stay visibly pending until the agent confirms');
+        $this->assertTrue(\App\Models\RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'rule.revocation_pending')->exists());
+
+        $summary = app(\App\Services\Relay\RelayReconcileService::class)->run();
+        $this->assertGreaterThanOrEqual(1, $summary['revocation_pending']);
+
+        // The agent comes back and ACKs the latest document (reconcile
+        // may have republished again on eligibility hash drift — the ACK
+        // that counts is for the newest version, which also excludes the
+        // rule): only now is the revocation confirmed.
+        $latest = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $latest['version'], $latest['hash'], true));
+        $this->assertNull($rule->fresh()->revocation_pending_at);
+        $this->assertTrue(\App\Models\RelayAuditLog::where('machine_id', $relay->id)
+            ->where('action', 'rule.revocation_confirmed')->exists());
+    }
+
+    /**
+     * GPT review R08: the contract hash covers eligibility-derived state.
+     * Adding a production-rollout Suzu profile changes neither the
+     * endpoint nor the deliverable verdict — yet the hash must move, the
+     * reconcile loop must republish, and the ACK must realign the rule.
+     */
+    public function test_rollout_state_change_moves_hash_and_reconcile_republishes(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-R08'));
+        $landing = $this->makeMachine('L-R08');
+        $node = $this->makeNode($landing, ['server_port' => 8444]);
+        $rule = $this->nodeRule($relay, $node->id, 20122);
+        $config = app(RelayConfigService::class);
+
+        $hashBefore = RelayRuleService::nodeContractHash($node->fresh());
+        $this->assertSame($hashBefore, $rule->fresh()->target_contract_hash);
+        $v1 = $config->latestForAgent($relay->fresh());
+        $this->assertTrue($config->handleAck($relay->fresh(), $v1['version'], $v1['hash'], true));
+
+        \App\Models\SuzuNodeProfile::create([
+            'server_id' => $node->id,
+            'profile_code' => 'sw1',
+            'schema_version' => 1,
+            'relay_policy' => 'required',
+            'rollout_stage' => 'production',
+            'client_policy' => 'standard',
+            'udp_enabled' => false,
+        ]);
+
+        $hashAfter = RelayRuleService::nodeContractHash($node->fresh());
+        $this->assertNotSame($hashBefore, $hashAfter,
+            'a rollout-stage change must move the contract hash even when endpoint and verdict are unchanged');
+
+        $summary = app(\App\Services\Relay\RelayReconcileService::class)->run();
+        $this->assertGreaterThanOrEqual(1, $summary['republished']);
+        $v2 = $config->latestForAgent($relay->fresh());
+        $this->assertSame($v1['version'] + 1, $v2['version']);
+        $this->assertSame($hashAfter, $rule->fresh()->target_contract_hash);
+
+        $this->assertTrue($config->handleAck($relay->fresh(), $v2['version'], $v2['hash'], true));
+        $this->assertSame($v2['version'], (int) $rule->fresh()->config_version);
+        $this->assertSame(RelayRule::STATUS_APPLIED, $rule->fresh()->status);
+    }
+
+    /**
+     * GPT review R12: rollback re-derives NODE endpoints from CURRENT
+     * state. The node's landing port moved after v1 — rolling back to v1
+     * must republish the rule with today's endpoint, not resurrect v1's.
+     */
+    public function test_rollback_rederives_current_endpoint(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-R12'));
+        $landing = $this->makeMachine('L-R12');
+        $node = $this->makeNode($landing, ['server_port' => 8444]);
+        $this->nodeRule($relay, $node->id, 20123);
+        $config = app(RelayConfigService::class);
+        $v1 = $config->latestForAgent($relay->fresh());
+        $this->assertSame(8444, $v1['config']['rules'][0]['target_port']);
+
+        $node->forceFill(['server_port' => 9444])->save();
+        $config->publish($relay->fresh());
+
+        $rolled = $config->rollback($relay->fresh(), $v1['version']);
+        $payload = json_decode($rolled->payload, true);
+        $this->assertSame(9444, (int) $payload['rules'][0]['target_port'],
+            'rollback must re-derive the endpoint from current state, not republish the historical one');
+        $this->assertSame($v1['version'], (int) $payload['rolled_back_from']);
+    }
+
+    /** GPT review R12: a historical endpoint that no longer resolves refuses the rollback. */
+    public function test_rollback_refused_when_node_no_longer_deliverable(): void
+    {
+        $relay = $this->enableRelay($this->makeMachine('R-R12B'));
+        $landing = $this->makeMachine('L-R12B');
+        $node = $this->makeNode($landing, ['server_port' => 8444]);
+        $this->nodeRule($relay, $node->id, 20124);
+        $config = app(RelayConfigService::class);
+        $v1 = $config->latestForAgent($relay->fresh());
+
+        $node->forceFill(['enabled' => false])->save();
+        $outboxCount = \App\Models\RelayConfigOutbox::where('machine_id', $relay->id)->count();
+        try {
+            $config->rollback($relay->fresh(), $v1['version']);
+            $this->fail('rollback must be refused when the historical target lost eligibility');
+        } catch (RelayValidationException $e) {
+            $this->assertStringContainsString('rollback refused', $e->getMessage());
+        }
+        $this->assertSame($outboxCount, \App\Models\RelayConfigOutbox::where('machine_id', $relay->id)->count(),
+            'a refused rollback must not create a new outbox version');
     }
 }

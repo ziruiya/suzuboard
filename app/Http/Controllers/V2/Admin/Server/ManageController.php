@@ -9,6 +9,7 @@ use App\Models\Server;
 use App\Models\ServerGroup;
 use App\Models\SuzuNodeProfile;
 use App\Services\Relay\MachineRoleService;
+use App\Services\Relay\RelayValidationException;
 use App\Services\ServerService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -66,6 +67,12 @@ class ManageController extends Controller
         }
         try {
             DB::transaction(function () use ($request, $params, $profile) {
+                // R05: re-check under the machine row lock, inside the
+                // transaction — the unlocked pre-check above can race a
+                // concurrent role switch; the locked gate cannot.
+                if (!empty($params['machine_id'])) {
+                    MachineRoleService::assertAssignableLocked((int) $params['machine_id']);
+                }
                 if ($request->input('id')) {
                     $server = Server::findOrFail($request->input('id'));
                     $server->update($params);
@@ -87,6 +94,8 @@ class ManageController extends Controller
                 }
             });
             return $this->success(true);
+        } catch (RelayValidationException $e) {
+            return $this->fail([400210, $e->getMessage()]);
         } catch (\Throwable $e) {
             Log::error($e);
             return $this->fail([500, '保存失败']);
@@ -107,23 +116,31 @@ class ManageController extends Controller
             return $this->fail([400202, '服务器不存在']);
         }
 
-        if (array_key_exists('show', $params)) {
-            $server->show = (int) $params['show'];
-        }
-        if (array_key_exists('machine_id', $params)) {
-            if (!empty($params['machine_id'])) {
-                $assignError = MachineRoleService::nodeAssignmentError((int) $params['machine_id']);
-                if ($assignError) {
-                    return $this->fail([400210, $assignError]);
+        try {
+            DB::transaction(function () use ($server, $params) {
+                if (array_key_exists('show', $params)) {
+                    $server->show = (int) $params['show'];
                 }
-            }
-            $server->machine_id = $params['machine_id'] ?: null;
-        }
-        if (array_key_exists('enabled', $params)) {
-            $server->enabled = (bool) $params['enabled'];
-        }
-
-        if (!$server->save()) {
+                if (array_key_exists('machine_id', $params)) {
+                    if (!empty($params['machine_id'])) {
+                        // R05: locked gate inside the transaction (the
+                        // unlocked pre-check pattern used before raced
+                        // concurrent role switches).
+                        MachineRoleService::assertAssignableLocked((int) $params['machine_id']);
+                    }
+                    $server->machine_id = $params['machine_id'] ?: null;
+                }
+                if (array_key_exists('enabled', $params)) {
+                    $server->enabled = (bool) $params['enabled'];
+                }
+                if (!$server->save()) {
+                    throw new \RuntimeException('save failed');
+                }
+            });
+        } catch (RelayValidationException $e) {
+            return $this->fail([400210, $e->getMessage()]);
+        } catch (\Throwable $e) {
+            Log::error($e);
             return $this->fail([500, '保存失败']);
         }
 
@@ -282,12 +299,19 @@ class ManageController extends Controller
         try {
             $servers = Server::whereIn('id', $ids)->get();
             DB::transaction(function () use ($servers, $update) {
+                // R05: locked gate inside the transaction, before any row
+                // is written (see update()).
+                if (!empty($update['machine_id'])) {
+                    MachineRoleService::assertAssignableLocked((int) $update['machine_id']);
+                }
                 /** @var Server $server */
                 foreach ($servers as $server) {
                     $server->update($update);
                 }
             });
             return $this->success(true);
+        } catch (RelayValidationException $e) {
+            return $this->fail([400210, $e->getMessage()]);
         } catch (\Exception $e) {
             Log::error($e);
             return $this->fail([500, '批量更新失败']);
@@ -304,6 +328,17 @@ class ManageController extends Controller
         $server = Server::find($request->input('id'));
         if (!$server) {
             return $this->fail([400202, '服务器不存在']);
+        }
+
+        // R05: replicate() carries machine_id over verbatim — it is a
+        // node-assignment write path and must pass the same role gate
+        // (the source machine may have become a relay machine since the
+        // node was created).
+        if (!empty($server->machine_id)) {
+            $assignError = MachineRoleService::nodeAssignmentError((int) $server->machine_id);
+            if ($assignError) {
+                return $this->fail([400210, $assignError]);
+            }
         }
 
         $copiedServer = $server->replicate();

@@ -66,11 +66,21 @@ class MachineController extends Controller
             $machine->update($update);
             if (array_key_exists('public_address', $params)) {
                 try {
-                    app(MachineRoleService::class)->setPublicAddress(
+                    // R11: follower republish outcomes are surfaced, not
+                    // swallowed — a follower that failed keeps its old
+                    // published config and is named in the response.
+                    $report = app(MachineRoleService::class)->setPublicAddressWithReport(
                         $machine, $params['public_address'], 'admin', $request->user()?->id
                     );
                 } catch (RelayValidationException $e) {
                     return $this->fail([422, $e->getMessage()]);
+                }
+                $failed = array_values(array_filter(
+                    $report['followers'],
+                    fn($f) => $f['status'] !== 'published'
+                ));
+                if ($failed) {
+                    return $this->success(['follower_failures' => $failed]);
                 }
             }
             return $this->success(true);

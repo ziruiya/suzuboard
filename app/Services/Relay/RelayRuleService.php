@@ -438,7 +438,14 @@ class RelayRuleService
         if ($address === '') {
             return [null, 'target machine "' . $machine->name . '" has no public_address configured; set it in server management before a relay rule can target its nodes'];
         }
-        $port = (int) ($node->direct_port ?: $node->server_port);
+        // Strict null semantics (GPT review R07): direct_port is an
+        // override that is either absent (null) or a real port. A stored
+        // 0 is NOT "unset" — the old falsy ?: silently fell back to
+        // server_port and masked a corrupt value; now it fails the range
+        // check below like any other invalid port. Writes are validated
+        // to 1-65535 (ServerSave), so a 0 here means legacy/bad data and
+        // must surface, not be papered over.
+        $port = (int) ($node->direct_port !== null ? $node->direct_port : $node->server_port);
         if ($port < 1 || $port > 65535) {
             return [null, 'target node has no valid landing port (direct_port/server_port)'];
         }
@@ -446,19 +453,29 @@ class RelayRuleService
     }
 
     /**
-     * Contract hash over the DERIVED landing endpoint: it changes exactly
-     * when the published target would change (machine address, effective
-     * landing port, hosting machine, eligibility) — the node's
-     * subscription host is deliberately NOT part of it anymore.
+     * Contract hash over the DERIVED landing endpoint plus the node's
+     * eligibility-derived state (GPT review R08): it changes exactly when
+     * the published target would change (machine address, effective
+     * landing port, hosting machine) OR when the node's agent-deliverable
+     * qualification changes for any reason — enabled/show, Suzu profile
+     * rollout stage, enterprise-stock registration, or the deliverable
+     * verdict itself. The reconcile loop compares this hash against the
+     * stored snapshot and republishes on drift, so a qualification change
+     * can never leave a stale contract silently in place. The node's
+     * subscription host is deliberately NOT part of it.
      */
     public static function nodeContractHash(Server $node): string
     {
         [$endpoint] = self::nodeLandingEndpoint($node);
+        $profile = \App\Models\SuzuNodeProfile::where('server_id', $node->id)->first();
         return hash('sha256', implode('|', [
             $node->id, $node->type,
             $node->machine_id ?? '',
             $endpoint['host'] ?? '', $endpoint['port'] ?? '',
             $node->enabled ? '1' : '0', $node->show ? '1' : '0',
+            $profile?->rollout_stage ?? '',
+            ServerService::isEnterpriseInventoryNode($node) ? '1' : '0',
+            ServerService::isAgentDeliverable($node) ? '1' : '0',
         ]));
     }
 

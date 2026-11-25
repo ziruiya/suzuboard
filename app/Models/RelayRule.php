@@ -24,6 +24,9 @@ class RelayRule extends Model
         'enabled' => 'boolean',
         'allowlist_approved' => 'boolean',
         'allowlist_cidrs' => 'array',
+        // R03: set while a previously-APPLIED rule's removal from the
+        // published document has not yet been confirmed by an agent ACK.
+        'revocation_pending_at' => 'datetime',
     ];
 
     public const STATUS_NOT_APPLIED = 'NOT_APPLIED';
