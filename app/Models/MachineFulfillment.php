@@ -80,6 +80,29 @@ class MachineFulfillment extends Model
         self::STATUS_RECLAIM_PENDING,
     ];
 
+    /**
+     * SB-ER-005: states a new purchase may actually renew/restore.
+     * RECLAIM_PENDING is "held" for display purposes, but a repurchase
+     * must NOT be folded into it: the reclaim is already dismantling
+     * the old machine, and assignWithinOpen() has no transition out of
+     * RECLAIM_PENDING — the paid order completed while nothing was
+     * restored and no new fulfilment was created. A repurchase during
+     * reclaim therefore starts a fresh fulfilment instead.
+     */
+    public const RENEWAL_STATUSES = [
+        self::STATUS_PAID_PENDING_PURCHASE,
+        self::STATUS_PURCHASING,
+        self::STATUS_PURCHASE_BLOCKED,
+        self::STATUS_WAITING_IP,
+        self::STATUS_WAITING_INSTALL,
+        self::STATUS_INSTALLING,
+        self::STATUS_VERIFYING,
+        self::STATUS_VERIFY_FAILED,
+        self::STATUS_DELIVERED,
+        self::STATUS_SUSPENDED,
+        self::STATUS_GRACE_HELD,
+    ];
+
     public const CHOICE_WAIT_ORIGINAL = 'WAIT_ORIGINAL';
     public const CHOICE_SWITCH_REGION = 'SWITCH_REGION';
 

@@ -411,6 +411,16 @@ class Plugin extends AbstractPlugin
       return;
     }
 
+    // SB-ER-001: only admin/staff accounts may speak as support. A
+    // bound *customer* replying to a ticket notification must never be
+    // treated as a staff reply (TicketService::replyByAdmin enforces
+    // the same check server-side; this guard keeps the bot's answer
+    // honest instead of claiming success).
+    if (!($user->is_admin || $user->is_staff)) {
+      $this->sendMessage($msg, '您的账号没有客服权限，无法以客服身份回复工单。');
+      return;
+    }
+
     $ticketId = (int) $matches[2];
     $ticket = Ticket::where('id', $ticketId)->first();
     if (!$ticket) {
@@ -419,11 +429,16 @@ class Plugin extends AbstractPlugin
     }
 
     $ticketService = new TicketService();
-    $ticketService->replyByAdmin(
-      $ticketId,
-      $msg->text,
-      $user->id
-    );
+    try {
+      $ticketService->replyByAdmin(
+        $ticketId,
+        $msg->text,
+        $user->id
+      );
+    } catch (\App\Exceptions\ApiException $e) {
+      $this->sendMessage($msg, $e->getMessage());
+      return;
+    }
 
     $this->sendMessage($msg, "工单 #{$ticketId} 回复成功");
   }

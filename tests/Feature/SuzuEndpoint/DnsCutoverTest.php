@@ -139,4 +139,74 @@ class DnsCutoverTest extends TestCase
         $this->expectException(SuzuEndpointException::class);
         $this->dns->rollback($cutover['change']->fresh(), 5, 1);
     }
+
+    // ------------------------------------------------------------ SB-ER-011
+
+    public function test_second_cutover_with_stale_revision_never_reaches_dns(): void
+    {
+        // A second operator holds a pre-cutover copy of the binding.
+        $staleCopy = SuzuEndpointBinding::find($this->binding->id);
+        $this->fakeSequence([self::OLD_IP, self::NEW_IP, self::NEW_IP]);
+
+        $this->dns->cutover($this->binding, self::NEW_IP, 3, 1);
+        Http::assertSentCount(3);
+
+        try {
+            $this->dns->cutover($staleCopy, '203.0.113.99', 3, 2);
+            $this->fail('a stale-revision cutover must be refused');
+        } catch (SuzuEndpointException $e) {
+            $this->assertStringContainsString('revision conflict', $e->getMessage());
+        }
+        Http::assertSentCount(3, 'ER-011: the losing cutover must not write DNS at all');
+        $binding = $this->binding->fresh();
+        $this->assertSame(self::NEW_IP, $binding->current_entry_ip);
+        $this->assertSame(4, $binding->revision);
+    }
+
+    public function test_cutover_refuses_while_another_change_holds_the_lock(): void
+    {
+        Http::fake();
+        $lock = \Illuminate\Support\Facades\Cache::lock('suzu-dns-cutover:binding:' . $this->binding->id, 30);
+        $this->assertTrue($lock->acquire());
+        try {
+            $this->dns->cutover($this->binding, self::NEW_IP, 3, 1);
+            $this->fail('a concurrent DNS change must be refused, not raced');
+        } catch (SuzuEndpointException $e) {
+            $this->assertStringContainsString('in progress', $e->getMessage());
+        } finally {
+            $lock->release();
+        }
+        Http::assertNothingSent();
+        $this->assertSame(0, SuzuEndpointChange::count());
+    }
+
+    public function test_commit_conflict_leaves_durable_audit_evidence(): void
+    {
+        $calls = 0;
+        Http::fake([self::RECORD_URL => function () use (&$calls) {
+            $calls++;
+            if ($calls === 2) {
+                // A writer that bypassed the lock lands between our
+                // DNS write and the panel commit.
+                SuzuEndpointBinding::where('id', $this->binding->id)->update(['revision' => 99]);
+                return Http::response(['success' => true, 'result' => ['id' => 'rec-1', 'content' => self::NEW_IP]], 200);
+            }
+            return Http::response(['success' => true, 'result' => ['id' => 'rec-1', 'content' => $calls === 1 ? self::OLD_IP : self::NEW_IP]], 200);
+        }]);
+
+        try {
+            $this->dns->cutover($this->binding, self::NEW_IP, 3, 1);
+            $this->fail('the commit conflict must surface');
+        } catch (SuzuEndpointException $e) {
+            $this->assertStringContainsString('revision moved during cutover', $e->getMessage());
+        }
+
+        // ER-011: previously this failure record was rolled back with
+        // the commit transaction — the fork had no surviving evidence.
+        $change = SuzuEndpointChange::first();
+        $this->assertNotNull($change, 'the failed change row must survive');
+        $this->assertSame(SuzuEndpointChange::ROLLBACK_FAILED, $change->rollback_status);
+        $this->assertFalse($change->postcheck_result['verified']);
+        $this->assertSame(self::OLD_IP, $this->binding->fresh()->current_entry_ip, 'the panel row itself was not committed');
+    }
 }

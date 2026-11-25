@@ -181,6 +181,27 @@ class RelayConfigService
                 'relay_config_hash' => $hash,
             ])->save();
 
+            $this->recordPublishEffects($machine, $document, $version, $hash, $previouslyApplied, $actorType, $actorId);
+            RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.publish', 'v' . $version . ' ' . $hash);
+            return $outbox;
+        });
+    }
+
+    /**
+     * Shared publish bookkeeping (extracted for SB-ER-012 so rollback
+     * runs the identical accounting as a normal publish): included
+     * rules move to APPLYING under the new version, rules the agent
+     * was serving that are absent from the document enter the
+     * revocation-pending window, and obligations for rules that are
+     * published again close. Must run inside the publish transaction,
+     * after the outbox row and the machine version are written.
+     *
+     * @param array<int, string> $previouslyApplied rule codes whose
+     *        rows were APPLIED before this publish (captured before
+     *        any status rewrite).
+     */
+    private function recordPublishEffects(ServerMachine $machine, array $document, int $version, string $hash, array $previouslyApplied, string $actorType, ?int $actorId): void
+    {
             $included = collect($document['rules'])->pluck('rule_code')->all();
             RelayRule::where('machine_id', $machine->id)->where('enabled', true)
                 ->whereIn('rule_code', $included)
@@ -255,9 +276,6 @@ class RelayConfigService
                 RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'rule.revocation_confirmed',
                     'republished in v' . $version . ': ' . $republished->pluck('rule_code')->implode(','));
             }
-            RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.publish', 'v' . $version . ' ' . $hash);
-            return $outbox;
-        });
     }
 
     /** Republish an older version's content under a new, higher version. */
@@ -277,6 +295,46 @@ class RelayConfigService
         // endpoint (or a revoked rule) under a fresh version.
         $machine = $machine->fresh() ?? $machine;
         $document = $this->revalidateRollbackDocument($machine, json_decode($source->payload, true), (int) $source->version);
+        // SB-ER-012: a rollback restores a historical RULESET, never a
+        // historical machine state, and never resurrects a rule the
+        // operator has since disabled. The old path republished the
+        // stored document almost verbatim: its machine-level
+        // relay_enabled/status came from the snapshot day, currently
+        // disabled rules went back on the wire (and were then marked
+        // APPLIED on ACK while their rows still said disabled), and
+        // none of the normal publish bookkeeping (APPLYING flips,
+        // revocation obligations for rules the rollback drops) ran.
+        if (!$machine->relay_enabled
+            || in_array($machine->relay_status, [ServerMachine::RELAY_STATUS_DRAINING, ServerMachine::RELAY_STATUS_DISABLED], true)) {
+            throw new RelayValidationException(
+                'rollback refused: machine relay is currently ' . ($machine->relay_enabled ? $machine->relay_status : 'DISABLED')
+                . '; re-enable the machine first, then roll back'
+            );
+        }
+        $droppedDisabled = [];
+        $document['rules'] = array_values(array_filter(
+            $document['rules'] ?? [],
+            function (array $entry) use ($machine, &$droppedDisabled) {
+                $code = $entry['rule_code'] ?? null;
+                $rule = $code
+                    ? RelayRule::where('machine_id', $machine->id)->where('rule_code', $code)->first()
+                    : null;
+                if ($rule && !$rule->enabled) {
+                    $droppedDisabled[] = $code;
+                    return false;
+                }
+                return true;
+            }
+        ));
+        if ($droppedDisabled) {
+            RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.rollback_dropped_disabled',
+                'from v' . $source->version . '; currently disabled, not restored: ' . implode(',', $droppedDisabled));
+        }
+        // Machine-level fields always describe the CURRENT machine,
+        // derived exactly as buildDocument() derives them.
+        $document['relay_enabled'] = (bool) ($machine->isRelayRole() && $machine->relay_enabled)
+            && $machine->relay_status !== ServerMachine::RELAY_STATUS_DRAINING;
+        $document['machine_status'] = $machine->relay_status;
         // B04: re-derivation proves an endpoint is well-formed, not that
         // it answers. When a prober is wired (the admin controller wires
         // the real TCP prober), every re-derived NODE target must accept
@@ -311,6 +369,15 @@ class RelayConfigService
         }
         return DB::transaction(function () use ($machine, $source, $document, $actorType, $actorId) {
             $machine = ServerMachine::where('id', $machine->id)->lockForUpdate()->first() ?? $machine;
+            // SB-ER-012: capture the serving set before the rollback
+            // publish, then run the SAME bookkeeping as a normal
+            // publish (recordPublishEffects): restored rules move to
+            // APPLYING under the new version, and rules the agent was
+            // serving that the rollback document omits enter the
+            // revocation-pending window instead of vanishing silently.
+            $previouslyApplied = RelayRule::where('machine_id', $machine->id)
+                ->where('status', RelayRule::STATUS_APPLIED)
+                ->pluck('rule_code')->all();
             $version = (int) $machine->relay_config_version + 1;
             $document['version'] = $version;
             $document['generated_at'] = now()->toIso8601String();
@@ -335,6 +402,7 @@ class RelayConfigService
                 'relay_config_version' => $version,
                 'relay_config_hash' => $hash,
             ])->save();
+            $this->recordPublishEffects($machine, $document, $version, $hash, $previouslyApplied, $actorType, $actorId);
             RelayAuditLog::record($machine->id, null, $actorType, $actorId, 'config.rollback', 'from v' . $source->version . ' republished as v' . $version);
             return $outbox;
         });

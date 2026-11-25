@@ -21,13 +21,24 @@ class RelayTrafficService
     /**
      * @param array $batches each: rule_code, boot_id, seq, period_start,
      *                        period_end, bytes_in, bytes_out, connections?
-     * @return array{accepted:int, duplicates:int, rejected:int}
+     * @return array{accepted:int, duplicates:int, rejected:int, rejected_batches:array}
+     *
+     * SB-ER-014 (panel half): every batch is judged independently and
+     * the response now names each rejected batch (rule_code / boot_id
+     * / seq / reason). The agent-side defect — one rejected batch
+     * causing the whole pending queue to be dropped, including later
+     * valid batches — can only be fixed in xboard-node (batch 4), but
+     * it needs this per-batch verdict to drop exactly the rejected
+     * batches and keep the rest; aggregate counts alone cannot say
+     * WHICH batches died. The field is additive: older agents reading
+     * only the counts are unaffected.
      */
     public function ingest(ServerMachine $machine, array $batches): array
     {
         $accepted = 0;
         $duplicates = 0;
         $rejected = 0;
+        $rejectedBatches = [];
 
         foreach ($batches as $batch) {
             $ruleCode = (string) ($batch['rule_code'] ?? '');
@@ -38,6 +49,12 @@ class RelayTrafficService
             $end = (int) ($batch['period_end'] ?? 0);
             if (!$rule || $bootId === '' || $seq < 0 || $start <= 0 || $end <= $start) {
                 $rejected++;
+                $rejectedBatches[] = [
+                    'rule_code' => $ruleCode,
+                    'boot_id' => $bootId,
+                    'seq' => $seq,
+                    'reason' => !$rule ? 'unknown_rule' : 'invalid_batch',
+                ];
                 continue;
             }
             $bytesIn = max(0, (int) ($batch['bytes_in'] ?? 0));
@@ -68,7 +85,12 @@ class RelayTrafficService
             $booked ? $accepted++ : $duplicates++;
         }
 
-        return ['accepted' => $accepted, 'duplicates' => $duplicates, 'rejected' => $rejected];
+        return [
+            'accepted' => $accepted,
+            'duplicates' => $duplicates,
+            'rejected' => $rejected,
+            'rejected_batches' => $rejectedBatches,
+        ];
     }
 
     /**

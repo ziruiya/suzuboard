@@ -128,10 +128,12 @@ class RelaySyncTest extends RelayTestCase
         ];
         $traffic = app(RelayTrafficService::class);
         $first = $traffic->ingest($machine->fresh(), [$batch]);
-        $this->assertSame(['accepted' => 1, 'duplicates' => 0, 'rejected' => 0], $first);
+        // SB-ER-014: the result gained the additive rejected_batches
+        // detail field; the counting contract is unchanged.
+        $this->assertSame(['accepted' => 1, 'duplicates' => 0, 'rejected' => 0, 'rejected_batches' => []], $first);
         for ($i = 0; $i < 9; $i++) {
             $again = $traffic->ingest($machine->fresh(), [$batch]);
-            $this->assertSame(['accepted' => 0, 'duplicates' => 1, 'rejected' => 0], $again);
+            $this->assertSame(['accepted' => 0, 'duplicates' => 1, 'rejected' => 0, 'rejected_batches' => []], $again);
         }
         $this->assertSame(1, RelayTrafficBatch::count());
         $day = RelayRuleStat::where('rule_id', $rule->id)->where('record_type', 'd')

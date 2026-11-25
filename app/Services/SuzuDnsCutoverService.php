@@ -23,6 +23,16 @@ use Illuminate\Support\Facades\Http;
  *    (idempotent): no API call, no new audit row.
  *  - Failed attempts still leave an audit row marked rollback_status
  *    'failed' — the trail must show attempts, not only successes.
+ *  - SB-ER-011: all changes to one binding are SERIALIZED through a
+ *    per-binding cache lock, and the binding is re-read inside the
+ *    lock before any check or API call. Two operations presenting the
+ *    same revision can therefore no longer both write DNS (the second
+ *    sees the moved revision and stops before touching the record) —
+ *    previously the second write landed remotely while the panel kept
+ *    the first, forking panel state from authoritative DNS, and its
+ *    failure audit was saved inside the very transaction that then
+ *    rolled back, erasing the evidence. Failure bookkeeping for the
+ *    commit phase is now persisted outside the throwing transaction.
  */
 class SuzuDnsCutoverService
 {
@@ -36,6 +46,22 @@ class SuzuDnsCutoverService
         if (!filter_var($newIp, FILTER_VALIDATE_IP)) {
             throw new SuzuEndpointException("invalid target ip: {$newIp}");
         }
+        $lock = $this->bindingLock($binding);
+        try {
+            return $this->withBindingLock($lock, function () use ($binding, $newIp, $expectedRevision, $actorId, $precheckResult) {
+                // Re-read inside the lock: every check below runs
+                // against the state the previous serialized change
+                // left behind, never a stale caller-side copy.
+                $binding = $binding->fresh() ?? $binding;
+                return $this->cutoverLocked($binding, $newIp, $expectedRevision, $actorId, $precheckResult);
+            });
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function cutoverLocked(SuzuEndpointBinding $binding, string $newIp, int $expectedRevision, ?int $actorId = null, ?array $precheckResult = null): array
+    {
         $this->assertBindingReady($binding);
 
         if ($binding->revision !== $expectedRevision) {
@@ -76,7 +102,17 @@ class SuzuDnsCutoverService
             throw $e instanceof SuzuEndpointException ? $e : new SuzuEndpointException($e->getMessage());
         }
 
-        $binding = $this->commitBindingIp($binding, $newIp, $expectedRevision, $change);
+        try {
+            $binding = $this->commitBindingIp($binding, $newIp, $expectedRevision, $change);
+        } catch (SuzuEndpointException $e) {
+            // SB-ER-011: the commit conflict must leave durable audit
+            // evidence. This save runs outside the rolled-back commit
+            // transaction, so the 'failed' row survives.
+            $change->postcheck_result = ['verified' => false, 'error' => $e->getMessage()];
+            $change->rollback_status = SuzuEndpointChange::ROLLBACK_FAILED;
+            $change->save();
+            throw $e;
+        }
 
         $change->new_binding = $binding->auditSnapshot();
         $change->postcheck_result = ['read_back' => $newIp, 'verified' => true];
@@ -110,6 +146,21 @@ class SuzuDnsCutoverService
         if (!$binding) {
             throw new SuzuEndpointException('binding for cutover contract not found');
         }
+        // SB-ER-011: rollbacks serialize against cutovers of the same
+        // binding through the same per-binding lock.
+        $lock = $this->bindingLock($binding);
+        try {
+            return $this->withBindingLock($lock, function () use ($binding, $cutoverChange, $expectedRevision, $actorId, $oldIp) {
+                $binding = $binding->fresh() ?? $binding;
+                return $this->rollbackLocked($binding, $cutoverChange, $expectedRevision, $actorId, (string) $oldIp);
+            });
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function rollbackLocked(SuzuEndpointBinding $binding, SuzuEndpointChange $cutoverChange, int $expectedRevision, ?int $actorId, string $oldIp): array
+    {
         $this->assertBindingReady($binding);
         if ($binding->revision !== $expectedRevision) {
             throw new SuzuEndpointException(
@@ -141,7 +192,16 @@ class SuzuDnsCutoverService
             throw $e instanceof SuzuEndpointException ? $e : new SuzuEndpointException($e->getMessage());
         }
 
-        $binding = $this->commitBindingIp($binding, (string) $oldIp, $expectedRevision, $change);
+        try {
+            $binding = $this->commitBindingIp($binding, (string) $oldIp, $expectedRevision, $change);
+        } catch (SuzuEndpointException $e) {
+            // SB-ER-011: durable failure audit, saved outside the
+            // rolled-back commit transaction (see cutoverLocked).
+            $change->postcheck_result = ['verified' => false, 'error' => $e->getMessage()];
+            $change->rollback_status = SuzuEndpointChange::ROLLBACK_FAILED;
+            $change->save();
+            throw $e;
+        }
 
         $change->new_binding = $binding->auditSnapshot();
         $change->postcheck_result = ['read_back' => $oldIp, 'verified' => true];
@@ -151,6 +211,22 @@ class SuzuDnsCutoverService
         $cutoverChange->save();
 
         return ['binding' => $binding, 'change' => $change];
+    }
+
+    /** SB-ER-011: the per-binding serialization lock. */
+    private function bindingLock(SuzuEndpointBinding $binding): \Illuminate\Contracts\Cache\Lock
+    {
+        return \Illuminate\Support\Facades\Cache::lock('suzu-dns-cutover:binding:' . $binding->id, 30);
+    }
+
+    private function withBindingLock(\Illuminate\Contracts\Cache\Lock $lock, callable $fn): mixed
+    {
+        try {
+            $lock->block(10);
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException) {
+            throw new SuzuEndpointException('another DNS change for this record is in progress; retry shortly');
+        }
+        return $fn();
     }
 
     /** Current content of the binding's DNS record, or null if unreadable. */
@@ -176,9 +252,10 @@ class SuzuDnsCutoverService
                 throw new SuzuEndpointException('binding disappeared during cutover');
             }
             if ($locked->revision !== $expectedRevision) {
-                $change->postcheck_result = ['verified' => false, 'error' => 'revision moved during cutover; DNS already changed, binding left untouched'];
-                $change->rollback_status = SuzuEndpointChange::ROLLBACK_FAILED;
-                $change->save();
+                // SB-ER-011: do NOT persist the failure state here —
+                // this transaction is about to roll back and would take
+                // the audit row with it. The caller saves the 'failed'
+                // state outside the transaction, then rethrows.
                 throw new SuzuEndpointException('revision moved during cutover; DNS was changed but the binding was not updated — reconcile manually');
             }
             $locked->current_entry_ip = $ip;

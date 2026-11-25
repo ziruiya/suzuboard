@@ -3,6 +3,8 @@
 namespace App\Services\Relay;
 
 use App\Models\RelayAddressChange;
+use App\Models\RelayAuditLog;
+use App\Models\RelayConfigOutbox;
 use App\Models\RelayRevocation;
 use App\Models\RelayRule;
 use App\Models\Server;
@@ -82,14 +84,44 @@ class RelayReconcileService
                     });
 
                 // Eligibility drift on NODE targets -> republish (marks BROKEN).
-                $before = RelayRule::where('machine_id', $machine->id)
-                    ->where('status', RelayRule::STATUS_BROKEN)->count();
+                //
+                // SB-ER-013: the trigger is no longer "the BROKEN count
+                // grew". That test goes blind exactly when it matters:
+                // a rule marked BROKEN by a round whose publish then
+                // FAILED (process death, outbox write error) leaves the
+                // count unchanged in every later round, so the document
+                // excluding the rule was never published and the agent
+                // kept forwarding to the dead target indefinitely.
+                // Instead, reconcile the DESIRED document (what
+                // buildDocument computes now) against the LATEST
+                // PUBLISHED document (the newest outbox payload): any
+                // rule-set difference republishes, however it arose.
+                // A failed publish is counted and logged, and the same
+                // mismatch re-triggers it next round — visible and
+                // self-retrying, never silently dropped.
                 $document = $this->config->buildDocument($machine);
-                $after = RelayRule::where('machine_id', $machine->id)
-                    ->where('status', RelayRule::STATUS_BROKEN)->count();
-                if ($after > $before || $hashDrift) {
-                    $this->config->publish($machine);
-                    $summary['republished']++;
+                $desired = collect($document['rules'] ?? [])->pluck('rule_code')->all();
+                sort($desired);
+                $latest = RelayConfigOutbox::where('machine_id', $machine->id)
+                    ->orderByDesc('version')->first();
+                $published = [];
+                if ($latest) {
+                    $published = collect(json_decode((string) $latest->payload, true)['rules'] ?? [])
+                        ->pluck('rule_code')->all();
+                    sort($published);
+                }
+                if ($desired !== $published || $hashDrift) {
+                    try {
+                        $this->config->publish($machine);
+                        $summary['republished']++;
+                    } catch (\Throwable $e) {
+                        $summary['publish_failed'] = ($summary['publish_failed'] ?? 0) + 1;
+                        \Illuminate\Support\Facades\Log::warning('relay reconcile publish failed', [
+                            'machine_id' => $machine->id,
+                            'error' => $e->getMessage(),
+                        ]);
+                        RelayAuditLog::record($machine->id, null, 'system', null, 'config.reconcile_publish_failed', $e->getMessage());
+                    }
                 }
             });
 

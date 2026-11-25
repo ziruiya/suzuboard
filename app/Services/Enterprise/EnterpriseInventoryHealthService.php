@@ -294,6 +294,10 @@ class EnterpriseInventoryHealthService
         $ok = collect($checks)->every(fn($c) => $c['ok']);
         $kit->last_probe_at = now();
         if ($ok) {
+            // SB-ER-007: only a PASS stamps the freshness clock. A
+            // failing probe updates last_probe_at (attempt) but must
+            // never refresh assignment eligibility.
+            $kit->last_probe_ok_at = now();
             $kit->health_fail_count = 0;
             if ($mode === 'full') {
                 $kit->last_full_probe_at = now();

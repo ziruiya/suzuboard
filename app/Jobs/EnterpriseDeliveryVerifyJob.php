@@ -26,6 +26,15 @@ use Illuminate\Queue\SerializesModels;
  * yet, and a single immediate probe misjudges that lag as a delivery
  * failure. Only when every attempt in the window has failed is the
  * delivery declared failed (fail-closed semantics unchanged).
+ *
+ * SB-ER-008: each queue execution performs exactly ONE bounded probe.
+ * The previous shape slept through the whole backoff ladder (210s)
+ * inside a single execution, but the production Horizon workers time
+ * out at 30s — the process was killed mid-ladder, the retry restarted
+ * the ladder from attempt 1, and the terminal alert could never fire.
+ * Attempts now advance by re-dispatching the next attempt as a fresh
+ * job with the ladder delay, so every execution fits the worker
+ * timeout and the final attempt reliably raises the persistent alert.
  */
 class EnterpriseDeliveryVerifyJob implements ShouldQueue
 {
@@ -34,6 +43,7 @@ class EnterpriseDeliveryVerifyJob implements ShouldQueue
     public function __construct(
         public int $kitId,
         public int $intentId,
+        public int $attempt = 1,
     ) {
     }
 
@@ -46,27 +56,27 @@ class EnterpriseDeliveryVerifyJob implements ShouldQueue
         }
         $backoff = array_map('intval', (array) config('suzu_enterprise.delivery_verify_backoff_seconds', [20, 40, 60, 90]));
         $maxAttempts = count($backoff) + 1;
-        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            $result = $health->verifyDelivery($kit);
-            if ($result['ok']) {
-                if ($intent->status === EnterpriseOrderIntent::STATUS_RESERVED) {
-                    $intent->status = EnterpriseOrderIntent::STATUS_DELIVERED;
-                    $intent->save();
-                }
-                return;
+
+        $result = $health->verifyDelivery($kit);
+        if ($result['ok']) {
+            if ($intent->status === EnterpriseOrderIntent::STATUS_RESERVED) {
+                $intent->status = EnterpriseOrderIntent::STATUS_DELIVERED;
+                $intent->save();
             }
-            if ($attempt < $maxAttempts) {
-                $delay = (int) ($backoff[$attempt - 1] ?? 0);
-                EnterpriseInventoryLog::record(
-                    $kit->id,
-                    'delivery.verify.retry',
-                    "delivery verification attempt {$attempt}/{$maxAttempts} failed; retrying in {$delay}s (agent sync may lag)"
-                );
-                if ($delay > 0) {
-                    sleep($delay);
-                }
-            }
+            return;
         }
+
+        if ($this->attempt < $maxAttempts) {
+            $delay = (int) ($backoff[$this->attempt - 1] ?? 0);
+            EnterpriseInventoryLog::record(
+                $kit->id,
+                'delivery.verify.retry',
+                "delivery verification attempt {$this->attempt}/{$maxAttempts} failed; retrying in {$delay}s (agent sync may lag)"
+            );
+            self::dispatch($this->kitId, $this->intentId, $this->attempt + 1)->delay($delay);
+            return;
+        }
+
         EnterpriseInventoryAlert::raise(
             $kit->purpose_id,
             $kit->id,

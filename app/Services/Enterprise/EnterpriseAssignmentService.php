@@ -151,10 +151,17 @@ class EnterpriseAssignmentService
         $kit = null;
         if ($intent->kit_id) {
             $candidate = EnterpriseInventoryKit::lockForUpdate()->find($intent->kit_id);
+            // SB-ER-007: the reserved candidate must pass the same
+            // freshness gate as a fresh pick, inside this lock — a kit
+            // that lost its health qualification between hold and
+            // payment is not delivered; the flow falls through to a
+            // fresh pick or to the waiting queue.
             if ($candidate && $candidate->status === EnterpriseInventoryKit::STATUS_HELD
-                && (int) $candidate->held_order_id === (int) $order->id) {
+                && (int) $candidate->held_order_id === (int) $order->id
+                && $candidate->freshnessOk()) {
                 $kit = $candidate;
-            } elseif ($candidate && $candidate->status === EnterpriseInventoryKit::STATUS_READY) {
+            } elseif ($candidate && $candidate->status === EnterpriseInventoryKit::STATUS_READY
+                && $candidate->assignmentFresh()) {
                 $kit = $candidate;
             }
         }
@@ -207,6 +214,22 @@ class EnterpriseAssignmentService
             $user = User::lockForUpdate()->find($intent->user_id);
             $order = Order::find($intent->order_id);
             if (!$user || !$order) {
+                // SB-ER-006 (residual after SB-MONEY-008): a queue head
+                // whose user or order row is gone can never be
+                // delivered, and returning without a state change left
+                // it at the head of the FIFO forever — the drain loop
+                // stops on an unchanged head. Close it for manual
+                // handling exactly like the lapsed-subscription case.
+                $intent->status = EnterpriseOrderIntent::STATUS_FAILED;
+                $intent->note = 'linked user or order missing; moved to manual handling (D02: no refund)';
+                $intent->save();
+                EnterpriseInventoryAlert::raise(
+                    $intent->purpose_id,
+                    null,
+                    EnterpriseInventoryAlert::TYPE_WAITING_TOO_LONG,
+                    "Order intent #{$intent->id} references a missing user/order; intent closed for manual handling (D02: no refund)"
+                );
+                EnterpriseInventoryLog::record(null, 'intent.orphaned_closed', "intent {$intent->id}");
                 return null;
             }
             if ($user->enterprise_kit_id) {
@@ -246,6 +269,18 @@ class EnterpriseAssignmentService
 
         if ($assignedKitId) {
             EnterpriseDeliveryVerifyJob::dispatch($assignedKitId, $intent->id);
+            // SB-ER-003 (residual after SB-MONEY-007): the kit just
+            // became usable, so a DELIVERED dedicated machine the
+            // customer still holds must start its grace window now —
+            // the same switch OrderService::open() performs post-commit
+            // for instantly-assigned kits. The drain path previously
+            // skipped it, leaving the machine DELIVERED forever while
+            // the customer's group had already moved to the kit.
+            $customer = User::find($intent->user_id);
+            if ($customer) {
+                app(\App\Services\Machine\MachineFulfillmentService::class)
+                    ->supersedeActiveMachine($customer, 'customer switched to the dedicated-port tier (waiting-queue assignment)');
+            }
             return true;
         }
         return false;
@@ -429,7 +464,11 @@ class EnterpriseAssignmentService
             $query->lockForUpdate();
         }
         $candidates = $query->get();
-        return $candidates->first(fn(EnterpriseInventoryKit $k) => $k->assignmentFresh()) ?? $candidates->first();
+        // SB-ER-007: no silent fallback to a stale kit. When nothing is
+        // fresh the caller queues the order (PAID_WAITING_INVENTORY);
+        // handing out an unverified kit defeats the freshness gate the
+        // design mandates.
+        return $candidates->first(fn(EnterpriseInventoryKit $k) => $k->assignmentFresh());
     }
 
     private function customerLabel(User $user): string

@@ -24,6 +24,7 @@ class EnterpriseInventoryKit extends Model
         'health_fail_count' => 'integer',
         'held_order_id' => 'integer',
         'last_probe_at' => 'datetime',
+        'last_probe_ok_at' => 'datetime',
         'last_full_probe_at' => 'datetime',
         'verify_expires_at' => 'datetime',
         'hold_expires_at' => 'datetime',
@@ -90,18 +91,28 @@ class EnterpriseInventoryKit extends Model
      * Assignment freshness gates from the design: a kit may only be handed
      * out when a full verification passed within the last 24h and a light
      * check passed within the last 6h.
+     *
+     * SB-ER-007: the light-check leg reads last_probe_ok_at — the last
+     * PASSING probe — never last_probe_at (the last attempt). A kit
+     * whose probes keep failing must age out of eligibility instead of
+     * looking freshly checked forever.
      */
+    public function freshnessOk(): bool
+    {
+        if (!$this->verify_expires_at || $this->verify_expires_at->isPast()) {
+            return false;
+        }
+        if (!$this->last_probe_ok_at || $this->last_probe_ok_at->lt(now()->subHours(6))) {
+            return false;
+        }
+        return true;
+    }
+
     public function assignmentFresh(): bool
     {
         if ($this->status !== self::STATUS_READY) {
             return false;
         }
-        if (!$this->verify_expires_at || $this->verify_expires_at->isPast()) {
-            return false;
-        }
-        if (!$this->last_probe_at || $this->last_probe_at->lt(now()->subHours(6))) {
-            return false;
-        }
-        return true;
+        return $this->freshnessOk();
     }
 }

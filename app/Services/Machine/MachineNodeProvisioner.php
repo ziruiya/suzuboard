@@ -183,14 +183,15 @@ class MachineNodeProvisioner
                     'encryption' => null,
                 ],
                 // Production-shaped cert config (domain / dns_provider /
-                // dns_env / email); the domain is the machine's public IP
-                // until ops binds a name to the box.
-                'cert_config' => [
-                    'cert_mode' => 'dns',
-                    'domain' => $ip,
-                    'dns_provider' => 'cloudflare',
-                    'email' => admin_setting('machine_cert_email'),
-                ],
+                // dns_env / email) via the shared credential clone
+                // (SB-ER-010): previously this literal carried no
+                // dns_env at all, so the agent could never complete a
+                // DNS-01 issuance and the first machines would have
+                // needed hand repair. The domain is the machine's
+                // public IP until ops binds a name to the box;
+                // delivery verification now refuses to deliver while
+                // the credential set is incomplete.
+                'cert_config' => \App\Services\CertCredentialReference::dnsCertConfig($ip),
             ]
         ));
         SuzuNodeProfile::create([
@@ -225,12 +226,8 @@ class MachineNodeProvisioner
                     'multiplex' => ['enabled' => false],
                     'encryption' => null,
                 ],
-                'cert_config' => [
-                    'cert_mode' => 'dns',
-                    'domain' => $ip,
-                    'dns_provider' => 'cloudflare',
-                    'email' => admin_setting('machine_cert_email'),
-                ],
+                // See createSs1Node (SB-ER-010): shared credential clone.
+                'cert_config' => \App\Services\CertCredentialReference::dnsCertConfig($ip),
             ]
         ));
         SuzuNodeProfile::create([

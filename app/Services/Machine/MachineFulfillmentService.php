@@ -63,7 +63,11 @@ class MachineFulfillmentService
      */
     public function createForOrder(Order $order, Plan $plan, ?string $regionCode, User $user): MachineFulfillment
     {
-        $active = $this->activeForUser((int) $user->id, (int) $plan->id);
+        // SB-ER-005: renewal targeting excludes RECLAIM_PENDING (see
+        // MachineFulfillment::RENEWAL_STATUSES) — a repurchase during
+        // reclaim creates a fresh fulfilment instead of being folded
+        // into the record being dismantled.
+        $active = $this->renewalForUser((int) $user->id, (int) $plan->id);
         if ($active) {
             if (!$order->machine_region_code) {
                 $order->machine_region_code = $active->region_code;
@@ -97,6 +101,16 @@ class MachineFulfillmentService
             ->first();
     }
 
+    /** The fulfilment a new purchase would renew (SB-ER-005). */
+    public function renewalForUser(int $userId, ?int $planId = null): ?MachineFulfillment
+    {
+        return MachineFulfillment::where('user_id', $userId)
+            ->when($planId, fn($q) => $q->where('plan_id', $planId))
+            ->whereIn('status', MachineFulfillment::RENEWAL_STATUSES)
+            ->orderByDesc('id')
+            ->first();
+    }
+
     public function forOrder(int $orderId): ?MachineFulfillment
     {
         return MachineFulfillment::where('order_id', $orderId)->first();
@@ -112,7 +126,7 @@ class MachineFulfillmentService
      */
     public function assignWithinOpen(Order $order, User $user, Plan $plan): ?MachineFulfillment
     {
-        $fulfillment = $this->forOrder((int) $order->id) ?? $this->activeForUser((int) $user->id, (int) $plan->id);
+        $fulfillment = $this->forOrder((int) $order->id) ?? $this->renewalForUser((int) $user->id, (int) $plan->id);
         if (!$fulfillment) {
             return null;
         }
@@ -131,6 +145,7 @@ class MachineFulfillmentService
             $user->group_id = $fulfillment->group_id;
             $user->machine_fulfillment_id = $fulfillment->id;
             $this->membership->addGroupToVipServers((int) $fulfillment->group_id);
+            $this->restoreDedicatedNodeGrants($fulfillment);
             MachineFulfillmentLog::record($fulfillment->id, 'fulfillment.restored', 'renewed during grace; delivery restored');
         }
 
@@ -215,7 +230,10 @@ class MachineFulfillmentService
     public function suspend(MachineFulfillment $f, ?int $adminId = null): MachineFulfillment
     {
         $this->assertStatus($f, [MachineFulfillment::STATUS_DELIVERED]);
-        DB::transaction(function () use ($f) {
+        // Incidental fix on the ER-002 path: $adminId was used inside
+        // the closure without being captured (undefined-variable
+        // warning in production, exception under strict handlers).
+        DB::transaction(function () use ($f, $adminId) {
             $this->stopEntitlement($f);
             $this->transition($f, MachineFulfillment::STATUS_SUSPENDED, 'fulfillment.suspended', null, $adminId);
         });
@@ -229,14 +247,35 @@ class MachineFulfillmentService
         if ($user->expired_at !== null && $user->expired_at < time()) {
             throw new \InvalidArgumentException('user subscription has expired; cannot resume');
         }
-        DB::transaction(function () use ($f, $user) {
+        DB::transaction(function () use ($f, $user, $adminId) {
             $user->group_id = $f->group_id;
             $user->machine_fulfillment_id = $f->id;
             $user->save();
             $this->membership->addGroupToVipServers((int) $f->group_id);
+            $this->restoreDedicatedNodeGrants($f);
             $this->transition($f, MachineFulfillment::STATUS_DELIVERED, 'fulfillment.resumed', null, $adminId);
         });
         return $f->fresh();
+    }
+
+    /**
+     * SB-ER-002: stopEntitlement() strips the dedicated group from
+     * EVERY server carrying it — including the fulfilment's three
+     * dedicated nodes, whose only grant it is. The VIP-side restore
+     * (addGroupToVipServers) never reaches those nodes, so a resumed /
+     * grace-restored machine came back DELIVERED with its dedicated
+     * lines invisible. Re-grant the group to the three nodes here.
+     * Must be called inside a DB transaction (membership contract).
+     */
+    private function restoreDedicatedNodeGrants(MachineFulfillment $f): void
+    {
+        if (!$f->group_id) {
+            return;
+        }
+        $ids = $f->nodeIds();
+        if ($ids) {
+            $this->membership->addGroupToServers((int) $f->group_id, $ids);
+        }
     }
 
     // ------------------------------------------------------------ verify + deliver
@@ -278,6 +317,20 @@ class MachineFulfillmentService
             $node = $nodes->firstWhere('id', $serverId);
             $report['tcp_' . $role] = $node && $f->public_ip
                 ? $this->probe->tcpReachable((string) $f->public_ip, (int) $node->server_port)
+                : false;
+        }
+
+        // SB-ER-010: TCP reachability says nothing about whether the
+        // two TLS lines can ever obtain a certificate. Delivery now
+        // also requires each TLS node's cert_config to carry a
+        // complete DNS-01 credential set (provider / dns_env / email);
+        // an incomplete set parks the fulfilment at VERIFY_FAILED with
+        // the failing leg named in the report instead of delivering a
+        // line that can never come up.
+        foreach (['ss1' => $f->ss1_server_id, 'sw1' => $f->sw1_server_id] as $role => $serverId) {
+            $node = $nodes->firstWhere('id', $serverId);
+            $report['cert_source_' . $role] = $node
+                ? \App\Services\CertCredentialReference::isComplete($node->cert_config)
                 : false;
         }
 
@@ -497,6 +550,43 @@ class MachineFulfillmentService
                 throw new \InvalidArgumentException('a different, valid region is required to switch');
             }
             $from = $f->region_code;
+            // SB-ER-004: a region switch after provisioning must not
+            // keep pointing at the old region's machine. Previously
+            // only the region label changed: the fulfilment kept the
+            // old machine, group, nodes and verification data, and the
+            // next IP backfill short-circuited in provision() (existing
+            // machine_id) — the new region's IP was recorded while the
+            // subscription still served the old box. Tear the old
+            // resources down (same revocation shape as the reclaim
+            // flow) and clear every provisioned pointer so the new
+            // region provisions fresh.
+            if ($f->machine_id) {
+                DB::transaction(function () use ($f) {
+                    $machine = ServerMachine::find($f->machine_id);
+                    if ($machine) {
+                        $machine->token = ServerMachine::generateToken();
+                        $machine->is_active = false;
+                        $machine->save();
+                    }
+                    Server::whereIn('id', $f->nodeIds())->update(['enabled' => false, 'show' => false]);
+                    if ($f->group_id) {
+                        $this->membership->removeGroupFromVipServers((int) $f->group_id);
+                    }
+                });
+                $f->machine_id = null;
+                $f->group_id = null;
+                $f->reality_server_id = null;
+                $f->ss1_server_id = null;
+                $f->sw1_server_id = null;
+                $f->public_ip = null;
+                $f->vendor_instance_id = null;
+                $f->vendor_name = null;
+                $f->resource_expires_at = null;
+                $f->provisioned_at = null;
+                $f->verified_at = null;
+                $f->verify_report = null;
+                MachineFulfillmentLog::record($f->id, 'fulfillment.region_teardown', 'provisioned resources revoked for region switch');
+            }
             $f->region_code = $code;
             $f->region_name = MachineRegionCatalog::name($code);
             $f->user_choice = $choice;

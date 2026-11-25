@@ -40,6 +40,17 @@ class TicketService
 
     public function replyByAdmin($ticketId, $message, $userId): void
     {
+        // SB-ER-001: an "admin reply" must come from an account that
+        // actually holds admin/staff privileges. Previously any caller
+        // that knew a ticket id could speak as support — the Telegram
+        // plugin passed the *bound* user's id, so every bound customer
+        // could reply to (and close out) arbitrary tickets as staff.
+        // The check lives here, at the service entry, so every caller
+        // (admin panel, console bridge, Telegram) is held to it.
+        $replier = User::find($userId);
+        if (!$replier || !($replier->is_admin || $replier->is_staff)) {
+            throw new ApiException('无权以客服身份回复工单');
+        }
         $ticket = Ticket::where('id', $ticketId)->first();
         if (!$ticket) {
             throw new ApiException('工单不存在');

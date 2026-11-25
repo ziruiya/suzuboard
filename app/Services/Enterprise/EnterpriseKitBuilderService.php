@@ -75,17 +75,47 @@ class EnterpriseKitBuilderService
      */
     public function attachRules(EnterpriseInventoryKit $kit, array $ruleIds): EnterpriseInventoryKit
     {
-        $purpose = $kit->purpose;
-        $rules = EnterpriseInventoryRule::whereIn('id', $ruleIds)
-            ->where('status', EnterpriseInventoryRule::STATUS_READY)
-            ->lockForUpdate()
-            ->get();
-        if ($rules->count() !== 2) {
-            throw new \RuntimeException('Exactly two READY rules are required');
-        }
-        $pair = $this->claimPair($kit, $rules->all());
-        $this->materializeNodes($purpose, $kit, $pair);
-        return $kit->fresh();
+        // SB-ER-009: the whole confirm runs in ONE transaction with the
+        // kit and both rules row-locked. Previously the lock was taken
+        // outside any transaction (released immediately), the kit's
+        // state and the rules' ownership were never validated — a
+        // confirm could attach another SKU's rules, re-confirm an
+        // already-built kit (duplicating its nodes), or leave rules
+        // marked IN_USE when node creation failed.
+        return DB::transaction(function () use ($kit, $ruleIds) {
+            $kit = EnterpriseInventoryKit::lockForUpdate()->find($kit->id) ?? $kit;
+            if ($kit->status !== EnterpriseInventoryKit::STATUS_BUILDING) {
+                throw new \RuntimeException('kit is not awaiting rules (status ' . $kit->status . ')');
+            }
+            if ($kit->nodes()->whereNotNull('server_id')->exists()) {
+                throw new \RuntimeException('kit already has nodes; rules cannot be confirmed twice');
+            }
+            $purpose = $kit->purpose;
+            $rules = EnterpriseInventoryRule::whereIn('id', $ruleIds)
+                ->where('status', EnterpriseInventoryRule::STATUS_READY)
+                ->lockForUpdate()
+                ->get();
+            if ($rules->count() !== 2) {
+                throw new \RuntimeException('Exactly two READY rules are required');
+            }
+            foreach ($rules as $rule) {
+                if ((int) $rule->purpose_id !== (int) $kit->purpose_id) {
+                    throw new \RuntimeException('rule ' . $rule->id . ' belongs to a different purpose than the kit');
+                }
+                if ($rule->provider !== $purpose->entry_provider) {
+                    throw new \RuntimeException('rule ' . $rule->id . ' provider does not match the purpose entry provider');
+                }
+                if ($rule->kit_id !== null) {
+                    throw new \RuntimeException('rule ' . $rule->id . ' is already claimed by another kit');
+                }
+            }
+            if ($rules[0]->target_ip !== $rules[1]->target_ip) {
+                throw new \RuntimeException('rule pair targets differ: a kit\'s primary and backup must land on the same machine');
+            }
+            $pair = $this->claimPair($kit, $rules->all());
+            $this->materializeNodes($purpose, $kit, $pair);
+            return $kit->fresh();
+        });
     }
 
     /**
@@ -350,35 +380,15 @@ class EnterpriseKitBuilderService
      */
     private function certCredentialReference(): ?array
     {
+        // SB-ER-010: the majority-clone algorithm now lives in
+        // App\Services\CertCredentialReference (shared with the
+        // dedicated-machine provisioner); this wrapper keeps the
+        // per-builder memoisation the original implementation had.
         if ($this->certCredentialReferenceResolved) {
             return $this->certCredentialReferenceCache;
         }
         $this->certCredentialReferenceResolved = true;
-        $groups = [];
-        foreach (Server::whereNotNull('cert_config')->get() as $server) {
-            $cert = $server->cert_config;
-            if (!is_array($cert) || empty($cert['dns_env']) || !is_array($cert['dns_env'])
-                || empty($cert['dns_provider']) || empty($cert['email'])) {
-                continue;
-            }
-            $key = md5(json_encode($cert['dns_env']));
-            $groups[$key] ??= ['count' => 0, 'server_id' => 0, 'cert' => null];
-            $groups[$key]['count']++;
-            if ((int) $server->id > $groups[$key]['server_id']) {
-                $groups[$key]['server_id'] = (int) $server->id;
-                $groups[$key]['cert'] = $cert;
-            }
-        }
-        if (!$groups) {
-            return null;
-        }
-        uasort($groups, fn($a, $b) => ($b['count'] <=> $a['count']) ?: ($b['server_id'] <=> $a['server_id']));
-        $cert = reset($groups)['cert'];
-        return $this->certCredentialReferenceCache = [
-            'dns_provider' => $cert['dns_provider'],
-            'dns_env' => $cert['dns_env'],
-            'email' => $cert['email'],
-        ];
+        return $this->certCredentialReferenceCache = \App\Services\CertCredentialReference::majority();
     }
 
     private function sw1Settings(string $alias): array

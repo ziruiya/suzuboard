@@ -112,6 +112,16 @@ abstract class MachineTestCase extends TestCase
                     'short_id' => 'ab12cd34',
                 ],
             ],
+            // SB-ER-010: the production fleet carries the shared DNS-01
+            // credential set per-node; this fixture is the test fleet's
+            // credentialed reference node, which new TLS nodes clone.
+            'cert_config' => [
+                'cert_mode' => 'dns',
+                'domain' => 'prod.example.test',
+                'dns_provider' => 'cloudflare',
+                'dns_env' => ['CLOUDFLARE_DNS_API_TOKEN' => 'test-token-not-a-secret'],
+                'email' => 'ops@example.com',
+            ],
         ]);
     }
 
