@@ -21,6 +21,8 @@ class StatUserJob implements ShouldQueue
     protected string $protocol;
     protected string $recordType;
     protected ?string $batchHash;
+    protected ?string $batchId;
+    protected ?string $contentHash;
 
     public $tries = 3;
     public $timeout = 60;
@@ -37,7 +39,7 @@ class StatUserJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd', ?string $batchHash = null)
+    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
@@ -45,6 +47,8 @@ class StatUserJob implements ShouldQueue
         $this->protocol = $protocol;
         $this->recordType = $recordType;
         $this->batchHash = $batchHash;
+        $this->batchId = $batchId;
+        $this->contentHash = $contentHash;
     }
 
     public function handle(): void
@@ -60,10 +64,12 @@ class StatUserJob implements ShouldQueue
         // now a failure rolls back everything including the claim and
         // the retry counts the batch exactly once.
         DB::transaction(function () use ($recordAt) {
-            if ($this->batchHash !== null && !\App\Services\TrafficBatchGuard::claim(
+            if (!\App\Services\TrafficBatchGuard::claimForProcessor(
                 $this->batchHash,
                 (int) ($this->server['id'] ?? 0),
-                \App\Services\TrafficBatchGuard::PROCESSOR_STAT_USER
+                \App\Services\TrafficBatchGuard::PROCESSOR_STAT_USER,
+                $this->batchId,
+                $this->contentHash
             )) {
                 return;
             }

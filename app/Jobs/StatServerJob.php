@@ -23,6 +23,8 @@ class StatServerJob implements ShouldQueue
     protected string $protocol;
     protected string $recordType;
     protected ?string $batchHash;
+    protected ?string $batchId;
+    protected ?string $contentHash;
 
     public $tries = 3;
     public $timeout = 60;
@@ -39,7 +41,7 @@ class StatServerJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, $protocol, string $recordType = 'd', ?string $batchHash = null)
+    public function __construct(array $server, array $data, $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
@@ -47,6 +49,8 @@ class StatServerJob implements ShouldQueue
         $this->protocol = $protocol;
         $this->recordType = $recordType;
         $this->batchHash = $batchHash;
+        $this->batchId = $batchId;
+        $this->contentHash = $contentHash;
     }
 
     public function handle(): void
@@ -67,10 +71,12 @@ class StatServerJob implements ShouldQueue
             // after a failure between the two writes can no longer
             // count the stat twice.
             DB::transaction(function () use ($u, $d, $recordAt) {
-                if ($this->batchHash !== null && !\App\Services\TrafficBatchGuard::claim(
+                if (!\App\Services\TrafficBatchGuard::claimForProcessor(
                     $this->batchHash,
                     (int) ($this->server['id'] ?? 0),
-                    \App\Services\TrafficBatchGuard::PROCESSOR_STAT_SERVER
+                    \App\Services\TrafficBatchGuard::PROCESSOR_STAT_SERVER,
+                    $this->batchId,
+                    $this->contentHash
                 )) {
                     return;
                 }

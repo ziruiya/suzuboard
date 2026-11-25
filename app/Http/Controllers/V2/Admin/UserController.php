@@ -293,10 +293,6 @@ class UserController extends Controller
             $params['invite_user_id'] = null;
         }
 
-        if (isset($params['banned']) && (int) $params['banned'] === 1) {
-            $authService = new AuthService($user);
-            $authService->removeAllSessions();
-        }
         if (isset($params['balance'])) {
             $params['balance'] = $params['balance'] * 100;
         }
@@ -312,8 +308,23 @@ class UserController extends Controller
             'request' => $request,
         ]);
 
+        // SB-TA-013/014: a password change or a ban commits together
+        // with the session revocation and the auth-version bump, in
+        // one transaction. Previously the ban deleted tokens BEFORE
+        // the banned flag was written (a login racing that window
+        // could be issued a fresh token after the cleanup), and a
+        // password-only edit kept every old token alive.
+        $passwordChanged = isset($params['password']);
+        $banning = isset($params['banned']) && (int) $params['banned'] === 1;
+
         try {
-            $user->update($params);
+            DB::transaction(function () use ($user, $params, $passwordChanged, $banning) {
+                $user->update($params);
+
+                if ($passwordChanged || $banning) {
+                    (new AuthService($user))->revokeAllSessionsAndBumpAuthVersion();
+                }
+            });
         } catch (\Exception $e) {
             Log::error($e);
             return $this->fail([500, '保存失败']);

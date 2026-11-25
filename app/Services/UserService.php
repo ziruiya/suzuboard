@@ -114,8 +114,19 @@ class UserService
         return true;
     }
 
-    public function trafficFetch(Server $server, string $protocol, array $data)
+    /** SB-TA-003: per-item delta sanity bound (1 PiB per user per batch). */
+    public const MAX_TRAFFIC_DELTA = 1_000_000_000_000_000;
+
+    /**
+     * @param array|null $batchMeta SB-TA-001/002/004 batch envelope for
+     *   agents that speak the persistent batch-id protocol:
+     *   ['batch_id' => string, 'collected_from' => int, 'collected_to' => int].
+     *   Null for legacy agents: the panel keeps the AUD-022 content-hash
+     *   fallback, so old agents never lose accounting over this upgrade.
+     */
+    public function trafficFetch(Server $server, string $protocol, array $data, ?array $batchMeta = null)
     {
+        $serverModel = $server;
         $server->rate = $server->getCurrentRate();
         $server = $server->toArray();
 
@@ -123,17 +134,98 @@ class UserService
         // Compatible with legacy hook
         list($server, $protocol, $data) = HookManager::filter('traffic.before_process', [$server, $protocol, $data]);
 
+        // SB-TA-003: every accounting entry point funnels through here
+        // (UniProxy push, V2 report, Tidalab controllers), so validate
+        // once, centrally: bounded non-negative integer deltas, and —
+        // when the node declares permission groups — only users that
+        // belong to one of the node's groups may be charged.
+        $data = $this->validateTrafficData($serverModel, is_array($data) ? $data : []);
+        if (empty($data)) {
+            return;
+        }
+
+        $batchId = null;
+        $collectedFrom = null;
+        $collectedTo = null;
+        if ($batchMeta !== null && isset($batchMeta['batch_id']) && is_string($batchMeta['batch_id']) && $batchMeta['batch_id'] !== '') {
+            $batchId = substr($batchMeta['batch_id'], 0, 64);
+            $collectedFrom = isset($batchMeta['collected_from']) ? (int) $batchMeta['collected_from'] : null;
+            $collectedTo = isset($batchMeta['collected_to']) ? (int) $batchMeta['collected_to'] : null;
+        }
+
         $timestamp = strtotime(date('Y-m-d'));
-        collect($data)->chunk(1000)->each(function ($chunk) use ($timestamp, $server, $protocol) {
+        collect($data)->chunk(1000)->each(function ($chunk, $seq) use ($timestamp, $server, $protocol, $batchId, $collectedFrom, $collectedTo) {
             $chunkData = $chunk->toArray();
-            // SB-AUD-022: the push payload carries no batch id, so derive
-            // one from the content; every processor claims it before
-            // writing and a replayed batch is counted exactly once.
-            $batchHash = TrafficBatchGuard::hashFor((int) ($server['id'] ?? 0), $protocol, $chunkData);
-            TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash);
-            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash);
-            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash);
+            $contentHash = TrafficBatchGuard::hashFor((int) ($server['id'] ?? 0), $protocol, $chunkData);
+            // SB-TA-001/002: identified batches dedup on (node, batch id,
+            // chunk seq); the content hash rides along so a same-id
+            // different-content replay is refused as a conflict.
+            // Legacy batches keep the AUD-022 content-hash key.
+            $batchHash = $batchId !== null
+                ? TrafficBatchGuard::keyForBatchId((int) ($server['id'] ?? 0), $batchId, (int) $seq)
+                : $contentHash;
+            TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash, $batchId, $contentHash, $collectedFrom, $collectedTo);
+            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);
+            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);
         });
+    }
+
+    /**
+     * SB-TA-003 validation for one traffic batch.
+     *
+     * Authorization scope: the panel keeps no historical group-membership
+     * snapshot, so membership is judged against the user's CURRENT group.
+     * Node user lists are issued per group, so an out-of-group report is
+     * either forged or cross-node confusion; the narrow window of traffic
+     * collected just before a legitimate group change may be refused and
+     * is logged (server, user, values) for manual reconciliation instead
+     * of being silently dropped. Nodes with no declared groups keep the
+     * legacy behaviour — there is no authorized set to judge against.
+     */
+    private function validateTrafficData(Server $server, array $data): array
+    {
+        $clean = [];
+        $candidateIds = [];
+        foreach ($data as $uid => $v) {
+            $uid = (int) $uid;
+            if (!is_array($v) || count($v) !== 2 || !is_numeric($v[0] ?? null) || !is_numeric($v[1] ?? null)) {
+                \Illuminate\Support\Facades\Log::warning('traffic item rejected: malformed delta', [
+                    'server_id' => $server->id, 'user_id' => $uid, 'value' => $v,
+                ]);
+                continue;
+            }
+            $up = $v[0] + 0;
+            $down = $v[1] + 0;
+            if ($up != floor($up) || $down != floor($down) || $up < 0 || $down < 0
+                || $up > self::MAX_TRAFFIC_DELTA || $down > self::MAX_TRAFFIC_DELTA) {
+                \Illuminate\Support\Facades\Log::warning('traffic item rejected: delta out of bounds', [
+                    'server_id' => $server->id, 'user_id' => $uid, 'value' => $v,
+                ]);
+                continue;
+            }
+            $clean[$uid] = [(int) $up, (int) $down];
+            $candidateIds[] = $uid;
+        }
+
+        $groupIds = $server->group_ids ?? [];
+        if (!empty($groupIds) && !empty($candidateIds)) {
+            $authorized = User::whereIn('id', $candidateIds)
+                ->whereIn('group_id', $groupIds)
+                ->pluck('id')
+                ->map(fn($id) => (int) $id)
+                ->all();
+            $authorizedSet = array_flip($authorized);
+            foreach (array_keys($clean) as $uid) {
+                if (!isset($authorizedSet[$uid])) {
+                    \Illuminate\Support\Facades\Log::warning('traffic item rejected: user outside node groups', [
+                        'server_id' => $server->id, 'user_id' => $uid, 'value' => $clean[$uid],
+                    ]);
+                    unset($clean[$uid]);
+                }
+            }
+        }
+
+        return $clean;
     }
 
     /**

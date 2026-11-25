@@ -159,7 +159,14 @@ class AuthController extends Controller
             ], 401);
         }
 
-        $url = $this->loginService->generateQuickLoginUrl($user, $request->input('redirect'));
+        // SB-TA-012: bind the quick-login ticket to this session, so
+        // revoking the session kills the ticket with it.
+        $accessToken = AuthService::findAccessTokenByBearerToken($authorization);
+        $url = $this->loginService->generateQuickLoginUrl(
+            $user,
+            $request->input('redirect'),
+            $accessToken ? (int) $accessToken->id : null
+        );
         return $this->success($url);
     }
 

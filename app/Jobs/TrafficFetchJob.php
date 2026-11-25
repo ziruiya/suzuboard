@@ -20,6 +20,10 @@ class TrafficFetchJob implements ShouldQueue
     protected $protocol;
     protected $timestamp;
     protected $batchHash;
+    protected $batchId;
+    protected $contentHash;
+    protected $collectedFrom;
+    protected $collectedTo;
     // SB-AUD-022: retries are safe now — the batch claim inside the
     // transaction makes processing idempotent, so a failed attempt can
     // be retried instead of silently dropping or double-counting.
@@ -31,7 +35,7 @@ class TrafficFetchJob implements ShouldQueue
         return [1, 5, 10];
     }
 
-    public function __construct(array $server, array $data, $protocol, int $timestamp, ?string $batchHash = null)
+    public function __construct(array $server, array $data, $protocol, int $timestamp, ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null, ?int $collectedFrom = null, ?int $collectedTo = null)
     {
         $this->onQueue('traffic_fetch');
         $this->server = $server;
@@ -39,6 +43,10 @@ class TrafficFetchJob implements ShouldQueue
         $this->protocol = $protocol;
         $this->timestamp = $timestamp;
         $this->batchHash = $batchHash;
+        $this->batchId = $batchId;
+        $this->contentHash = $contentHash;
+        $this->collectedFrom = $collectedFrom;
+        $this->collectedTo = $collectedTo;
     }
 
     public function handle(): void
@@ -49,16 +57,54 @@ class TrafficFetchJob implements ShouldQueue
         ksort($data);
         $userIds = array_keys($data);
 
-        $processed = DB::transaction(function () use ($data) {
-            if ($this->batchHash !== null && !TrafficBatchGuard::claim(
+        $processed = DB::transaction(function () use ($data, $userIds) {
+            if (!TrafficBatchGuard::claimForProcessor(
                 $this->batchHash,
                 (int) ($this->server['id'] ?? 0),
-                TrafficBatchGuard::PROCESSOR_FETCH
+                TrafficBatchGuard::PROCESSOR_FETCH,
+                $this->batchId,
+                $this->contentHash
             )) {
                 return false;
             }
 
+            // SB-TA-004: period attribution. A batch whose collection
+            // window closed at or before the user's last traffic reset
+            // belongs to the previous quota period and must not charge
+            // the new one — regardless of when this job happens to run.
+            // A window straddling the reset cannot be split (deltas are
+            // window aggregates), so it is charged whole to the current
+            // period and logged; see the batch-2 lab report.
+            $skipUids = [];
+            if ($this->collectedTo !== null && !empty($userIds)) {
+                $resetAts = User::whereIn('id', $userIds)->pluck('last_reset_at', 'id');
+                foreach ($userIds as $uid) {
+                    $resetAt = (int) ($resetAts[$uid] ?? 0);
+                    if ($resetAt > 0 && $this->collectedTo <= $resetAt) {
+                        $skipUids[] = $uid;
+                    } elseif ($resetAt > 0 && $this->collectedFrom !== null && $this->collectedFrom < $resetAt) {
+                        \Illuminate\Support\Facades\Log::info('traffic batch straddles user reset; charged to current period', [
+                            'server_id' => (int) ($this->server['id'] ?? 0),
+                            'batch_id' => $this->batchId,
+                            'user_id' => $uid,
+                            'reset_at' => $resetAt,
+                        ]);
+                    }
+                }
+                if (!empty($skipUids)) {
+                    \Illuminate\Support\Facades\Log::info('traffic batch belongs to previous quota period; skipped', [
+                        'server_id' => (int) ($this->server['id'] ?? 0),
+                        'batch_id' => $this->batchId,
+                        'user_ids' => $skipUids,
+                        'collected_to' => $this->collectedTo,
+                    ]);
+                }
+            }
+
             foreach ($data as $uid => $v) {
+                if (in_array($uid, $skipUids, true)) {
+                    continue;
+                }
                 User::where('id', $uid)
                     ->incrementEach(
                         [

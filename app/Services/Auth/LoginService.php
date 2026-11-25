@@ -109,17 +109,28 @@ class LoginService
             return [false, [400, __('This email is not registered in the system')]];
         }
 
-        // 更新密码
-        $user->password = password_hash($password, PASSWORD_DEFAULT);
-        $user->password_algo = NULL;
-        $user->password_salt = NULL;
+        // SB-TA-012/013: the password change, the session revocation
+        // and the auth-version bump commit in ONE transaction — a
+        // crash between them must not leave new credentials alongside
+        // live old sessions or still-valid pre-signed tickets.
+        $saved = \Illuminate\Support\Facades\DB::transaction(function () use ($user, $password) {
+            $user->password = password_hash($password, PASSWORD_DEFAULT);
+            $user->password_algo = NULL;
+            $user->password_salt = NULL;
 
-        if (!$user->save()) {
+            if (!$user->save()) {
+                return false;
+            }
+
+            $user->tokens()->delete();
+            $user->increment('auth_version');
+
+            return true;
+        });
+
+        if (!$saved) {
             return [false, [500, __('Reset failed')]];
         }
-
-                // revoke all existing sessions after password reset (patch 03 port)
-        $user->tokens()->delete();
 
         HookManager::call('user.password.reset.after', $user);
 
@@ -137,7 +148,7 @@ class LoginService
      * @param string $redirect 重定向路径
      * @return string|null 快速登录URL
      */
-    public function generateQuickLoginUrl(User $user, ?string $redirect = null): ?string
+    public function generateQuickLoginUrl(User $user, ?string $redirect = null, ?int $sessionId = null): ?string
     {
         if (!$user || !$user->exists) {
             return null;
@@ -146,7 +157,9 @@ class LoginService
         $code = Helper::guid();
         $key = CacheKey::get('TEMP_TOKEN', $code);
 
-        Cache::put($key, $user->id, 60);
+        // SB-TA-012: bind the ticket to the issuing session and the
+        // account's current auth version (see MailLinkService).
+        Cache::put($key, MailLinkService::ticketPayload($user, $sessionId), 60);
 
         $redirect = $redirect ?: 'dashboard';
         $loginRedirect = '/#/login?verify=' . $code . '&redirect=' . rawurlencode($redirect);

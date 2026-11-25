@@ -20,8 +20,11 @@ class Admin
     {
         /** @var User|null $user */
         $user = Auth::guard('sanctum')->user();
-        
-        if (!$user || !$user->is_admin) {
+
+        // SB-TA-014: a banned account is rejected here even if a token
+        // was issued in the window before the ban landed — admin routes
+        // never serve banned users.
+        if (!$user || !$user->is_admin || $user->banned) {
             return response()->json(['message' => 'Unauthorized'], 403);
         }
         

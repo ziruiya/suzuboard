@@ -50,7 +50,19 @@ class ServerController extends Controller
 
         $traffic = $request->input('traffic');
         if (is_array($traffic) && !empty($traffic)) {
-            ServerService::processTraffic($node, $traffic);
+            // SB-TA-001/002/004: agents on the batch-id protocol attach
+            // one envelope per report; legacy agents omit it and the
+            // panel falls back to the AUD-022 content-hash dedup.
+            $batchMeta = null;
+            $envelope = $request->input('traffic_batch');
+            if (is_array($envelope) && isset($envelope['batch_id']) && is_string($envelope['batch_id']) && $envelope['batch_id'] !== '') {
+                $batchMeta = [
+                    'batch_id' => $envelope['batch_id'],
+                    'collected_from' => isset($envelope['collected_from']) ? (int) $envelope['collected_from'] : null,
+                    'collected_to' => isset($envelope['collected_to']) ? (int) $envelope['collected_to'] : null,
+                ];
+            }
+            ServerService::processTraffic($node, $traffic, $batchMeta);
         }
 
         $alive = $request->input('alive');

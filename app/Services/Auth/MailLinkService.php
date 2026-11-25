@@ -36,7 +36,10 @@ class MailLinkService
 
         $code = Helper::guid();
         $key = CacheKey::get('TEMP_TOKEN', $code);
-        Cache::put($key, $user->id, 300);
+        // SB-TA-012: tickets carry the account's auth version at
+        // issuance; a later password reset / admin password change /
+        // ban bumps the version and every outstanding ticket dies.
+        Cache::put($key, self::ticketPayload($user, null), 300);
         Cache::put(CacheKey::get('LAST_SEND_LOGIN_WITH_MAIL_LINK_TIMESTAMP', $email), time(), 60);
 
         $redirectUrl = '/#/login?verify=' . $code . '&redirect=' . ($redirect ? $redirect : 'dashboard');
@@ -75,28 +78,87 @@ class MailLinkService
     }
 
     /**
+     * SB-TA-012: the payload every pre-signed login ticket stores.
+     * session_id is the Sanctum token that requested a quick-login URL
+     * (null for mail-link tickets, which have no issuing session);
+     * auth_version pins the ticket to the account's credential state.
+     */
+    public static function ticketPayload(User $user, ?int $sessionId): array
+    {
+        return [
+            'user_id' => (int) $user->id,
+            'auth_version' => (int) ($user->auth_version ?? 0),
+            'session_id' => $sessionId,
+        ];
+    }
+
+    /**
      * 处理Token登录
-     * 
+     *
+     * SB-TA-012: redemption is atomic and one-time — the ticket is
+     * consumed under a cache lock, then validated against the CURRENT
+     * account state: the auth version must still match (no password
+     * reset / admin password change / ban since issuance) and, for
+     * quick-login tickets, the issuing Sanctum session must still
+     * exist and be unexpired. A revoked session therefore cannot be
+     * rebuilt from a ticket signed before the revocation.
+     *
      * @param string $token 登录令牌
      * @return int|null 用户ID或null
      */
     public function handleTokenLogin(string $token): ?int
     {
         $key = CacheKey::get('TEMP_TOKEN', $token);
-        $userId = Cache::get($key);
 
-        if (!$userId) {
+        $lock = Cache::lock('temp_token_consume_' . md5($token), 10);
+        try {
+            return $lock->block(5, function () use ($key) {
+                $payload = Cache::get($key);
+
+                if ($payload === null) {
+                    return null;
+                }
+
+                // Consume exactly once, whatever the validation outcome:
+                // a ticket that fails validation is dead, not retryable.
+                Cache::forget($key);
+
+                // Transition tolerance: tickets issued by the previous
+                // code stored a bare user id. They live at most 300s,
+                // so accept them under the old checks just this once.
+                if (is_int($payload) || is_string($payload)) {
+                    $user = User::find((int) $payload);
+                    return ($user && !$user->banned) ? (int) $user->id : null;
+                }
+
+                if (!is_array($payload) || !isset($payload['user_id'])) {
+                    return null;
+                }
+
+                $user = User::find((int) $payload['user_id']);
+
+                if (!$user || $user->banned) {
+                    return null;
+                }
+
+                if ((int) ($user->auth_version ?? 0) !== (int) ($payload['auth_version'] ?? -1)) {
+                    return null;
+                }
+
+                $sessionId = $payload['session_id'] ?? null;
+                if ($sessionId !== null) {
+                    $session = \Laravel\Sanctum\PersonalAccessToken::find((int) $sessionId);
+                    if (!$session
+                        || (int) $session->tokenable_id !== (int) $user->id
+                        || ($session->expires_at && $session->expires_at->isPast())) {
+                        return null;
+                    }
+                }
+
+                return (int) $user->id;
+            });
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {
             return null;
         }
-
-        $user = User::find($userId);
-
-        if (!$user || $user->banned) {
-            return null;
-        }
-
-        Cache::forget($key);
-
-        return $userId;
     }
 }

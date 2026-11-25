@@ -219,7 +219,7 @@ class ServerService
     /**
      * 处理节点流量数据汇报
      */
-    public static function processTraffic(Server $node, array $traffic): void
+    public static function processTraffic(Server $node, array $traffic, ?array $batchMeta = null): void
     {
         $data = array_filter($traffic, fn($item) =>
             is_array($item) && count($item) === 2
@@ -236,7 +236,10 @@ class ServerService
         Cache::put(CacheKey::get("SERVER_{$nodeType}_ONLINE_USER", $nodeId), count($data), 3600);
         Cache::put(CacheKey::get("SERVER_{$nodeType}_LAST_PUSH_AT", $nodeId), time(), 3600);
 
-        (new UserService())->trafficFetch($node, $node->type, $data);
+        // SB-TA-003 validation (bounds + group authorization) runs
+        // centrally inside trafficFetch; the batch envelope
+        // (SB-TA-001/002/004) is forwarded untouched.
+        (new UserService())->trafficFetch($node, $node->type, $data, $batchMeta);
     }
 
     /**
