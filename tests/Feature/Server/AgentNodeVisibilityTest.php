@@ -9,13 +9,27 @@ use App\Services\ServerService;
 use Tests\Feature\Enterprise\EnterpriseTestCase;
 
 /**
- * AUD-010 / AUD-011: agent delivery isolation.
+ * AUD-010 / AUD-011: agent delivery isolation — two scopes.
  *
- * A node may receive config + user lists through agent channels (global
- * server_token via the legacy middleware or ServerV2, machine token via
- * ServerV2 / machine endpoints, WS sync) only when it is in service:
- * enabled, production rollout stage, and — for enterprise inventory
- * nodes — assigned (stock nodes are built show=false and must stay dark).
+ * Strict scope (isAgentDeliverable): channels with no machine-ownership
+ * proof — the global server_token (legacy middleware, ServerV2 token
+ * auth, WS single-node auth via getServer) and relay NODE targets.
+ * A node is deliverable there only when in service: enabled, production
+ * rollout stage, and — for enterprise inventory nodes — assigned (stock
+ * nodes are built show=false; E11: unauthorized parties must not pull
+ * them). This scope is unchanged by the 2026-11-25 fix.
+ *
+ * Machine scope (isMachineDeliverable): delivery to the node's OWN
+ * machine agent (machine token / WS machine auth / machine node list).
+ * The stock show gate does NOT apply here — a stock node whose config
+ * never reaches its machine never listens on its landing port, so the
+ * inventory would be fake (production evidence 2026-11-25: all 48 stock
+ * nodes missing from machine delivery, no landing listeners). The user
+ * list stays converged by group isolation instead: a stock node's
+ * group_ids are exactly its kit group, whose only members are the
+ * enterprise probe identity (transiently, during verification) and the
+ * assigned customer. Enabled + production-rollout gates apply in both
+ * scopes.
  *
  * Deliberate exception, guarded by test here: subscription-hidden nodes
  * that are NOT enterprise inventory (the browser-plugin http nodes 52-55
@@ -61,19 +75,69 @@ class AgentNodeVisibilityTest extends EnterpriseTestCase
         return Server::findOrFail($serverId);
     }
 
-    /** AUD-010 core: a stock node yields zero users even with a user in its group. */
-    public function test_stock_node_gets_no_users_even_with_user_in_stock_group(): void
+    /**
+     * AUD-010 core, strict scope (unchanged): through the global-token
+     * lens a stock node does not exist — getServer hides it and the
+     * strict predicate stays false while it is unassigned (show=false).
+     */
+    public function test_stock_node_strict_gate_stays_closed(): void
     {
         $server = $this->stockServer();
 
         $this->assertFalse($server->show);
-        $this->assertCount(0, ServerService::getAvailableUsers($server));
         $this->assertNull(ServerService::getServer($server->id));
         $this->assertFalse(ServerService::isAgentDeliverable($server));
     }
 
-    /** AUD-011: every HTTP agent entry point refuses the stock node. */
-    public function test_stock_node_rejected_on_all_agent_http_paths(): void
+    /**
+     * Machine scope: the stock node IS deliverable to its own machine,
+     * and its user list is exactly the kit-group membership — the user
+     * stockServer() placed in the stock group stands in for the probe
+     * identity / assigned customer; nobody outside the group leaks in.
+     * Subscription rendering still hides the node (show gate intact).
+     */
+    public function test_stock_node_machine_delivery_and_group_scoped_users(): void
+    {
+        $server = $this->stockServer();
+        $kitGroupUser = ServerService::getAvailableUsers($server);
+        $this->assertTrue(ServerService::isMachineDeliverable($server));
+        $this->assertCount(1, $kitGroupUser);
+
+        $outsider = $this->liveUser($this->ordinaryGroup->id);
+        $users = ServerService::getAvailableUsers($server);
+        $this->assertFalse($users->contains('id', $outsider->id));
+
+        // getMachineNodes (machine list source) must include the node.
+        $listed = ServerService::getMachineNodes($this->machine)->pluck('id')->all();
+        $this->assertContains($server->id, $listed);
+
+        // Subscription visibility unchanged: a kit-group user does NOT
+        // see the unassigned stock node in their subscription render.
+        $member = User::findOrFail($kitGroupUser->first()->id);
+        $this->assertNotContains($server->id, $this->subscriptionServerIds($member));
+    }
+
+    /** An unassigned kit group with no members yields an empty user list. */
+    public function test_stock_node_users_empty_until_probe_or_customer_joins(): void
+    {
+        $kit = $this->buildReadyKit();
+        $server = Server::findOrFail((int) $kit->nodes()->firstOrFail()->server_id);
+
+        $this->assertCount(0, ServerService::getAvailableUsers($server));
+
+        $probe = $this->liveUser((int) $kit->stock_group_id);
+        $users = ServerService::getAvailableUsers($server);
+        $this->assertCount(1, $users);
+        $this->assertTrue($users->contains('id', $probe->id));
+    }
+
+    /**
+     * AUD-011 split by scope: global-token HTTP paths refuse the stock
+     * node; machine-token paths (the node's own machine) deliver config
+     * and the group-scoped user list; the machine node list advertises
+     * the stock node alongside production nodes on the same machine.
+     */
+    public function test_stock_node_http_paths_split_by_scope(): void
     {
         $server = $this->stockServer();
         $machine = $this->machine;
@@ -90,14 +154,16 @@ class AgentNodeVisibilityTest extends EnterpriseTestCase
         $this->getJson("/api/v2/server/config?token=server-token&node_id={$server->id}")
             ->assertStatus(400);
 
-        // ServerV2 via machine token.
+        // ServerV2 via machine token (own machine): delivered.
+        $kitUserId = (int) ServerService::getAvailableUsers($server)->first()->id;
         $this->getJson("/api/v2/server/user?machine_id={$machine->id}&token={$machine->token}&node_id={$server->id}")
-            ->assertStatus(400);
+            ->assertOk()
+            ->assertJsonFragment(['id' => $kitUserId]);
         $this->getJson("/api/v2/server/config?machine_id={$machine->id}&token={$machine->token}&node_id={$server->id}")
-            ->assertStatus(400);
+            ->assertOk();
 
-        // Machine node list must not advertise the stock node, but must
-        // still advertise a production node living on the same machine.
+        // Machine node list advertises the stock node AND a production
+        // node living on the same machine.
         $production = $this->makePlainServer([$this->ordinaryGroup->id], [
             'machine_id' => $machine->id,
         ]);
@@ -106,8 +172,25 @@ class AgentNodeVisibilityTest extends EnterpriseTestCase
             'token' => $machine->token,
         ])->assertOk();
         $listedIds = collect($response->json('nodes'))->pluck('id')->all();
-        $this->assertNotContains($server->id, $listedIds);
+        $this->assertContains($server->id, $listedIds);
         $this->assertContains($production->id, $listedIds);
+    }
+
+    /**
+     * Lifecycle: assignment flips show=true (EnterpriseAssignmentService),
+     * after which even the strict scope opens — the customer-facing state
+     * behaves exactly like any production node.
+     */
+    public function test_assigned_stock_node_opens_strict_scope(): void
+    {
+        $server = $this->stockServer();
+        $server->show = true;
+        $server->save();
+
+        $this->assertTrue(ServerService::isAgentDeliverable($server->fresh()));
+        $this->assertNotNull(ServerService::getServer($server->id));
+        $this->getJson("/api/v2/server/user?token=server-token&node_id={$server->id}")
+            ->assertOk();
     }
 
     /** Disabled nodes are refused on every path (machine path included). */

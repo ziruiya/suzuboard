@@ -37,7 +37,11 @@ class ServerService
     }
 
     /**
-     * 获取机器下所有已启用节点（仅含可向 agent 下发的节点）
+     * 获取机器下所有已启用节点（仅含可向该机器 agent 下发的节点）
+     *
+     * 这里用的是机器口径（isMachineDeliverable）：库存节点必须出现在
+     * 所属机器的清单里，agent 才会真正把落地跑起来；订阅不可见由
+     * show=false 与 getAvailableServers 的 show 门单独保证，与下发无关。
      */
     public static function getMachineNodes(ServerMachine $machine): Collection
     {
@@ -45,12 +49,29 @@ class ServerService
             ->where('enabled', true)
             ->orderBy('sort', 'ASC')
             ->get()
-            ->filter(fn(Server $node) => self::isAgentDeliverable($node))
+            ->filter(fn(Server $node) => self::isMachineDeliverable($node))
             ->values();
     }
 
+    /** 节点是否为企业库存节点（suzu_enterprise_inventory_nodes 有登记）。 */
+    public static function isEnterpriseInventoryNode(Server $node): bool
+    {
+        return \App\Models\EnterpriseInventoryNode::query()
+            ->where('server_id', $node->id)
+            ->exists();
+    }
+
+    /** 节点挂有 Suzu 协议档案且其 rollout_stage 未到 production。 */
+    private static function hasNonProductionProfile(Server $node): bool
+    {
+        return \App\Models\SuzuNodeProfile::query()
+            ->where('server_id', $node->id)
+            ->where('rollout_stage', '!=', 'production')
+            ->exists();
+    }
+
     /**
-     * 节点是否可向 agent 下发配置与用户列表（AUD-010 / AUD-011）。
+     * 节点是否可向 agent 下发配置与用户列表（AUD-010 / AUD-011，严口径）。
      *
      * 三个条件缺一不可：
      * 1. 节点已启用（enabled）；
@@ -58,6 +79,10 @@ class ServerService
      * 3. 企业库存节点在分配前不得下发：库存节点由建造器以 show=false 建入
      *    suzu_enterprise_inventory_nodes，分配时才翻 show=true、回收时翻回。
      *    非库存的订阅隐藏节点（如浏览器插件 http 节点）不在此列，保持原有下发。
+     *
+     * 本口径用于「无机器归属证明」的通道：全局 server_token（V1 中间件、
+     * ServerV2 token 认证、WS 单节点认证经 getServer）与中转 NODE 目标
+     * 资格——E11 的本意是未授权方拉不到库存节点，这条不变。
      */
     public static function isAgentDeliverable(Server $node): bool
     {
@@ -65,17 +90,39 @@ class ServerService
             return false;
         }
 
-        $hasNonProductionProfile = \App\Models\SuzuNodeProfile::query()
-            ->where('server_id', $node->id)
-            ->where('rollout_stage', '!=', 'production')
-            ->exists();
-        if ($hasNonProductionProfile) {
+        if (self::hasNonProductionProfile($node)) {
             return false;
         }
 
-        if (!$node->show
-            && \App\Models\EnterpriseInventoryNode::query()->where('server_id', $node->id)->exists()
-        ) {
+        if (!$node->show && self::isEnterpriseInventoryNode($node)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * 节点是否可下发给「节点所属机器」的 agent（机器口径）。
+     *
+     * 与 isAgentDeliverable 的唯一差别：不应用库存 show 门。理由：
+     * 机器通道以 machine token 认证且调用方已核验节点归属该机器
+     * （ServerV2::authenticateByMachine / WS 机器认证 / getMachineNodes），
+     * 不存在未授权拉取；库存节点若连配置都下发不了，agent 根本不会在
+     * 落地端口监听，库存即为假库存（2026-11-25 实证：48 个库存节点
+     * 全部未下发、落地端口无监听）。
+     *
+     * 库存节点的用户面收敛不靠这道门，而靠分组隔离：库存节点
+     * group_ids 恒为其 kit 专属组（AUD-015），组内只有企业探针身份
+     * （验活时临时入组）与分配后的客户，getAvailableUsers 按组取人
+     * 天然只给出这两类。enabled 与 rollout 两道门与严口径一致保留。
+     */
+    public static function isMachineDeliverable(Server $node): bool
+    {
+        if (!$node->enabled) {
+            return false;
+        }
+
+        if (self::hasNonProductionProfile($node)) {
             return false;
         }
 
@@ -133,7 +180,11 @@ class ServerService
      */
     public static function getAvailableUsers(Server $node)
     {
-        if (!self::isAgentDeliverable($node)) {
+        // 机器口径：库存节点要把 kit 组内用户（探针 + 已分配客户）交给
+        // 所属机器的 agent，否则隧道无人可验、客户分配后也连不上。
+        // 全局 token 通道在中间件层经 getServer() 严口径先行拦截，
+        // 到不了这里；disabled / 非 production 档案节点在此仍返回空。
+        if (!self::isMachineDeliverable($node)) {
             return collect();
         }
         $groupIds = $node->group_ids ?? [];

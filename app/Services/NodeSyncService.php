@@ -66,7 +66,9 @@ class NodeSyncService
         if (!$node)
             return;
 
-        if (!ServerService::isAgentDeliverable($node))
+        // 机器口径：推送只发往该节点已注册的连接（库存节点只可能由所属
+        // 机器注册），库存节点的配置热更新必须能推达。
+        if (!ServerService::isMachineDeliverable($node))
             return;
 
         self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
@@ -157,7 +159,7 @@ class NodeSyncService
         if (!$node)
             return;
 
-        if (!ServerService::isAgentDeliverable($node))
+        if (!ServerService::isMachineDeliverable($node))
             return;
 
         self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);

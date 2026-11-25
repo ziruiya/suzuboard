@@ -18,8 +18,11 @@ use Illuminate\Support\Facades\Redis;
  * database — to each marked node that is currently online and clears
  * its mark. Offline nodes keep their mark; a reconnect already triggers
  * a full sync, and the next run after they return clears the rest.
- * Nodes that are gone or not agent-deliverable (AUD-010 gate) are
- * dropped from the set without receiving anything.
+ * Nodes that are gone or not machine-deliverable (disabled, or a Suzu
+ * profile still outside production rollout) are dropped from the set
+ * without receiving anything. Enterprise stock nodes ARE re-pushed:
+ * the push only reaches the connection registered for that node, which
+ * for a stock node can only be its own machine's agent.
  */
 class NodeUserResync extends Command
 {
@@ -41,7 +44,7 @@ class NodeUserResync extends Command
         foreach ($nodeIds as $nodeId) {
             $nodeId = (int) $nodeId;
             $node = Server::find($nodeId);
-            if (!$node || !ServerService::isAgentDeliverable($node)) {
+            if (!$node || !ServerService::isMachineDeliverable($node)) {
                 NodeSyncService::clearUsersResyncPending($nodeId);
                 continue;
             }

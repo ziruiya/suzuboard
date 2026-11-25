@@ -83,7 +83,11 @@ class ServerV2
                 ->where('enabled', true)
                 ->first();
 
-            if (!$serverInfo || !ServerService::isAgentDeliverable($serverInfo)) {
+            // 机器口径：token 与归属（machine_id + enabled）已在上方核验，
+            // 库存节点必须能向自家机器的 agent 下发配置与用户（见
+            // ServerService::isMachineDeliverable）；严口径只留给全局
+            // server_token 通道（authenticateByServerToken）。
+            if (!$serverInfo || !ServerService::isMachineDeliverable($serverInfo)) {
                 throw new ApiException('Node not found on this machine');
             }
 

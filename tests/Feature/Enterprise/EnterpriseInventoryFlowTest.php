@@ -292,7 +292,12 @@ class EnterpriseInventoryFlowTest extends EnterpriseTestCase
         $this->assertSame(count($groupIds), count(array_unique($groupIds)), 'group_ids must stay deduplicated');
     }
 
-    /** E11 (No-Go): unassigned stock nodes are invisible to everyone and have no available users. */
+    /**
+     * E11 (No-Go): unassigned stock nodes are invisible in subscriptions
+     * and expose no users — the kit group is empty until the probe
+     * identity (verification) or the assigned customer joins it, and the
+     * global-token agent paths refuse them outright (AgentNodeVisibilityTest).
+     */
     public function test_e11_stock_nodes_invisible_and_userless(): void
     {
         $kit = $this->buildReadyKit();
