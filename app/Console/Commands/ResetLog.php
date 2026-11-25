@@ -47,10 +47,34 @@ class ResetLog extends Command
         // SB-AUD-022: prune traffic batch dedup markers after 48 hours;
         // realistic replays (agent retry, queue redelivery) land within
         // minutes, so the window only needs to cover those.
+        //
+        // SB-TA-B01-R1: the same table also holds the durable inbox
+        // (SB-TA-B01, processor = 'inbox'). An inbox row that is not
+        // yet 'processed' still carries the ONLY copy of a received
+        // batch's payload — the agent has already discarded its copy
+        // on the strength of the panel's HTTP 200 — so it must never
+        // be pruned by age: if the accounting queue is down for longer
+        // than 48 hours, deleting it would lose the batch permanently
+        // and suzu:traffic-batch-reconcile would have nothing left to
+        // re-drive. Only processed inbox rows follow the 48-hour
+        // retention, exactly like claim/legacy marker rows.
+        //
+        // Delete predicate: created_at aged out AND NOT (an unprocessed
+        // inbox row), where "unprocessed inbox row" is decided by
+        // processor alone plus a status check: processor = 'inbox' AND
+        // (status IS NULL OR status <> 'processed'). Claim rows are
+        // never processor = 'inbox', so their NULL status (pre-000010
+        // rows) can never be mistaken for an unprocessed inbox row.
         if (\Illuminate\Support\Facades\Schema::hasTable('suzu_traffic_batches')) {
-            \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
-                ->where('created_at', '<', time() - 172800)
-                ->delete();
+            $prune = \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
+                ->where('created_at', '<', time() - 172800);
+            if (\Illuminate\Support\Facades\Schema::hasColumn('suzu_traffic_batches', 'status')) {
+                $prune->where(function ($query) {
+                    $query->where('processor', '<>', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
+                        ->orWhere('status', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
+                });
+            }
+            $prune->delete();
         }
     }
 }

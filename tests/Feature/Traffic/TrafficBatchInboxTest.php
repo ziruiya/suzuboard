@@ -285,4 +285,77 @@ class TrafficBatchInboxTest extends TestCase
         $this->assertSame(250, (int) StatServer::where('server_id', $server->id)->firstOrFail()->u);
         $this->assertSame(TrafficBatchGuard::STATUS_PROCESSED, $this->inboxRow($batchKey)->status);
     }
+
+    // ---------------- ⑤ prune must spare unprocessed inbox rows (TA-B01-R1) ----------------
+
+    public function test_reset_log_prune_spares_unprocessed_inbox_and_reconcile_still_books_it(): void
+    {
+        $user = $this->makeUser();
+        $server = $this->makeServer();
+        $data = [$user->id => [700, 300]];
+        $contentHash = TrafficBatchGuard::hashFor($server->id, 'vless', $data);
+        $batchKey = TrafficBatchGuard::keyForBatchId($server->id, 'inbox-batch-stranded', 0);
+        $agedAt = time() - 200000; // safely beyond the 48-hour prune horizon
+
+        // A durably received batch whose accounting jobs never ran
+        // (queue down), then aged past 48 hours.
+        $payload = json_encode([
+            'protocol' => 'vless',
+            'timestamp' => strtotime(date('Y-m-d')),
+            'server' => ['id' => $server->id, 'rate' => 1, 'type' => 'vless'],
+            'data' => $data,
+            'collected_from' => time() - 60,
+            'collected_to' => time(),
+        ]);
+        $this->assertSame(
+            TrafficBatchGuard::RECEIPT_OK,
+            TrafficBatchGuard::receiveIdentified($batchKey, $server->id, $contentHash, $payload)
+        );
+        DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->where('processor', TrafficBatchGuard::PROCESSOR_INBOX)
+            ->update(['created_at' => $agedAt]);
+
+        // Same-age neighbours that MUST still be pruned: a processed
+        // inbox row, and a plain claim row (status NULL, as claim rows
+        // have always been written — a NULL status must not make a
+        // non-inbox row look like an unprocessed inbox row).
+        $processedKey = TrafficBatchGuard::keyForBatchId($server->id, 'inbox-batch-done', 0);
+        DB::table('suzu_traffic_batches')->insert([
+            'batch_hash' => $processedKey,
+            'server_id' => $server->id,
+            'processor' => TrafficBatchGuard::PROCESSOR_INBOX,
+            'content_hash' => $contentHash,
+            'payload' => $payload,
+            'status' => TrafficBatchGuard::STATUS_PROCESSED,
+            'processed_at' => $agedAt + 60,
+            'created_at' => $agedAt,
+        ]);
+        $claimKey = TrafficBatchGuard::keyForBatchId($server->id, 'inbox-batch-claimed', 0);
+        DB::table('suzu_traffic_batches')->insert([
+            'batch_hash' => $claimKey,
+            'server_id' => $server->id,
+            'processor' => TrafficBatchGuard::PROCESSOR_FETCH,
+            'created_at' => $agedAt,
+        ]);
+
+        $this->artisan('reset:log')->assertExitCode(0);
+
+        // The unprocessed inbox row — the only surviving copy of the
+        // batch — must survive the prune; the other two are gone.
+        $this->assertNotNull($this->inboxRow($batchKey), 'unprocessed inbox row must not be pruned by age');
+        $this->assertNull($this->inboxRow($processedKey), 'processed inbox row follows the 48h retention');
+        $this->assertSame(0, DB::table('suzu_traffic_batches')->where('batch_hash', $claimKey)->count());
+        $this->assertSame(0, (int) User::findOrFail($user->id)->u);
+
+        // And because it survived, reconcile can still book it —
+        // exactly once — even after the >48h outage.
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+        $this->assertSame(300, (int) User::findOrFail($user->id)->d);
+        $this->assertSame(TrafficBatchGuard::STATUS_PROCESSED, $this->inboxRow($batchKey)->status);
+
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame(700, (int) User::findOrFail($user->id)->u);
+    }
 }
