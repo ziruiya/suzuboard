@@ -560,46 +560,65 @@ class MachineFulfillmentService
             // resources down (same revocation shape as the reclaim
             // flow) and clear every provisioned pointer so the new
             // region provisions fresh.
-            if ($f->machine_id) {
-                DB::transaction(function () use ($f) {
-                    $machine = ServerMachine::find($f->machine_id);
+            // SB-ER-004-R1: EVERY database change of the switch — the
+            // teardown, the pointer clearing, the region/status update
+            // and both audit rows — runs in ONE transaction on the
+            // locked fulfilment row, and the final save's return value
+            // is checked. The first ER-004 shape committed the teardown
+            // in an inner transaction and saved the fulfilment outside
+            // it, unchecked: a failed final save left the old machine
+            // revoked while the fulfilment still pointed at it.
+            DB::transaction(function () use ($f, $user, $choice, $code, &$from) {
+                $locked = MachineFulfillment::lockForUpdate()->find($f->id);
+                if (!$locked
+                    || (int) $locked->user_id !== (int) $user->id
+                    || !$locked->sla_overdue
+                    || !$locked->isInFlight()
+                    || $locked->region_code === $code) {
+                    throw new \InvalidArgumentException('fulfilment is no longer awaiting this choice');
+                }
+                $from = $locked->region_code;
+                if ($locked->machine_id) {
+                    $machine = ServerMachine::find($locked->machine_id);
                     if ($machine) {
                         $machine->token = ServerMachine::generateToken();
                         $machine->is_active = false;
                         $machine->save();
                     }
-                    Server::whereIn('id', $f->nodeIds())->update(['enabled' => false, 'show' => false]);
-                    if ($f->group_id) {
-                        $this->membership->removeGroupFromVipServers((int) $f->group_id);
+                    Server::whereIn('id', $locked->nodeIds())->update(['enabled' => false, 'show' => false]);
+                    if ($locked->group_id) {
+                        $this->membership->removeGroupFromVipServers((int) $locked->group_id);
                     }
-                });
-                $f->machine_id = null;
-                $f->group_id = null;
-                $f->reality_server_id = null;
-                $f->ss1_server_id = null;
-                $f->sw1_server_id = null;
-                $f->public_ip = null;
-                $f->vendor_instance_id = null;
-                $f->vendor_name = null;
-                $f->resource_expires_at = null;
-                $f->provisioned_at = null;
-                $f->verified_at = null;
-                $f->verify_report = null;
-                MachineFulfillmentLog::record($f->id, 'fulfillment.region_teardown', 'provisioned resources revoked for region switch');
-            }
-            $f->region_code = $code;
-            $f->region_name = MachineRegionCatalog::name($code);
-            $f->user_choice = $choice;
-            $f->user_choice_at = now();
-            $f->sla_overdue = false;
-            $f->sla_stage = 0;
-            $f->overdue_notice_at = null;
-            $f->extended_deadline_at = null;
-            $f->termination_review = false;
-            $f->delivery_deadline_at = now()->addMinutes(self::DELIVERY_SLA_MINUTES);
-            $f->status = MachineFulfillment::STATUS_PAID_PENDING_PURCHASE;
-            $f->save();
-            MachineFulfillmentLog::record($f->id, 'fulfillment.choice_switch', "customer switched region {$from} -> {$code}; SLA clock restarted", MachineFulfillmentLog::ACTOR_USER, (int) $user->id);
+                    $locked->machine_id = null;
+                    $locked->group_id = null;
+                    $locked->reality_server_id = null;
+                    $locked->ss1_server_id = null;
+                    $locked->sw1_server_id = null;
+                    $locked->public_ip = null;
+                    $locked->vendor_instance_id = null;
+                    $locked->vendor_name = null;
+                    $locked->resource_expires_at = null;
+                    $locked->provisioned_at = null;
+                    $locked->verified_at = null;
+                    $locked->verify_report = null;
+                    MachineFulfillmentLog::record($locked->id, 'fulfillment.region_teardown', 'provisioned resources revoked for region switch');
+                }
+                $locked->region_code = $code;
+                $locked->region_name = MachineRegionCatalog::name($code);
+                $locked->user_choice = $choice;
+                $locked->user_choice_at = now();
+                $locked->sla_overdue = false;
+                $locked->sla_stage = 0;
+                $locked->overdue_notice_at = null;
+                $locked->extended_deadline_at = null;
+                $locked->termination_review = false;
+                $locked->delivery_deadline_at = now()->addMinutes(self::DELIVERY_SLA_MINUTES);
+                $locked->status = MachineFulfillment::STATUS_PAID_PENDING_PURCHASE;
+                if (!$locked->save()) {
+                    throw new \RuntimeException('failed to persist region switch for fulfilment #' . $locked->id);
+                }
+                MachineFulfillmentLog::record($locked->id, 'fulfillment.choice_switch', "customer switched region {$from} -> {$code}; SLA clock restarted", MachineFulfillmentLog::ACTOR_USER, (int) $user->id);
+            });
             $this->adminAlert('machine_choice_switch', "Fulfilment #{$f->id} (user {$f->user_id}): customer switched region {$from} -> {$code}");
         } else {
             throw new \InvalidArgumentException('unknown choice: ' . $choice);

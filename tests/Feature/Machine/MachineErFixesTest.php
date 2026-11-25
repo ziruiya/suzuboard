@@ -3,8 +3,10 @@
 namespace Tests\Feature\Machine;
 
 use App\Models\MachineFulfillment;
+use App\Models\MachineFulfillmentLog;
 use App\Models\Server;
 use App\Models\ServerMachine;
+use App\Services\Enterprise\EnterpriseGroupMembershipService;
 use Carbon\Carbon;
 
 /**
@@ -13,6 +15,8 @@ use Carbon\Carbon;
  *         fulfilment's own three nodes, not only to the VIP set;
  *  ER-004 a region switch after provisioning tears the old machine
  *         down instead of silently keeping it;
+ *  ER-004-R1 the switch is atomic: if the fulfilment's final save
+ *         fails, the teardown rolls back with it (this file);
  *  ER-005 a repurchase during RECLAIM_PENDING starts a fresh
  *         fulfilment instead of being swallowed by the reclaim;
  *  ER-010 TLS nodes are provisioned with the fleet's DNS-01
@@ -135,6 +139,81 @@ class MachineErFixesTest extends MachineTestCase
         foreach ($this->dedicatedNodes($f) as $node) {
             $this->assertSame('203.0.113.99', $node->host, 'new nodes point at the new region machine');
         }
+    }
+
+    public function test_region_switch_rolls_back_teardown_when_final_save_fails(): void
+    {
+        $user = $this->makeUser();
+        $order = $this->buyMachinePlan($user, 'JP');
+        $this->payOrder($order);
+        $f = MachineFulfillment::where('order_id', $order->id)->firstOrFail();
+        $this->service()->startPurchase($f);
+        $this->service()->backfillIp($f->fresh(), [
+            'public_ip' => '203.0.113.10',
+            'vendor_name' => 'TestVendor',
+            'vendor_instance_id' => 'ins-old',
+            'resource_expires_at' => now()->addMonth()->toDateTimeString(),
+        ]);
+        $f = $f->fresh();
+        $oldMachine = ServerMachine::findOrFail($f->machine_id);
+        $oldToken = $oldMachine->token;
+        $oldNodeIds = $f->nodeIds();
+        $this->assertCount(3, $oldNodeIds);
+        $groupId = (int) $f->group_id;
+        $statusBefore = $f->status;
+        foreach ($this->dedicatedNodes($f) as $node) {
+            $this->assertTrue($this->groupOnNode($node, $groupId), 'dedicated group on the nodes before the switch');
+        }
+
+        // Put the VIP grant in place (the same call deliver() makes):
+        // the teardown revokes it, so a half-committed switch would
+        // strip it even though the fulfilment never moved.
+        app(EnterpriseGroupMembershipService::class)->addGroupToVipServers($groupId);
+        $this->assertTrue($this->groupOnNode($this->vipServer->fresh(), $groupId), 'VIP grant in place before the switch');
+
+        $f->sla_overdue = true;
+        $f->save();
+
+        // Veto the fulfilment's final save (Eloquent saving event):
+        // the switch must fail as one unit and roll the teardown back.
+        $targetId = (int) $f->id;
+        MachineFulfillment::saving(function ($m) use ($targetId) {
+            if ((int) $m->id === $targetId) {
+                return false;
+            }
+        });
+        $thrown = null;
+        try {
+            $this->service()->recordUserChoice($f->fresh(), $user, MachineFulfillment::CHOICE_SWITCH_REGION, 'SG');
+        } catch (\RuntimeException $e) {
+            $thrown = $e;
+        }
+        $this->assertNotNull($thrown, 'ER-004-R1: a failed final save must surface, not be swallowed');
+
+        $oldMachine = $oldMachine->fresh();
+        $this->assertSame($oldToken, $oldMachine->token, 'old machine token must not rotate on a rolled-back switch');
+        $this->assertTrue((bool) $oldMachine->is_active, 'old machine must stay active');
+        foreach (Server::whereIn('id', $oldNodeIds)->get() as $node) {
+            $this->assertTrue((bool) $node->enabled, 'old node must stay enabled');
+            $this->assertTrue((bool) $node->show, 'old node must stay visible');
+            $this->assertTrue($this->groupOnNode($node, $groupId), 'dedicated group must stay on the old nodes');
+        }
+        $this->assertTrue($this->groupOnNode($this->vipServer->fresh(), $groupId), 'VIP grant must survive a rolled-back switch');
+
+        $f = $f->fresh();
+        $this->assertSame('JP', $f->region_code);
+        $this->assertSame($statusBefore, $f->status);
+        $this->assertSame((int) $oldMachine->id, (int) $f->machine_id, 'fulfilment must still point at the old machine');
+        $this->assertSame($groupId, (int) $f->group_id);
+        $this->assertSame($oldNodeIds, $f->nodeIds(), 'node pointers must be intact');
+        $this->assertSame('203.0.113.10', $f->public_ip);
+        $this->assertTrue((bool) $f->sla_overdue, 'still awaiting the customer choice');
+        $this->assertNull($f->user_choice);
+        $this->assertSame(
+            0,
+            MachineFulfillmentLog::where('fulfillment_id', $f->id)->where('event', 'fulfillment.region_teardown')->count(),
+            'teardown audit row must roll back with the switch'
+        );
     }
 
     public function test_repurchase_during_reclaim_pending_creates_fresh_fulfilment(): void
