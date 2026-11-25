@@ -153,6 +153,29 @@ class AuthTicketRevocationTest extends TestCase
         $this->assertNull((new MailLinkService())->handleTokenLogin($code));
     }
 
+    public function test_legacy_bare_id_ticket_is_never_honoured(): void
+    {
+        $user = $this->makeUser();
+
+        // SB-TA-012 hard cut (GPT re-review ruling): pre-fix code
+        // stored a bare user id as the ticket payload. Such a ticket
+        // carries no auth version and no session binding, so it cannot
+        // be proven to postdate the last credential rotation — it must
+        // be refused outright, even inside its 300s lifetime, and the
+        // user must request a fresh login link. (Batch 2 originally
+        // tolerated these once as a transition measure; the re-review
+        // rejected that tolerance.)
+        $code = \App\Utils\Helper::guid();
+        Cache::put(\App\Utils\CacheKey::get('TEMP_TOKEN', $code), (int) $user->id, 300);
+        $this->assertNull((new MailLinkService())->handleTokenLogin($code));
+
+        // String form of the bare id (cache backends that round-trip
+        // scalars as strings) is refused the same way.
+        $code2 = \App\Utils\Helper::guid();
+        Cache::put(\App\Utils\CacheKey::get('TEMP_TOKEN', $code2), (string) $user->id, 300);
+        $this->assertNull((new MailLinkService())->handleTokenLogin($code2));
+    }
+
     // ---------------- TA-013 ----------------
 
     public function test_admin_password_change_revokes_target_tokens(): void

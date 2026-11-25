@@ -52,6 +52,9 @@ class Kernel extends ConsoleKernel
         $schedule->command('suzu:enterprise-health', ['--mode' => 'full'])->dailyAt('04:30')->onOneServer()->withoutOverlapping(60);
         // SB-RELAY-01: relay config reconciliation every 5 minutes
         $schedule->command('suzu:relay-reconcile')->everyFiveMinutes()->onOneServer()->withoutOverlapping(5);
+        // SB-TA-B01: re-drive durably received traffic batches whose
+        // accounting jobs never completed (durable-receipt protocol).
+        $schedule->command('suzu:traffic-batch-reconcile')->everyFiveMinutes()->onOneServer()->withoutOverlapping(5);
         // AUD-035: re-push full user lists to nodes whose fire-and-forget
         // WS delta may have been missed while they were offline
         $schedule->command('suzu:node-resync')->everyMinute()->onOneServer()->withoutOverlapping(5);

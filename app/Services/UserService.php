@@ -164,6 +164,51 @@ class UserService
             $batchHash = $batchId !== null
                 ? TrafficBatchGuard::keyForBatchId((int) ($server['id'] ?? 0), $batchId, (int) $seq)
                 : $contentHash;
+
+            if ($batchId !== null) {
+                // SB-TA-B01: durable receipt BEFORE any job is
+                // dispatched. HTTP 200 for an identified batch means
+                // "durably received" (payload + fingerprint + status
+                // committed to the inbox), not "booked" — see
+                // TrafficBatchGuard::receiveIdentified() for the full
+                // protocol definition. A persistence failure throws
+                // and the report endpoint answers an HTTP error, so
+                // the agent keeps the batch; a same-id different-
+                // content re-send is refused synchronously here.
+                $payload = json_encode([
+                    'protocol' => $protocol,
+                    'timestamp' => $timestamp,
+                    'server' => [
+                        'id' => (int) ($server['id'] ?? 0),
+                        'rate' => $server['rate'] ?? 1,
+                        'type' => $server['type'] ?? null,
+                    ],
+                    'data' => $chunkData,
+                    'collected_from' => $collectedFrom,
+                    'collected_to' => $collectedTo,
+                ]);
+                $receipt = TrafficBatchGuard::receiveIdentified(
+                    $batchHash,
+                    (int) ($server['id'] ?? 0),
+                    $contentHash,
+                    $payload
+                );
+                if ($receipt === TrafficBatchGuard::RECEIPT_CONFLICT) {
+                    \Illuminate\Support\Facades\Log::error('traffic batch conflict at receipt: same batch id, different content', [
+                        'server_id' => (int) ($server['id'] ?? 0),
+                        'batch_id' => $batchId,
+                    ]);
+                    throw new \App\Exceptions\TrafficBatchConflictException((int) ($server['id'] ?? 0), $batchId);
+                }
+                if ($receipt === TrafficBatchGuard::RECEIPT_REPLAY) {
+                    // The durable receipt already stands. Do not
+                    // re-dispatch: processors that completed are
+                    // claimed, and a batch whose jobs were lost is
+                    // re-driven by suzu:traffic-batch-reconcile.
+                    return;
+                }
+            }
+
             TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash, $batchId, $contentHash, $collectedFrom, $collectedTo);
             StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);
             StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);

@@ -218,6 +218,14 @@ class ServerService
 
     /**
      * 处理节点流量数据汇报
+     *
+     * @throws \App\Exceptions\TrafficBatchConflictException SB-TA-B01: an
+     *         identified batch id was re-sent with different content.
+     * @throws \Throwable SB-TA-B01: for identified batches, a durable
+     *         inbox receipt failure propagates; callers must answer an
+     *         HTTP error so the agent keeps the batch. (The conflict
+     *         exception cannot occur for legacy reports without an
+     *         envelope — they keep the AUD-022 queue path untouched.)
      */
     public static function processTraffic(Server $node, array $traffic, ?array $batchMeta = null): void
     {

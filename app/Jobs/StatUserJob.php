@@ -91,6 +91,11 @@ class StatUserJob implements ShouldQueue
                 }
             }
         });
+
+        if ($this->batchId !== null) {
+            // SB-TA-B01: see TrafficFetchJob — inbox completion tracking.
+            \App\Services\TrafficBatchGuard::noteBatchProcessed($this->batchHash, (int) ($this->server['id'] ?? 0));
+        }
     }
 
     protected function processPluginStat(int $uid, array $v, int $recordAt): void

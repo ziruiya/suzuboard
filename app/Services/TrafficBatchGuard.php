@@ -28,6 +28,19 @@ class TrafficBatchGuard
     public const CLAIM_REPLAY = 'replay';
     public const CLAIM_CONFLICT = 'conflict';
 
+    // SB-TA-B01: durable inbox for identified batches. One inbox row
+    // per chunk (processor = 'inbox') is written synchronously at
+    // report time and carries the validated payload plus a processing
+    // status; the per-processor claim rows stay payload-free.
+    public const PROCESSOR_INBOX = 'inbox';
+    public const STATUS_RECEIVED = 'received';
+    public const STATUS_PROCESSED = 'processed';
+
+    // SB-TA-B01: outcomes of a synchronous inbox receipt.
+    public const RECEIPT_OK = 'received';
+    public const RECEIPT_REPLAY = 'replay';
+    public const RECEIPT_CONFLICT = 'conflict';
+
     /**
      * Dedup key for a batch that carries a persistent agent-assigned
      * batch id (SB-TA-001/002). The key depends only on the node, the
@@ -152,5 +165,114 @@ class TrafficBatchGuard
             }
             return self::CLAIM_REPLAY;
         }
+    }
+
+    /**
+     * SB-TA-B01 protocol definition — durable receipt.
+     *
+     * For batches on the batch-id protocol, HTTP 200 from the report
+     * endpoint means "the panel has DURABLY RECEIVED this batch", not
+     * "the batch has been booked". Durable receipt is established here:
+     * the validated chunk payload, its content fingerprint and a
+     * 'received' status are inserted into suzu_traffic_batches
+     * (processor = 'inbox') synchronously inside the report request,
+     * before any accounting job is dispatched. Only when this insert
+     * commits may the endpoint answer 200; any failure propagates and
+     * the endpoint answers an HTTP error, so the agent keeps the batch
+     * and re-sends it.
+     *
+     * Booking then happens asynchronously from this record: the three
+     * processors claim the batch exactly as before (claim rows are the
+     * idempotency mechanism) and noteBatchProcessed() flips the inbox
+     * row to 'processed' once every processor's claim exists. A batch
+     * whose jobs are lost (retries exhausted, queue failure) stays
+     * 'received' with its payload intact, and the
+     * suzu:traffic-batch-reconcile command re-drives it — booking is
+     * recoverable and reconcilable, never dependent on queue retries
+     * alone.
+     *
+     * The same-id conflict check also lives here, synchronously: a
+     * re-sent batch id whose stored content hash differs is refused at
+     * the HTTP layer (RECEIPT_CONFLICT), not acknowledged with 200 and
+     * rejected later inside a job. A same-id same-content re-send is a
+     * replay: the receipt already stands, no jobs are re-dispatched
+     * (recovery of a stuck batch is the reconcile command's job).
+     *
+     * Legacy reports without a batch envelope have no durable identity
+     * to receive against; they keep the AUD-022 queue path unchanged
+     * and are outside this protocol.
+     *
+     * Returns RECEIPT_OK / RECEIPT_REPLAY / RECEIPT_CONFLICT. Throws on
+     * any persistence failure that is not a uniqueness replay.
+     */
+    public static function receiveIdentified(string $batchKey, int $serverId, ?string $contentHash, string $payload): string
+    {
+        try {
+            DB::table('suzu_traffic_batches')->insert([
+                'batch_hash' => $batchKey,
+                'server_id' => $serverId,
+                'processor' => self::PROCESSOR_INBOX,
+                'content_hash' => $contentHash,
+                'payload' => $payload,
+                'status' => self::STATUS_RECEIVED,
+                'created_at' => time(),
+            ]);
+            return self::RECEIPT_OK;
+        } catch (QueryException $e) {
+            $existing = DB::table('suzu_traffic_batches')
+                ->where('batch_hash', $batchKey)
+                ->where('processor', self::PROCESSOR_INBOX)
+                ->first();
+            if (!$existing) {
+                // Not a replay — a genuine receipt failure. The caller
+                // must surface it as an HTTP error so the agent keeps
+                // the batch.
+                throw $e;
+            }
+            $stored = $existing->content_hash ?? null;
+            if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
+                return self::RECEIPT_CONFLICT;
+            }
+            return self::RECEIPT_REPLAY;
+        }
+    }
+
+    /**
+     * SB-TA-B01: flip an inbox row to 'processed' once every accounting
+     * processor (fetch / stat_user / stat_server) holds a claim row for
+     * the batch. Called by each processor after its own transaction
+     * commits, and by the reconcile command (a crash between the last
+     * claim commit and this update must not strand the row). Returns
+     * true when the inbox row is in 'processed' state afterwards.
+     */
+    public static function noteBatchProcessed(string $batchKey, int $serverId): bool
+    {
+        $inbox = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->where('processor', self::PROCESSOR_INBOX)
+            ->first();
+        if (!$inbox) {
+            return false;
+        }
+        if (($inbox->status ?? null) === self::STATUS_PROCESSED) {
+            return true;
+        }
+
+        $claimed = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->whereIn('processor', [self::PROCESSOR_FETCH, self::PROCESSOR_STAT_USER, self::PROCESSOR_STAT_SERVER])
+            ->distinct()
+            ->count('processor');
+        if ($claimed < 3) {
+            return false;
+        }
+
+        DB::table('suzu_traffic_batches')
+            ->where('id', $inbox->id)
+            ->update([
+                'status' => self::STATUS_PROCESSED,
+                'processed_at' => time(),
+            ]);
+        return true;
     }
 }

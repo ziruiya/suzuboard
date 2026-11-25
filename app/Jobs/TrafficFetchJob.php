@@ -75,9 +75,28 @@ class TrafficFetchJob implements ShouldQueue
             // A window straddling the reset cannot be split (deltas are
             // window aggregates), so it is charged whole to the current
             // period and logged; see the batch-2 lab report.
+            //
+            // SB-TA-B02: the attribution decision and the u/d updates
+            // happen in THIS transaction, and last_reset_at is re-read
+            // here under lockForUpdate — never from a value read
+            // earlier without a lock. The previous implementation
+            // plucked last_reset_at with a plain select: a reset that
+            // committed after that read but before the increments was
+            // invisible to the decision, and the old period's traffic
+            // landed in the new period. With the rows locked (in
+            // ascending id order — the same order this job and
+            // TrafficResetService::performReset serialize on), a
+            // concurrent reset either commits before this read (and is
+            // seen) or waits until this transaction commits (and then
+            // resets the counters including this batch's charge). Both
+            // orders are correct.
             $skipUids = [];
             if ($this->collectedTo !== null && !empty($userIds)) {
-                $resetAts = User::whereIn('id', $userIds)->pluck('last_reset_at', 'id');
+                $resetAts = User::whereIn('id', $userIds)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->get(['id', 'last_reset_at'])
+                    ->mapWithKeys(fn($u) => [(int) $u->id => (int) ($u->last_reset_at ?? 0)]);
                 foreach ($userIds as $uid) {
                     $resetAt = (int) ($resetAts[$uid] ?? 0);
                     if ($resetAt > 0 && $this->collectedTo <= $resetAt) {
@@ -117,6 +136,13 @@ class TrafficFetchJob implements ShouldQueue
 
             return true;
         });
+
+        if ($this->batchId !== null) {
+            // SB-TA-B01: this processor's claim is committed; flip the
+            // durable inbox row to 'processed' if the other two
+            // processors have claimed the batch as well.
+            TrafficBatchGuard::noteBatchProcessed($this->batchHash, (int) ($this->server['id'] ?? 0));
+        }
 
         if ($processed && !empty($userIds)) {
             Redis::sadd('traffic:pending_check', ...$userIds);

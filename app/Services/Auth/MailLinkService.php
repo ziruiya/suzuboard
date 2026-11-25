@@ -123,12 +123,17 @@ class MailLinkService
                 // a ticket that fails validation is dead, not retryable.
                 Cache::forget($key);
 
-                // Transition tolerance: tickets issued by the previous
-                // code stored a bare user id. They live at most 300s,
-                // so accept them under the old checks just this once.
+                // SB-TA-012 hard cut (GPT review ruling): tickets
+                // issued by the previous code stored a bare user id
+                // with no auth version and no session binding, so
+                // there is no way to prove one was not issued before
+                // a password reset / session revocation. They are NOT
+                // honoured — not even inside their 300s lifetime. A
+                // user holding one must request a fresh login link;
+                // that is the accepted cost of closing the ticket
+                // completely.
                 if (is_int($payload) || is_string($payload)) {
-                    $user = User::find((int) $payload);
-                    return ($user && !$user->banned) ? (int) $user->id : null;
+                    return null;
                 }
 
                 if (!is_array($payload) || !isset($payload['user_id'])) {

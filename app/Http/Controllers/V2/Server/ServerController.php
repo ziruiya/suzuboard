@@ -62,7 +62,23 @@ class ServerController extends Controller
                     'collected_to' => isset($envelope['collected_to']) ? (int) $envelope['collected_to'] : null,
                 ];
             }
-            ServerService::processTraffic($node, $traffic, $batchMeta);
+            try {
+                ServerService::processTraffic($node, $traffic, $batchMeta);
+            } catch (\App\Exceptions\TrafficBatchConflictException $e) {
+                // SB-TA-B01: same batch id, different content — refuse
+                // at the HTTP layer so the agent does NOT discard the
+                // batch on the strength of a 200.
+                return response()->json(['error' => 'traffic_batch_conflict'], 409);
+            } catch (\Throwable $e) {
+                // SB-TA-B01: the durable receipt could not be
+                // committed. Answer an HTTP error (never 200) so the
+                // agent keeps the batch and re-sends it.
+                \Illuminate\Support\Facades\Log::error('traffic report receipt failed', [
+                    'server_id' => (int) ($node->id ?? 0),
+                    'exception' => $e->getMessage(),
+                ]);
+                return response()->json(['error' => 'traffic_receipt_failed'], 500);
+            }
         }
 
         $alive = $request->input('alive');

@@ -88,6 +88,11 @@ class StatServerJob implements ShouldQueue
             Log::error('StatServerJob failed for server ' . $this->server['id'] . ': ' . $e->getMessage());
             throw $e;
         }
+
+        if ($this->batchId !== null) {
+            // SB-TA-B01: see TrafficFetchJob — inbox completion tracking.
+            \App\Services\TrafficBatchGuard::noteBatchProcessed($this->batchHash, (int) ($this->server['id'] ?? 0));
+        }
     }
 
     protected function updateServerTraffic(int $u, int $d): void

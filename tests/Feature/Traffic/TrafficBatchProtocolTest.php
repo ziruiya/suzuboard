@@ -149,10 +149,18 @@ class TrafficBatchProtocolTest extends TestCase
         $this->assertSame(100, (int) User::findOrFail($user->id)->u);
 
         // Same id, different content: protocol conflict — refuse, do
-        // not fold into either batch.
-        (new UserService())->trafficFetch($server, 'vless', [$user->id => [999, 999]], $this->meta('batch-0007'));
-        $this->assertSame(100, (int) User::findOrFail($user->id)->u);
-        $this->assertSame(100, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        // not fold into either batch. Since SB-TA-B01 the refusal
+        // happens synchronously at durable receipt and is signalled
+        // with TrafficBatchConflictException, which the report
+        // endpoint converts to HTTP 409 (see TrafficBatchInboxTest);
+        // at this service level the exception IS the refusal.
+        $this->expectException(\App\Exceptions\TrafficBatchConflictException::class);
+        try {
+            (new UserService())->trafficFetch($server, 'vless', [$user->id => [999, 999]], $this->meta('batch-0007'));
+        } finally {
+            $this->assertSame(100, (int) User::findOrFail($user->id)->u);
+            $this->assertSame(100, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
+        }
     }
 
     public function test_legacy_batches_keep_content_hash_fallback(): void
@@ -290,5 +298,94 @@ class TrafficBatchProtocolTest extends TestCase
         $job2->handle();
         $this->assertSame(40, (int) User::findOrFail($user->id)->u);
         $this->assertSame(60, (int) User::findOrFail($user->id)->d);
+    }
+
+    // ---------------- TA-B02 (GPT re-review closure of TA-004) ----------------
+
+    /**
+     * The GPT re-review sequence is: job reads last_reset_at (T0) ->
+     * reset commits (T1) -> job increments, charging the OLD period to
+     * the NEW one. The fix makes the attribution decision and the u/d
+     * updates one transaction whose last_reset_at values are re-read
+     * under lockForUpdate in ascending id order (the lock order
+     * performReset serializes on): a concurrent reset then either
+     * commits before the locked read (and is seen) or waits for this
+     * transaction (and resets counters that already include the
+     * batch). Both orders are correct.
+     *
+     * Harness limitation, stated plainly (same disclosure pattern as
+     * SB-MONEY-002-C1-R1, accepted by GPT there): the test database is
+     * a single in-memory SQLite connection, and SQLite discards the
+     * FOR UPDATE clause, so a true two-connection InnoDB lock
+     * contention CANNOT be reproduced here. What this test pins is the
+     * decision mechanism the fix introduces — the attribution read is
+     * an id-ordered locking re-read taken INSIDE the job's transaction
+     * (after the batch claim, before the increments), never an
+     * unlocked read whose result could predate a concurrent reset.
+     * On the pre-fix code the attribution read is a plain unordered
+     * pluck(), and this test fails (verified via git stash against
+     * the batch-2 baseline). Production MySQL/InnoDB lockForUpdate is
+     * the final serialization guarantee.
+     */
+    public function test_period_attribution_uses_locked_ordered_reread_inside_the_transaction(): void
+    {
+        $user = $this->makeUser();
+        $server = $this->makeServer();
+        $serverArray = $server->toArray();
+        $serverArray['rate'] = 1.0;
+
+        $data = [$user->id => [300, 300]];
+        $job = new TrafficFetchJob(
+            $serverArray,
+            $data,
+            'vless',
+            strtotime(date('Y-m-d')),
+            TrafficBatchGuard::keyForBatchId($server->id, 'batch-b02-pin', 0),
+            'batch-b02-pin',
+            TrafficBatchGuard::hashFor($server->id, 'vless', $data),
+            time() - 3600,
+            time() - 3500
+        );
+
+        $queries = [];
+        DB::listen(function ($event) use (&$queries) {
+            $queries[] = $event->sql;
+        });
+        $job->handle();
+
+        // Locate, in execution order: the batch claim insert, the
+        // attribution read of last_reset_at, and the first u/d update.
+        $claimIdx = $attributionIdx = $updateIdx = null;
+        foreach ($queries as $i => $sql) {
+            if ($claimIdx === null && str_contains($sql, 'insert into "suzu_traffic_batches"')) {
+                $claimIdx = $i;
+            }
+            if ($attributionIdx === null && str_contains($sql, '"v2_user"') && str_contains($sql, 'last_reset_at') && str_starts_with($sql, 'select')) {
+                $attributionIdx = $i;
+            }
+            if ($updateIdx === null && str_starts_with($sql, 'update "v2_user"')) {
+                $updateIdx = $i;
+            }
+        }
+
+        $this->assertNotNull($claimIdx, 'batch claim insert must run');
+        $this->assertNotNull($attributionIdx, 'attribution read of last_reset_at must run');
+        $this->assertNotNull($updateIdx, 'u/d increment must run');
+        // One transaction, decision before writes: claim -> locked
+        // re-read -> increments.
+        $this->assertLessThan($attributionIdx, $claimIdx);
+        $this->assertLessThan($updateIdx, $attributionIdx);
+        // The re-read locks the user rows in ascending id order (the
+        // compiled FOR UPDATE is stripped by the SQLite grammar, but
+        // the id ordering that accompanies lockForUpdate in the fixed
+        // code is observable — and absent from the pre-fix pluck()).
+        $this->assertStringContainsString(
+            'order by "id" asc',
+            $queries[$attributionIdx],
+            'attribution read must re-read last_reset_at under lockForUpdate in ascending id order'
+        );
+
+        // Behavioural sanity: with no reset in play, the batch charges.
+        $this->assertSame(300, (int) User::findOrFail($user->id)->u);
     }
 }
