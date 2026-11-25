@@ -52,7 +52,12 @@ class PaymentController extends Controller
             // admin decision) instead of being confirmed to the gateway
             // and silently lost with no trace in the books.
             if ($order->status === Order::STATUS_CANCELLED) {
-                $this->recordReceiptOnCancelledOrder($order, $callbackNo, $verify);
+                // SB-MONEY-002 (fix-up): acknowledge only when the
+                // receipt is verifiably on the books. If it cannot be
+                // recorded (persistence failure, or the report carries
+                // no verifiable amount/currency), fail so the gateway
+                // keeps retrying instead of the money vanishing.
+                return $this->recordReceiptOnCancelledOrder($order, $callbackNo, $verify);
             }
             return true;
         }
@@ -93,8 +98,9 @@ class PaymentController extends Controller
         // paid() no-oped and the receipt would still be lost.
         $freshOrder = Order::find($order->id);
         if ($freshOrder && $freshOrder->status === Order::STATUS_CANCELLED) {
-            $this->recordReceiptOnCancelledOrder($freshOrder, $callbackNo, $verify);
-            return true;
+            // Same acknowledgement rule as the cancelled path above:
+            // propagate the recording result instead of forcing true.
+            return $this->recordReceiptOnCancelledOrder($freshOrder, $callbackNo, $verify);
         }
 
         HookManager::call('payment.notify.success', $order);
@@ -107,39 +113,75 @@ class PaymentController extends Controller
      * was already refunded at cancel time, so silently re-opening it
      * would double-grant); saving callback_no + paid_at makes the
      * receipt findable in the books for a manual re-open or refund.
-     * Reports that fail the same reconciliation as the pending path are
-     * logged, not persisted.
+     *
+     * Return value = whether the gateway may be acknowledged:
+     *  - true: the receipt is verifiably persisted, or the report is
+     *    complete but definitively fails reconciliation (evidence is
+     *    logged for manual handling; retrying the identical report
+     *    could never succeed, so the gateway may stop).
+     *  - false: the receipt could NOT be confirmed — the report lacks
+     *    a verifiable amount or currency, or the write itself failed.
+     *    Nothing is written as received, and handle() propagates the
+     *    failure so the gateway keeps retrying instead of the payment
+     *    being confirmed here and lost with no trace in the books.
      */
-    private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): void
+    private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): bool
     {
-        if (isset($verify['paid_currency'])
-            && strtoupper((string) $verify['paid_currency']) !== 'CNY') {
+        // The receipt must be provable: both the paid amount and the
+        // currency have to be reported. A verified signature without
+        // them proves a notification arrived, not that this amount of
+        // money did — record nothing and fail the acknowledgement.
+        $missing = [];
+        if (!isset($verify['paid_amount_cents'])) {
+            $missing[] = 'paid_amount_cents';
+        }
+        if (!isset($verify['paid_currency'])) {
+            $missing[] = 'paid_currency';
+        }
+        if ($missing) {
+            Log::warning('payment notify for cancelled order: receipt evidence incomplete, receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'callback_no' => $callbackNo,
+                'missing' => $missing,
+            ]);
+            return false;
+        }
+        if (strtoupper((string) $verify['paid_currency']) !== 'CNY') {
             Log::warning('payment notify for cancelled order: currency mismatch, receipt not recorded', [
                 'trade_no' => $order->trade_no,
                 'paid_currency' => $verify['paid_currency'],
             ]);
-            return;
+            return true;
         }
         $expectedAmount = (int) $order->total_amount + (int) ($order->handling_amount ?? 0);
-        if (isset($verify['paid_amount_cents'])
-            && (int) $verify['paid_amount_cents'] !== $expectedAmount) {
+        if ((int) $verify['paid_amount_cents'] !== $expectedAmount) {
             Log::warning('payment notify for cancelled order: amount mismatch, receipt not recorded', [
                 'trade_no' => $order->trade_no,
                 'paid_amount_cents' => $verify['paid_amount_cents'],
                 'expected_amount_cents' => $expectedAmount,
             ]);
-            return;
+            return true;
         }
         try {
             $order->callback_no = $order->callback_no ?: $callbackNo;
             $order->paid_at = $order->paid_at ?: time();
             $order->save();
         } catch (\Exception $e) {
-            Log::error($e);
+            // Persistence is the acknowledgement criterion: if the
+            // receipt is not in the database (e.g. the AUD-040 unique
+            // index rejects the callback_no), the gateway must not be
+            // told the payment was handled.
+            Log::error('payment notify for cancelled order: receipt could not be persisted', [
+                'trade_no' => $order->trade_no,
+                'callback_no' => $callbackNo,
+                'exception' => $e->getMessage(),
+            ]);
+            return false;
         }
         Log::warning('payment received for cancelled order; receipt recorded for manual handling (re-open or refund)', [
             'trade_no' => $order->trade_no,
             'callback_no' => $callbackNo,
         ]);
+        return true;
     }
 }

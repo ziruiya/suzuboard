@@ -2,6 +2,7 @@
 
 namespace Tests\Feature\Payment;
 
+use App\Http\Controllers\V1\Guest\PaymentController;
 use App\Http\Controllers\V2\Admin\OrderController as AdminOrderController;
 use App\Models\Order;
 use App\Models\Payment;
@@ -226,6 +227,112 @@ class MoneyBatch1FixTest extends TestCase
         $fresh = Order::findOrFail($order->id);
         $this->assertSame(Order::STATUS_CANCELLED, $fresh->status);
         $this->assertNull($fresh->callback_no);
+    }
+
+    // --------- SB-MONEY-002 fix-up (GPT re-review A/B) ---------
+
+    public function test_receipt_persistence_failure_fails_the_callback_acknowledgement(): void
+    {
+        $gateway = $this->makeEpayGateway();
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        // Another order already holds this gateway transaction number,
+        // so persisting the receipt violates the AUD-040 unique index
+        // on callback_no: the write genuinely fails in the database.
+        $this->makeOrder($user, $plan, [
+            'status' => Order::STATUS_COMPLETED,
+            'callback_no' => 'EPAY-TX-CONFLICT',
+        ]);
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        $response = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-TX-CONFLICT'));
+
+        // The gateway must NOT be told the payment was handled — it
+        // has to keep retrying while the receipt is missing from the
+        // books (previously the write exception was swallowed and the
+        // callback was acknowledged as success).
+        $response->assertStatus(400);
+        $fresh = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $fresh->status);
+        $this->assertNull($fresh->callback_no);
+        $this->assertNull($fresh->paid_at);
+    }
+
+    public function test_receipt_without_verifiable_amount_is_not_recorded_and_fails(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        $controller = new PaymentController();
+        $method = new \ReflectionMethod($controller, 'handle');
+        $method->setAccessible(true);
+
+        // The signature verified, but the plugin reported no amount:
+        // nothing proves money arrived, so nothing may be booked as
+        // received and the callback must fail (gateway keeps retrying).
+        $result = $method->invoke($controller, $order->trade_no, 'CB-NO-AMOUNT', [
+            'paid_currency' => 'CNY',
+        ]);
+
+        $this->assertFalse($result);
+        $fresh = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $fresh->status);
+        $this->assertNull($fresh->callback_no);
+        $this->assertNull($fresh->paid_at);
+    }
+
+    public function test_receipt_without_verifiable_currency_is_not_recorded_and_fails(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        $controller = new PaymentController();
+        $method = new \ReflectionMethod($controller, 'handle');
+        $method->setAccessible(true);
+
+        // Amount reported but no currency to reconcile it against:
+        // equally unprovable as a receipt.
+        $result = $method->invoke($controller, $order->trade_no, 'CB-NO-CURRENCY', [
+            'paid_amount_cents' => 2900,
+        ]);
+
+        $this->assertFalse($result);
+        $fresh = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $fresh->status);
+        $this->assertNull($fresh->callback_no);
+        $this->assertNull($fresh->paid_at);
+    }
+
+    public function test_duplicate_receipt_notification_is_recorded_once_without_error(): void
+    {
+        $gateway = $this->makeEpayGateway();
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan);
+        $this->assertTrue((new OrderService($order))->cancel());
+
+        $callback = $this->epayCallback($order, '29.00', 'EPAY-DUP-1');
+        $first = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $callback);
+        $first->assertStatus(200);
+        $afterFirst = Order::findOrFail($order->id);
+        $this->assertSame('EPAY-DUP-1', $afterFirst->callback_no);
+        $this->assertNotNull($afterFirst->paid_at);
+
+        // Gateways retry notifications: the identical callback must be
+        // acknowledged again without error and without re-recording
+        // (same callback number, original paid_at untouched).
+        $second = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $callback);
+        $second->assertStatus(200);
+        $this->assertSame('success', $second->getContent());
+        $afterSecond = Order::findOrFail($order->id);
+        $this->assertSame(Order::STATUS_CANCELLED, $afterSecond->status);
+        $this->assertSame('EPAY-DUP-1', $afterSecond->callback_no);
+        $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
     }
 
     // ---------------- SB-MONEY-004 ----------------
