@@ -198,7 +198,11 @@ class UserController extends Controller
                 if (!$user) {
                     throw new \Exception(__('The user does not exist'));
                 }
-                if ($amount > $user->commission_balance) {
+                // SB-MONEY-016: commission frozen by a pending
+                // withdrawal request is not transferable — moving it
+                // into the spendable balance while a payout is
+                // pending would spend the same commission twice.
+                if ($amount > \App\Models\CommissionWithdrawal::availableCommission($user)) {
                     throw new \Exception(__('Insufficient commission balance'));
                 }
                 $user->commission_balance -= $amount;

@@ -19,7 +19,11 @@ class OrderAssign extends FormRequest
             'plan_id' => 'required',
             'email' => 'required|email:strict|max:64',
             'total_amount' => 'required',
-            'period' => 'required|in:month_price,quarter_price,half_year_price,year_price,two_year_price,three_year_price,onetime_price,reset_price'
+            'period' => 'required|in:month_price,quarter_price,half_year_price,year_price,two_year_price,three_year_price,onetime_price,reset_price',
+            // SB-MONEY-012: business plans need the same fulfilment
+            // fields the user checkout collects.
+            'enterprise_purpose' => 'nullable|string|max:64',
+            'machine_region' => 'nullable|string|max:64'
         ];
     }
 

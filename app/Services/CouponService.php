@@ -29,10 +29,12 @@ class CouponService
         $this->check();
         switch ($this->coupon->type) {
             case 1:
-                $order->discount_amount = $this->coupon->value;
+                $order->discount_amount = (int) $this->coupon->value;
                 break;
             case 2:
-                $order->discount_amount = $order->total_amount * ($this->coupon->value / 100);
+                // SB-MONEY-011: integer-cent percentage (was a float
+                // product stored into an integer column).
+                $order->discount_amount = \App\Utils\MoneyAmount::percentOf((int) $order->total_amount, $this->coupon->value);
                 break;
         }
         if ($order->discount_amount > $order->total_amount) {

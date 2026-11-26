@@ -2,17 +2,21 @@
 
 namespace App\Http\Controllers\V1\User;
 
+use App\Exceptions\ApiException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\User\TicketSave;
 use App\Http\Requests\User\TicketWithdraw;
 use App\Http\Resources\TicketResource;
+use App\Models\CommissionWithdrawal;
 use App\Models\Ticket;
 use App\Models\TicketMessage;
 use App\Models\User;
 use App\Services\TicketService;
 use App\Utils\Dict;
+use App\Utils\Helper;
 use Illuminate\Http\Request;
 use App\Services\Plugin\HookManager;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class TicketController extends Controller
@@ -126,27 +130,62 @@ class TicketController extends Controller
         ) {
             return $this->fail([422, __('Unsupported withdrawal method')]);
         }
-        $user = User::find($request->user()->id);
         $limit = admin_setting('commission_withdraw_limit', 100);
-        if ($limit > ($user->commission_balance / 100)) {
-            return $this->fail([422, __('The current required minimum withdrawal commission is :limit', ['limit' => $limit])]);
-        }
         try {
-            $ticketService = new TicketService();
-            $subject = __('[Commission Withdrawal Request] This ticket is opened by the system');
-            $message = sprintf(
-                "%s\r\n%s",
-                __('Withdrawal method') . "：" . $request->input('withdraw_method'),
-                __('Withdrawal account') . "：" . $request->input('withdraw_account')
-            );
-            $ticket = $ticketService->createTicket(
-                $request->user()->id,
-                $subject,
-                2,
-                $message
-            );
-        } catch (\Exception $e) {
-            throw $e;
+            // SB-MONEY-016: the request is recorded as a structured
+            // withdrawal with its amount frozen in the same
+            // transaction that opens the ticket. Previously the
+            // ticket carried no amount and nothing was frozen, so
+            // the same commission could be requested repeatedly or
+            // transferred away while a payout was pending. One
+            // pending withdrawal per user; the amount is the full
+            // available commission at request time (the semantics
+            // admins already settled against), and the reference +
+            // amount are quoted on the ticket so settlement can be
+            // matched exactly.
+            $ticket = DB::transaction(function () use ($request, $limit) {
+                $user = User::lockForUpdate()->find($request->user()->id);
+                if (!$user) {
+                    throw new ApiException(__('The user does not exist'));
+                }
+                if (CommissionWithdrawal::where('user_id', $user->id)
+                    ->where('status', CommissionWithdrawal::STATUS_PENDING)
+                    ->exists()) {
+                    throw new ApiException(__('You already have a pending withdrawal request'));
+                }
+                $available = CommissionWithdrawal::availableCommission($user);
+                if ($limit > ($available / 100)) {
+                    throw new ApiException(__('The current required minimum withdrawal commission is :limit', ['limit' => $limit]));
+                }
+                $withdrawal = CommissionWithdrawal::create([
+                    'user_id' => $user->id,
+                    'reference' => 'CW-' . Helper::guid(),
+                    'amount_cents' => $available,
+                    'method' => $request->input('withdraw_method'),
+                    'account' => $request->input('withdraw_account'),
+                    'status' => CommissionWithdrawal::STATUS_PENDING,
+                ]);
+                $ticketService = new TicketService();
+                $subject = __('[Commission Withdrawal Request] This ticket is opened by the system');
+                $message = sprintf(
+                    "%s\r\n%s\r\n%s\r\n%s",
+                    __('Withdrawal method') . "：" . $request->input('withdraw_method'),
+                    __('Withdrawal account') . "：" . $request->input('withdraw_account'),
+                    __('Withdrawal amount') . "：" . number_format($available / 100, 2),
+                    __('Withdrawal reference') . "：" . $withdrawal->reference
+                );
+                $ticket = $ticketService->createTicket(
+                    $user->id,
+                    $subject,
+                    2,
+                    $message
+                );
+                $withdrawal->ticket_id = $ticket->id;
+                $withdrawal->save();
+                return $ticket;
+            });
+        } catch (ApiException $e) {
+            return $this->fail([422, $e->getMessage()]);
         }
         HookManager::call('ticket.create.after', $ticket);
         return $this->success(true);

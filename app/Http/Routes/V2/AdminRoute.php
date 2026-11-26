@@ -126,6 +126,14 @@ class AdminRoute
                 $router->post('/detail', [OrderController::class, 'detail']);
             });
 
+            // Commission withdrawals (SB-MONEY-016)
+            $router->group([
+                'prefix' => 'commission-withdraw'
+            ], function ($router) {
+                $router->post('/settle', [\App\Http\Controllers\V2\Admin\CommissionWithdrawalController::class, 'settle']);
+                $router->post('/reject', [\App\Http\Controllers\V2\Admin\CommissionWithdrawalController::class, 'reject']);
+            });
+
             // User
             $router->group([
                 'prefix' => 'user'

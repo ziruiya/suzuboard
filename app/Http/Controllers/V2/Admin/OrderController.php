@@ -260,7 +260,24 @@ class OrderController extends Controller
                 DB::rollBack();
                 return $this->fail([500, '订单创建失败']);
             }
+
+            // SB-MONEY-012: run the same fulfilment initialization as
+            // user checkout (enterprise purpose + kit hold, machine
+            // region + fulfilment record). Without it an admin-created
+            // business order could be paid and completed while no
+            // delivery record existed at all.
+            $orderService->initializeBusinessEntitlements(
+                $order,
+                $plan,
+                $user,
+                $request->input('enterprise_purpose'),
+                $request->input('machine_region')
+            );
+
             DB::commit();
+        } catch (\App\Exceptions\ApiException $e) {
+            DB::rollBack();
+            return $this->fail([400, $e->getMessage()]);
         } catch (\Exception $e) {
             DB::rollBack();
             throw $e;

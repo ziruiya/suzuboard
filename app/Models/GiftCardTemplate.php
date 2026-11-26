@@ -203,8 +203,14 @@ class GiftCardTemplate extends Model
                 if ($now >= $festivalConfig['start_time'] && $now <= $festivalConfig['end_time']) {
                     $bonus = data_get($festivalConfig, 'festival_bonus', 1.0);
                     if ($bonus > 1.0) {
+                        // SB-MONEY-013: the bonus may only scale
+                        // quantity rewards. The old loop multiplied
+                        // EVERY numeric field: plan_id silently became
+                        // a different plan, and invite_reward_rate
+                        // (a fraction like 0.2) was int-truncated to 0.
+                        $scalableQuantities = ['balance', 'transfer_enable', 'device_limit', 'expire_days', 'plan_validity_days'];
                         foreach ($actualRewards as $key => &$value) {
-                            if (is_numeric($value)) {
+                            if (in_array($key, $scalableQuantities, true) && is_numeric($value)) {
                                 $value = intval($value * $bonus);
                             }
                         }

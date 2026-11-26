@@ -192,13 +192,18 @@ class GiftCardService
 
         if (isset($rewards['plan_id'])) {
             $plan = Plan::find($rewards['plan_id']);
-            if ($plan) {
-                $userService->assignPlan(
-                    $this->user,
-                    $plan,
-                    $rewards['plan_validity_days'] ?? 0
-                );
+            // SB-MONEY-013: a plan reward that cannot be delivered
+            // must abort the redemption (the surrounding transaction
+            // rolls back and the code is NOT consumed). Silently
+            // skipping it burned the code for nothing.
+            if (!$plan) {
+                throw new ApiException('礼品卡套餐奖励不存在，兑换中止');
             }
+            $userService->assignPlan(
+                $this->user,
+                $plan,
+                $rewards['plan_validity_days'] ?? 0
+            );
         } else {
             // 只有在不是套餐卡的情况下，才处理独立的有效期奖励
             if (isset($rewards['expire_days']) && $rewards['expire_days'] > 0) {

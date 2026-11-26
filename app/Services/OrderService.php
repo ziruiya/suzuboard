@@ -82,18 +82,40 @@ class OrderService
                 throw new ApiException(__('The user does not exist'));
             }
 
+            // SB-MONEY-014: re-validate against the row-locked plan
+            // inside the transaction. The caller's validatePurchase()
+            // ran outside any lock, so the sell switch and the
+            // capacity count (which now includes other buyers' pending
+            // orders) could both change between check and insert;
+            // holding the plan row lock serializes order creation per
+            // plan and makes the checks decisive.
+            $lockedPlan = Plan::lockForUpdate()->find($plan->id);
+            if (!$lockedPlan) {
+                throw new ApiException(__('Subscription plan does not exist'));
+            }
+            (new PlanService($lockedPlan))->validatePurchase($user, $period);
+            $plan = $lockedPlan;
+
             if ($userService->isNotCompleteOrderByUserId($user->id)) {
                 throw new ApiException(__('You have an unpaid or pending order, please try again later or cancel it'));
             }
 
             $newPeriod = PlanService::getPeriodKey($period);
 
+            // SB-MONEY-011: the price boundary converts to integer
+            // cents decimal-safely — the old (int)($price * 100) cast
+            // truncated through binary floating point (19.99 -> 1998).
+            $priceCents = \App\Utils\MoneyAmount::priceToCents(optional($plan->prices)[$newPeriod]);
+            if ($priceCents === null) {
+                throw new ApiException(__('Subscription price is invalid'));
+            }
+
             $order = new Order([
                 'user_id' => $user->id,
                 'plan_id' => $plan->id,
                 'period' => $newPeriod,
                 'trade_no' => Helper::generateOrderNo(),
-                'total_amount' => (int) (optional($plan->prices)[$newPeriod] * 100),
+                'total_amount' => $priceCents,
             ]);
 
             $orderService = new self($order);
@@ -115,52 +137,7 @@ class OrderService
                 throw new ApiException(__('Failed to create order'));
             }
 
-            // SB-ENT-INV-01: enterprise plans require the primary purpose to
-            // be fixed on the order before payment; a READY kit is held for
-            // 30 minutes inside the same transaction.
-            if ($plan->enterprise_purpose_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
-                $code = $enterprisePurposeCode;
-                if (!$code && $user->enterprise_kit_id) {
-                    $existingKit = \App\Models\EnterpriseInventoryKit::find($user->enterprise_kit_id);
-                    $code = $existingKit?->purpose?->code;
-                }
-                // Model A (D06): resolve through the SKU catalog so batch-1
-                // legacy purpose codes (JP_TIKTOK / JP_SHOPPING / HK_TRADE /
-                // HK_GENERAL) keep mapping to their model-A SKU and renewals
-                // keep finding the customer's original kit.
-                $code = \App\Services\Enterprise\EnterpriseSkuCatalog::normalizeCode($code);
-                $purpose = $code
-                    ? \App\Models\EnterprisePurpose::where('code', $code)->where('is_active', true)->first()
-                    : null;
-                if (!$purpose) {
-                    throw new ApiException(__('Please select the primary purpose for the enterprise plan'));
-                }
-                $order->enterprise_purpose_code = $purpose->code;
-                $order->save();
-                app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
-                    ->holdForOrder($order, $purpose, $user);
-            }
-
-            // Business plans batch 3: the dedicated-VPS plan cannot become
-            // a payable order without a region. The region is snapshotted
-            // onto the order (immutable) and the fulfilment record is born
-            // in WAITING_PAYMENT inside the same transaction.
-            if ($plan->machine_region_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
-                $region = \App\Services\Machine\MachineRegionCatalog::normalize($machineRegionCode);
-                if (!$region) {
-                    // Renewals inherit the region of the active fulfilment.
-                    $active = app(\App\Services\Machine\MachineFulfillmentService::class)
-                        ->activeForUser((int) $user->id, (int) $plan->id);
-                    $region = $active?->region_code;
-                }
-                if (!$region) {
-                    throw new ApiException(__('Please select a region for the dedicated-VPS plan'));
-                }
-                $order->machine_region_code = $region;
-                $order->save();
-                app(\App\Services\Machine\MachineFulfillmentService::class)
-                    ->createForOrder($order, $plan, $region, $user);
-            }
+            $orderService->initializeBusinessEntitlements($order, $plan, $user, $enterprisePurposeCode, $machineRegionCode);
 
             HookManager::call('order.create.after', $order);
             // 兼容旧钩子
@@ -168,6 +145,71 @@ class OrderService
 
             return $order;
         });
+    }
+
+    /**
+     * SB-MONEY-012: the business-plan initialization an order needs
+     * before it can ever be fulfilled — enterprise purpose + kit hold,
+     * dedicated-machine region + fulfilment record. Extracted from
+     * createFromRequest so the admin assign path creates the SAME
+     * records; admin-created enterprise/machine orders previously
+     * carried neither, so paying one completed the order while no
+     * delivery ever started. Must be called inside a transaction,
+     * after the order has been saved.
+     */
+    public function initializeBusinessEntitlements(
+        Order $order,
+        Plan $plan,
+        User $user,
+        ?string $enterprisePurposeCode = null,
+        ?string $machineRegionCode = null,
+    ): void {
+        // SB-ENT-INV-01: enterprise plans require the primary purpose to
+        // be fixed on the order before payment; a READY kit is held for
+        // 30 minutes inside the same transaction.
+        if ($plan->enterprise_purpose_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
+            $code = $enterprisePurposeCode;
+            if (!$code && $user->enterprise_kit_id) {
+                $existingKit = \App\Models\EnterpriseInventoryKit::find($user->enterprise_kit_id);
+                $code = $existingKit?->purpose?->code;
+            }
+            // Model A (D06): resolve through the SKU catalog so batch-1
+            // legacy purpose codes (JP_TIKTOK / JP_SHOPPING / HK_TRADE /
+            // HK_GENERAL) keep mapping to their model-A SKU and renewals
+            // keep finding the customer's original kit.
+            $code = \App\Services\Enterprise\EnterpriseSkuCatalog::normalizeCode($code);
+            $purpose = $code
+                ? \App\Models\EnterprisePurpose::where('code', $code)->where('is_active', true)->first()
+                : null;
+            if (!$purpose) {
+                throw new ApiException(__('Please select the primary purpose for the enterprise plan'));
+            }
+            $order->enterprise_purpose_code = $purpose->code;
+            $order->save();
+            app(\App\Services\Enterprise\EnterpriseAssignmentService::class)
+                ->holdForOrder($order, $purpose, $user);
+        }
+
+        // Business plans batch 3: the dedicated-VPS plan cannot become
+        // a payable order without a region. The region is snapshotted
+        // onto the order (immutable) and the fulfilment record is born
+        // in WAITING_PAYMENT inside the same transaction.
+        if ($plan->machine_region_required && $order->period !== Plan::PERIOD_RESET_TRAFFIC) {
+            $region = \App\Services\Machine\MachineRegionCatalog::normalize($machineRegionCode);
+            if (!$region) {
+                // Renewals inherit the region of the active fulfilment.
+                $active = app(\App\Services\Machine\MachineFulfillmentService::class)
+                    ->activeForUser((int) $user->id, (int) $plan->id);
+                $region = $active?->region_code;
+            }
+            if (!$region) {
+                throw new ApiException(__('Please select a region for the dedicated-VPS plan'));
+            }
+            $order->machine_region_code = $region;
+            $order->save();
+            app(\App\Services\Machine\MachineFulfillmentService::class)
+                ->createForOrder($order, $plan, $region, $user);
+        }
     }
 
     public function open(): void
@@ -253,6 +295,25 @@ class OrderService
                 throw new \RuntimeException('用户信息保存失败');
             }
 
+            // SB-MONEY-009: the configured open event (e.g. event 1 =
+            // traffic reset) is part of what "opened" means. It used
+            // to run AFTER this transaction committed the COMPLETED
+            // status, so a failed event reset left a completed order
+            // whose mandated reset silently never happened and was
+            // never retried. Running it here makes a failure roll the
+            // whole open back: the order stays PROCESSING and the
+            // order checker retries it, exactly like the in-period
+            // resets above.
+            $eventId = match ((int) $order->type) {
+                Order::TYPE_NEW_PURCHASE => admin_setting('new_order_event_id', 0),
+                Order::TYPE_RENEWAL => admin_setting('renew_order_event_id', 0),
+                Order::TYPE_UPGRADE => admin_setting('change_order_event_id', 0),
+                default => 0,
+            };
+            if ($eventId) {
+                $this->openEvent($eventId);
+            }
+
             $order->status = Order::STATUS_COMPLETED;
             if (!$order->save()) {
                 throw new \RuntimeException('订单信息保存失败');
@@ -290,17 +351,9 @@ class OrderService
             }
         }
 
-        $eventId = match ((int) $order->type) {
-            Order::TYPE_NEW_PURCHASE => admin_setting('new_order_event_id', 0),
-            Order::TYPE_RENEWAL => admin_setting('renew_order_event_id', 0),
-            Order::TYPE_UPGRADE => admin_setting('change_order_event_id', 0),
-            default => 0,
-        };
-
-        if ($eventId) {
-            $this->openEvent($eventId);
-        }
-
+        // SB-MONEY-009: the open event itself now runs inside the
+        // transaction above (see the note there); only the hook stays
+        // post-commit.
         HookManager::call('order.open.after', $order);
     }
 
@@ -332,10 +385,18 @@ class OrderService
     public function setVipDiscount(User $user)
     {
         $order = $this->order;
+        // SB-MONEY-011: integer-cent percentage math, and the combined
+        // discount (coupon + VIP) is capped at the order's original
+        // total — stacking the two used to drive total_amount negative
+        // and get the order rejected at checkout.
         if ($user->discount) {
-            $order->discount_amount = $order->discount_amount + ($order->total_amount * ($user->discount / 100));
+            $order->discount_amount = (int) $order->discount_amount
+                + \App\Utils\MoneyAmount::percentOf((int) $order->total_amount, $user->discount);
         }
-        $order->total_amount = $order->total_amount - $order->discount_amount;
+        if ((int) $order->discount_amount > (int) $order->total_amount) {
+            $order->discount_amount = (int) $order->total_amount;
+        }
+        $order->total_amount = (int) $order->total_amount - (int) $order->discount_amount;
     }
 
     public function setInvite(User $user): void
@@ -363,10 +424,12 @@ class OrderService
 
         if (!$isCommission)
             return;
+        // SB-MONEY-011: integer-cent commission (was a float product
+        // fed into an integer column).
         if ($inviter->commission_rate) {
-            $order->commission_balance = $order->total_amount * ($inviter->commission_rate / 100);
+            $order->commission_balance = \App\Utils\MoneyAmount::percentOf((int) $order->total_amount, $inviter->commission_rate);
         } else {
-            $order->commission_balance = $order->total_amount * (admin_setting('invite_commission', 10) / 100);
+            $order->commission_balance = \App\Utils\MoneyAmount::percentOf((int) $order->total_amount, admin_setting('invite_commission', 10));
         }
     }
 
@@ -525,6 +588,24 @@ class OrderService
                 $order->status = Order::STATUS_CANCELLED;
                 if (!$order->save()) {
                     throw new \RuntimeException('Failed to save order status.');
+                }
+                // SB-MONEY-010: creating the order consumed one unit of
+                // the coupon's global limit_use; cancelling (user- or
+                // timeout-initiated — both funnel through here) must
+                // release it, or limited coupons are exhausted by
+                // orders that never transacted. Exactly-once is
+                // structural: this block only runs on the guarded
+                // PENDING -> CANCELLED transition under the row lock.
+                if ($order->coupon_id) {
+                    $coupon = \App\Models\Coupon::whereKey($order->coupon_id)
+                        ->lockForUpdate()
+                        ->first();
+                    if ($coupon && $coupon->limit_use !== null) {
+                        $coupon->limit_use = (int) $coupon->limit_use + 1;
+                        if (!$coupon->save()) {
+                            throw new \RuntimeException('Failed to release coupon usage.');
+                        }
+                    }
                 }
                 if ($order->balance_amount) {
                     $userService = new UserService();

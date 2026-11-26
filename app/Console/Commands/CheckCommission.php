@@ -115,8 +115,23 @@ class CheckCommission extends Command
             $inviter = User::find($inviteUserId);
             if (!$inviter) continue;
             if (!isset($commissionShareLevels[$l])) continue;
-            $commissionBalance = $order->commission_balance * ($commissionShareLevels[$l] / 100);
+            // SB-MONEY-011: integer-cent share (was a float product).
+            $commissionBalance = \App\Utils\MoneyAmount::percentOf((int) $order->commission_balance, $commissionShareLevels[$l]);
             if (!$commissionBalance) continue;
+            // SB-MONEY-005 (index hardening): one payout row per
+            // (order, level), backed by the unique key added in
+            // migration 000012. If this level is already on the books
+            // (e.g. an admin re-queued an order whose payout had in
+            // fact completed), the money for it must NOT move again —
+            // skip the increment and the row, but keep walking the
+            // invite chain so the remaining levels stay consistent.
+            $alreadyPaid = CommissionLog::where('trade_no', $order->trade_no)
+                ->where('level', $l)
+                ->exists();
+            if ($alreadyPaid) {
+                $inviteUserId = $inviter->invite_user_id;
+                continue;
+            }
             if ((int)admin_setting('withdraw_close_enable', 0)) {
                 $inviter->increment('balance', $commissionBalance);
             } else {
@@ -131,7 +146,8 @@ class CheckCommission extends Command
                 'user_id' => $order->user_id,
                 'trade_no' => $order->trade_no,
                 'order_amount' => $order->total_amount,
-                'get_amount' => $commissionBalance
+                'get_amount' => $commissionBalance,
+                'level' => $l
             ]);
             $inviteUserId = $inviter->invite_user_id;
             // update order actual commission balance

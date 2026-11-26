@@ -85,6 +85,15 @@ class PlanService
             return;
         }
 
+        // SB-MONEY-014: the sell switch was never consulted on the
+        // order path — a plan kept visible with sales off could still
+        // be ordered. Sales-off blocks new purchases and plan changes;
+        // same-plan renewals stay governed by the renew switch (the
+        // admin's explicit "existing customers may renew" control).
+        if ($user->plan_id !== $this->plan->id && !$this->plan->sell) {
+            throw new ApiException(__('This subscription has been sold out, please choose another subscription'));
+        }
+
         if ($user->plan_id !== $this->plan->id && !$this->hasCapacity($this->plan)) {
             throw new ApiException(__('Current product is sold out'));
         }
@@ -175,7 +184,21 @@ class PlanService
             })
             ->count();
 
-        return ($plan->capacity_limit - $activeUserCount) > 0;
+        // SB-MONEY-014: unpaid orders hold capacity too. Counting
+        // only active users let any number of buyers check out the
+        // last seat concurrently and all complete. A pending order
+        // occupies a seat until it is paid (then its user becomes an
+        // active user and is counted there) or cancelled by the
+        // 2-hour timeout; processing orders are paid and in flight.
+        // Renewals are excluded — a renewal extends an already
+        // counted active seat.
+        $pendingOrderCount = \App\Models\Order::where('plan_id', $plan->id)
+            ->whereIn('status', [\App\Models\Order::STATUS_PENDING, \App\Models\Order::STATUS_PROCESSING])
+            ->where('type', '!=', \App\Models\Order::TYPE_RENEWAL)
+            ->where('created_at', '>', time() - 7200)
+            ->count();
+
+        return ($plan->capacity_limit - $activeUserCount - $pendingOrderCount) > 0;
     }
 
     public function getAvailablePeriods(Plan $plan): array

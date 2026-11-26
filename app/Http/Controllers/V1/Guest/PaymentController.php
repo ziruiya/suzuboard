@@ -29,7 +29,11 @@ class PaymentController extends Controller
                 // (e.g. CoinPayments "IPN OK: pending"): nothing to handle.
                 return $verify;
             }
-            if (!$this->handle($verify['trade_no'], $verify['callback_no'], $verify)) {
+            // SB-MONEY-015: identify the payment instance that sent
+            // this callback so handle() can reconcile against the
+            // checkout attempt that instance issued.
+            $paymentId = optional(\App\Models\Payment::where('uuid', $uuid)->first())->id;
+            if (!$this->handle($verify['trade_no'], $verify['callback_no'], $verify, $paymentId)) {
                 return $this->fail([400, 'handle error']);
             }
             return (isset($verify['custom_result']) ? $verify['custom_result'] : 'success');
@@ -39,13 +43,25 @@ class PaymentController extends Controller
         }
     }
 
-    private function handle($tradeNo, $callbackNo, array $verify = [])
+    private function handle($tradeNo, $callbackNo, array $verify = [], $paymentId = null)
     {
         $order = Order::where('trade_no', $tradeNo)->first();
         if (!$order) {
             return $this->fail([400202, 'order is not found']);
         }
         if ($order->status !== Order::STATUS_PENDING) {
+            // SB-MONEY-015: a re-notification of the transaction that
+            // already paid this order is an idempotent ack. A
+            // DIFFERENT transaction number on an already-paid order
+            // is a second real payment (the customer paid two
+            // checkout attempts): record it durably for manual
+            // reconciliation instead of acknowledging it into
+            // oblivion with its transaction number recorded nowhere.
+            if ($order->status !== Order::STATUS_CANCELLED
+                && $callbackNo
+                && (string) $order->callback_no !== (string) $callbackNo) {
+                return $this->recordReceiptOnPaidOrder($order, $callbackNo, $verify);
+            }
             // SB-MONEY-002: a verified successful callback for an order
             // that was already cancelled is real money received. Record
             // the receipt on the order before acknowledging, so the
@@ -80,15 +96,27 @@ class PaymentController extends Controller
         // and reports that quote — reconcile against the quote, not the
         // bare total, or every fee-bearing payment is rejected.
         $expectedAmount = (int) $order->total_amount + (int) ($order->handling_amount ?? 0);
+        $matchedAttemptId = null;
         if (isset($verify['paid_amount_cents'])
             && (int) $verify['paid_amount_cents'] !== $expectedAmount) {
-            Log::warning('payment notify amount mismatch', [
-                'trade_no' => $order->trade_no,
-                'paid_amount_cents' => $verify['paid_amount_cents'],
-                'expected_amount_cents' => $expectedAmount,
-                'order_total_amount' => $order->total_amount,
-            ]);
-            return false;
+            // SB-MONEY-015: the callback may belong to an earlier
+            // checkout attempt — the customer paid the first
+            // gateway's link after re-checking-out with a second
+            // method, whose quote overwrote the order's fields.
+            // Reconcile against the recorded attempts (preferring
+            // the attempt issued by the payment instance that sent
+            // this callback) before failing closed.
+            $matchedAttempt = $this->matchPaymentAttempt($order, (int) $verify['paid_amount_cents'], $paymentId);
+            if (!$matchedAttempt) {
+                Log::warning('payment notify amount mismatch', [
+                    'trade_no' => $order->trade_no,
+                    'paid_amount_cents' => $verify['paid_amount_cents'],
+                    'expected_amount_cents' => $expectedAmount,
+                    'order_total_amount' => $order->total_amount,
+                ]);
+                return false;
+            }
+            $matchedAttemptId = $matchedAttempt->id;
         }
         $orderService = new OrderService($order);
         if (!$orderService->paid($callbackNo)) {
@@ -104,7 +132,105 @@ class PaymentController extends Controller
             return $this->recordReceiptOnCancelledOrder($freshOrder, $callbackNo, $verify);
         }
 
+        // SB-MONEY-015: stamp the attempt this payment came through,
+        // so the books show which issued quote was actually paid.
+        if ($matchedAttemptId) {
+            \App\Models\OrderPaymentAttempt::whereKey($matchedAttemptId)
+                ->update(['callback_no' => (string) $callbackNo]);
+        }
+
         HookManager::call('payment.notify.success', $order);
+        return true;
+    }
+
+    /**
+     * SB-MONEY-015: find a recorded checkout attempt for this order
+     * whose payable total equals the amount the gateway reports.
+     * Attempts issued by the payment instance that sent this callback
+     * are preferred; any attempt of the order is accepted as a
+     * fallback (gateways do not always identify their instance
+     * reliably, and the amount itself is the reconciled quantity).
+     */
+    private function matchPaymentAttempt(Order $order, int $paidAmountCents, $paymentId): ?\App\Models\OrderPaymentAttempt
+    {
+        $query = \App\Models\OrderPaymentAttempt::where('order_id', $order->id)
+            ->where('payable_cents', $paidAmountCents)
+            ->orderByDesc('id');
+        if ($paymentId) {
+            $own = (clone $query)->where('payment_id', $paymentId)->first();
+            if ($own) {
+                return $own;
+            }
+        }
+        return $query->first();
+    }
+
+    /**
+     * SB-MONEY-015: persist a verified receipt that arrived for an
+     * order which is already paid (PROCESSING/COMPLETED) under a
+     * different transaction number — a second real payment, typically
+     * the customer paying two checkout attempts. The order itself is
+     * untouched (its entitlement was granted by the first payment);
+     * the receipt goes to suzu_order_receipts for manual
+     * reconciliation (refund or credit is an admin decision).
+     *
+     * Acknowledgement rules mirror the cancelled-order path
+     * (SB-MONEY-002): incomplete evidence (no amount/currency) fails
+     * so the gateway keeps retrying; a definitive currency mismatch
+     * is logged and acknowledged without recording; a recorded (or
+     * already recorded) receipt is acknowledged.
+     */
+    private function recordReceiptOnPaidOrder(Order $order, $callbackNo, array $verify): bool
+    {
+        $missing = [];
+        if (!isset($verify['paid_amount_cents'])) {
+            $missing[] = 'paid_amount_cents';
+        }
+        if (!isset($verify['paid_currency'])) {
+            $missing[] = 'paid_currency';
+        }
+        if ($missing) {
+            Log::warning('payment notify for paid order: receipt evidence incomplete, receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'callback_no' => $callbackNo,
+                'missing' => $missing,
+            ]);
+            return false;
+        }
+        if (strtoupper((string) $verify['paid_currency']) !== 'CNY') {
+            Log::warning('payment notify for paid order: currency mismatch, receipt not recorded', [
+                'trade_no' => $order->trade_no,
+                'paid_currency' => $verify['paid_currency'],
+            ]);
+            return true;
+        }
+        try {
+            if (\App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->exists()) {
+                return true;
+            }
+            \App\Models\OrderReceipt::create([
+                'order_id' => $order->id,
+                'callback_no' => (string) $callbackNo,
+                'paid_amount_cents' => (int) $verify['paid_amount_cents'],
+                'paid_currency' => strtoupper((string) $verify['paid_currency']),
+                'note' => 'second receipt on already-paid order; recorded for manual reconciliation',
+            ]);
+        } catch (\Exception $e) {
+            if (\App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->exists()) {
+                return true;
+            }
+            Log::error('payment notify for paid order: receipt could not be persisted', [
+                'trade_no' => $order->trade_no,
+                'callback_no' => $callbackNo,
+                'exception' => $e->getMessage(),
+            ]);
+            return false;
+        }
+        Log::error('payment received for already-paid order; second receipt recorded for manual reconciliation', [
+            'trade_no' => $order->trade_no,
+            'callback_no' => $callbackNo,
+            'paid_amount_cents' => $verify['paid_amount_cents'],
+        ]);
         return true;
     }
 

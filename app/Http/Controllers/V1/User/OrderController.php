@@ -163,8 +163,27 @@ class OrderController extends Controller
             $order->handling_amount = (int) round(($order->total_amount * ($payment->handling_fee_percent / 100)) + $payment->handling_fee_fixed);
         }
         $order->payment_id = $method;
-        if (!$order->save())
+        // SB-MONEY-015: persist this checkout's quote as a payment
+        // attempt in the same transaction as the order update. A
+        // later re-checkout overwrites the order's fields, but the
+        // attempt rows keep every issued quote, so a callback for an
+        // earlier attempt can still be reconciled against what that
+        // gateway was actually told to charge.
+        try {
+            DB::transaction(function () use ($order, $method) {
+                if (!$order->save()) {
+                    throw new \RuntimeException('Failed to save order payment method.');
+                }
+                \App\Models\OrderPaymentAttempt::create([
+                    'order_id' => $order->id,
+                    'payment_id' => $method,
+                    'handling_amount' => (int) ($order->handling_amount ?? 0),
+                    'payable_cents' => (int) $order->total_amount + (int) ($order->handling_amount ?? 0),
+                ]);
+            });
+        } catch (\Exception $e) {
             return $this->fail([400, __('Request failed, please try again later')]);
+        }
         $result = $paymentService->pay([
             'trade_no' => $tradeNo,
             'total_amount' => isset($order->handling_amount) ? ($order->total_amount + $order->handling_amount) : $order->total_amount,
