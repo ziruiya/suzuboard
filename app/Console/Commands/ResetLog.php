@@ -86,11 +86,19 @@ class ResetLog extends Command
         // with no inbox row at all, follow the 48-hour retention as
         // before.
         //
-        // Implementation: the protected family keys are plucked first,
-        // then the delete excludes them. The unprocessed-inbox set is
-        // tiny by construction (only batches stranded by an outage),
-        // and the lookup rides the (status, created_at) index from
-        // migration 000010 and the batch_hash unique index.
+        // Implementation (SB-P2 INBOX-PLUCK): the exclusion is a
+        // subquery, not a pluck. The previous shape loaded every
+        // unprocessed inbox batch_hash into PHP memory and bound the
+        // whole set as NOT IN (?, ?, ...) — the stranded set is tiny
+        // by construction, but "tiny" is an operational assumption,
+        // not a bound: a long accounting outage could strand enough
+        // batches to make the in-memory set and the placeholder list
+        // the prune's own failure mode. The subquery form keeps the
+        // set inside the database at any size. The inner select is
+        // wrapped in a derived table because MySQL refuses a DELETE
+        // whose subquery reads the target table directly (error
+        // 1093); the derived-table form materializes the key set
+        // first and is accepted by MySQL, PostgreSQL and SQLite.
         //
         // Fallback: when the status column does not exist (migration
         // 000010 not applied) there is no inbox and therefore no
@@ -100,16 +108,17 @@ class ResetLog extends Command
             $prune = \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
                 ->where('created_at', '<', time() - 172800);
             if (\Illuminate\Support\Facades\Schema::hasColumn('suzu_traffic_batches', 'status')) {
-                $protectedKeys = \Illuminate\Support\Facades\DB::table('suzu_traffic_batches')
-                    ->where('processor', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
-                    ->where(function ($query) {
-                        $query->whereNull('status')
-                            ->orWhere('status', '<>', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
-                    })
-                    ->pluck('batch_hash');
-                if ($protectedKeys->isNotEmpty()) {
-                    $prune->whereNotIn('batch_hash', $protectedKeys->all());
-                }
+                $prune->whereNotIn('batch_hash', function ($query) {
+                    $query->select('batch_hash')->fromSub(function ($sub) {
+                        $sub->from('suzu_traffic_batches')
+                            ->select('batch_hash')
+                            ->where('processor', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
+                            ->where(function ($inner) {
+                                $inner->whereNull('status')
+                                    ->orWhere('status', '<>', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
+                            });
+                    }, 'protected_families');
+                });
             }
             $prune->delete();
         }

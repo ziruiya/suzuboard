@@ -210,8 +210,10 @@ class UserService
             }
 
             TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash, $batchId, $contentHash, $collectedFrom, $collectedTo);
-            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);
-            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash);
+            // SB-TA-007: both stat jobs bucket by this same receipt
+            // timestamp instead of their own execution clocks.
+            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash, $timestamp);
+            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash, $timestamp);
         });
     }
 

@@ -25,6 +25,7 @@ class StatServerJob implements ShouldQueue
     protected ?string $batchHash;
     protected ?string $batchId;
     protected ?string $contentHash;
+    protected ?int $timestamp;
 
     public $tries = 3;
     public $timeout = 60;
@@ -41,7 +42,7 @@ class StatServerJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null)
+    public function __construct(array $server, array $data, $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null, ?int $timestamp = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
@@ -51,13 +52,17 @@ class StatServerJob implements ShouldQueue
         $this->batchHash = $batchHash;
         $this->batchId = $batchId;
         $this->contentHash = $contentHash;
+        $this->timestamp = $timestamp;
     }
 
     public function handle(): void
     {
+        // SB-TA-007: bucket from the batch's receipt timestamp, not
+        // the worker execution clock (see StatUserJob).
+        $bucketTs = $this->timestamp ?? time();
         $recordAt = $this->recordType === 'm'
-            ? strtotime(date('Y-m-01'))
-            : strtotime(date('Y-m-d'));
+            ? strtotime(date('Y-m-01', $bucketTs))
+            : strtotime(date('Y-m-d', $bucketTs));
 
         $u = $d = 0;
         foreach ($this->data as $traffic) {

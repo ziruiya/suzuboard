@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -72,27 +71,43 @@ class TrafficBatchGuard
      * Claim a batch for a processor. Returns true when this caller owns
      * processing; false when the batch was already claimed (replay).
      * Must be called inside the transaction that performs the writes.
+     *
+     * SB-TA-005: the claim insert must never raise on a uniqueness
+     * conflict. The previous try-insert/catch-query shape breaks on
+     * PostgreSQL: a unique violation aborts the surrounding
+     * transaction, so the catch block's exists() probe runs inside a
+     * failed transaction and throws SQLSTATE 25P02 instead of
+     * reporting "already processed" — every replayed batch turned
+     * into a failing, retrying job. insertOrIgnore compiles to
+     * INSERT IGNORE (MySQL), INSERT ... ON CONFLICT DO NOTHING
+     * (PostgreSQL) or INSERT OR IGNORE (SQLite): the conflict is
+     * absorbed by the statement itself, the transaction stays usable,
+     * and the affected-row count is the ownership verdict.
      */
     public static function claim(string $batchHash, int $serverId, string $processor): bool
     {
-        try {
-            DB::table('suzu_traffic_batches')->insert([
-                'batch_hash' => $batchHash,
-                'server_id' => $serverId,
-                'processor' => $processor,
-                'created_at' => time(),
-            ]);
+        $inserted = DB::table('suzu_traffic_batches')->insertOrIgnore([
+            'batch_hash' => $batchHash,
+            'server_id' => $serverId,
+            'processor' => $processor,
+            'created_at' => time(),
+        ]);
+        if ($inserted === 1) {
             return true;
-        } catch (QueryException $e) {
-            $exists = DB::table('suzu_traffic_batches')
-                ->where('batch_hash', $batchHash)
-                ->where('processor', $processor)
-                ->exists();
-            if ($exists) {
-                return false;
-            }
-            throw $e;
         }
+        // Ignored: a replay only if the marker row is really there.
+        // Anything else (the row vanished in a prune race, or the
+        // driver ignored the insert for a non-uniqueness reason) must
+        // fail loudly so the job retries instead of silently dropping
+        // the batch.
+        $exists = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchHash)
+            ->where('processor', $processor)
+            ->exists();
+        if (!$exists) {
+            throw new \RuntimeException('traffic batch claim: row vanished after ignored insert');
+        }
+        return false;
     }
 
     /**
@@ -148,23 +163,29 @@ class TrafficBatchGuard
             $row['content_hash'] = $contentHash;
         }
 
-        try {
-            DB::table('suzu_traffic_batches')->insert($row);
+        // SB-TA-005: conflict-tolerant insert (see claim()); the
+        // follow-up read below is a plain SELECT in a healthy
+        // transaction, never a probe inside an aborted one.
+        $inserted = DB::table('suzu_traffic_batches')->insertOrIgnore($row);
+        if ($inserted === 1) {
             return self::CLAIM_OK;
-        } catch (QueryException $e) {
-            $existing = DB::table('suzu_traffic_batches')
-                ->where('batch_hash', $batchKey)
-                ->where('processor', $processor)
-                ->first();
-            if (!$existing) {
-                throw $e;
-            }
-            $stored = $existing->content_hash ?? null;
-            if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
-                return self::CLAIM_CONFLICT;
-            }
-            return self::CLAIM_REPLAY;
         }
+        $existing = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->where('processor', $processor)
+            ->first();
+        if (!$existing) {
+            // The insert was ignored but no row is visible: the row
+            // vanished between the two statements (prune race). Fail
+            // loudly so the job retries instead of silently treating
+            // the batch as processed or unprocessed.
+            throw new \RuntimeException('traffic batch claim: row vanished after ignored insert');
+        }
+        $stored = $existing->content_hash ?? null;
+        if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
+            return self::CLAIM_CONFLICT;
+        }
+        return self::CLAIM_REPLAY;
     }
 
     /**
@@ -207,34 +228,37 @@ class TrafficBatchGuard
      */
     public static function receiveIdentified(string $batchKey, int $serverId, ?string $contentHash, string $payload): string
     {
-        try {
-            DB::table('suzu_traffic_batches')->insert([
-                'batch_hash' => $batchKey,
-                'server_id' => $serverId,
-                'processor' => self::PROCESSOR_INBOX,
-                'content_hash' => $contentHash,
-                'payload' => $payload,
-                'status' => self::STATUS_RECEIVED,
-                'created_at' => time(),
-            ]);
+        // SB-TA-005: conflict-tolerant insert (see claim()). A genuine
+        // persistence failure still throws out of insertOrIgnore and
+        // the caller surfaces it as an HTTP error, so the agent keeps
+        // the batch — only the uniqueness replay is absorbed.
+        $inserted = DB::table('suzu_traffic_batches')->insertOrIgnore([
+            'batch_hash' => $batchKey,
+            'server_id' => $serverId,
+            'processor' => self::PROCESSOR_INBOX,
+            'content_hash' => $contentHash,
+            'payload' => $payload,
+            'status' => self::STATUS_RECEIVED,
+            'created_at' => time(),
+        ]);
+        if ($inserted === 1) {
             return self::RECEIPT_OK;
-        } catch (QueryException $e) {
-            $existing = DB::table('suzu_traffic_batches')
-                ->where('batch_hash', $batchKey)
-                ->where('processor', self::PROCESSOR_INBOX)
-                ->first();
-            if (!$existing) {
-                // Not a replay — a genuine receipt failure. The caller
-                // must surface it as an HTTP error so the agent keeps
-                // the batch.
-                throw $e;
-            }
-            $stored = $existing->content_hash ?? null;
-            if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
-                return self::RECEIPT_CONFLICT;
-            }
-            return self::RECEIPT_REPLAY;
         }
+        $existing = DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $batchKey)
+            ->where('processor', self::PROCESSOR_INBOX)
+            ->first();
+        if (!$existing) {
+            // Not a replay — the row vanished between the two
+            // statements (prune race). Throw so the caller surfaces an
+            // HTTP error and the agent keeps the batch.
+            throw new \RuntimeException('traffic batch receipt: row vanished after ignored insert');
+        }
+        $stored = $existing->content_hash ?? null;
+        if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
+            return self::RECEIPT_CONFLICT;
+        }
+        return self::RECEIPT_REPLAY;
     }
 
     /**

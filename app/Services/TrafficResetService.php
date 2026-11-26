@@ -33,10 +33,26 @@ class TrafficResetService
   /**
    * Perform the traffic reset for a user.
    */
+  /**
+   * SB-TA-011: one-shot audit metadata channel for the next
+   * performReset() call on this instance. manualReset() deposits the
+   * caller-collected metadata (reason + admin id) here and
+   * performReset() consumes it into the reset log written inside its
+   * transaction. A property channel is used instead of a fourth
+   * performReset() parameter on purpose: performReset() is an
+   * override point (test doubles and downstream subclasses override
+   * it with the current three-parameter signature), and widening the
+   * signature is a fatal signature-compatibility break for every
+   * existing override.
+   */
+  private array $resetLogMetadata = [];
+
   public function performReset(User $user, string $triggerSource = TrafficResetLog::SOURCE_MANUAL, bool $onlyIfDue = false): bool
   {
+    $metadata = $this->resetLogMetadata;
+    $this->resetLogMetadata = [];
     try {
-      return DB::transaction(function () use ($user, $triggerSource, $onlyIfDue) {
+      return DB::transaction(function () use ($user, $triggerSource, $onlyIfDue, $metadata) {
         // SB-AUD-023: lock the user row and work from the freshly read
         // row. Previously the reset read u/d from the caller's possibly
         // stale in-memory model and wrote absolute zeroes without any
@@ -88,6 +104,11 @@ class TrafficResetService
         $this->recordResetLog($user, [
           'reset_type' => $this->getResetTypeFromPlan($locked->plan),
           'trigger_source' => $triggerSource,
+          // SB-TA-011: audit metadata collected by the caller (the
+          // admin controller's reason + admin id) must reach the log
+          // row written inside this same transaction; manualReset()
+          // collected it and silently dropped it before this fix.
+          'metadata' => $metadata !== [] ? $metadata : null,
           'old_upload' => $oldUpload,
           'old_download' => $oldDownload,
           'old_total' => $oldTotal,
@@ -146,10 +167,29 @@ class TrafficResetService
 
   /**
    * Get the first day of the next month.
+   *
+   * SB-TA-008: build from the first day of the CURRENT month and add
+   * one month. The previous addMonth()->startOfMonth() overflows at
+   * long month ends: Jan 31 + 1 month lands in early March, and
+   * startOfMonth() then returns Mar 1 — February is skipped whole.
    */
   private function getNextMonthFirstDay(Carbon $from): Carbon
   {
-    return $from->copy()->addMonth()->startOfMonth();
+    return $from->copy()->startOfMonth()->addMonth();
+  }
+
+  /**
+   * SB-TA-008: construct a (year, month, anchorDay) candidate with the
+   * anchor day clamped to the target month's last day BEFORE any
+   * comparison. Carbon's day()/month() setters overflow into the
+   * following month (day 31 in a 30-day month, Feb 29 in a non-leap
+   * year), so an unclamped candidate can silently become a date in
+   * the wrong month and be returned early.
+   */
+  private function clampedCandidate(int $year, int $month, int $anchorDay, array $time): Carbon
+  {
+    $lastDay = Carbon::create($year, $month, 1)->endOfMonth()->day;
+    return Carbon::create($year, $month, min($anchorDay, $lastDay))->setTime(...$time);
   }
 
   /**
@@ -166,23 +206,20 @@ class TrafficResetService
     $expiredAt = Carbon::createFromTimestamp($user->expired_at, config('app.timezone'));
     $resetDay = $expiredAt->day;
     $resetTime = [$expiredAt->hour, $expiredAt->minute, $expiredAt->second];
-    
-    $currentMonthTarget = $from->copy()->day($resetDay)->setTime(...$resetTime);
+
+    // SB-TA-008: BOTH candidates are clamped before comparison. The
+    // previous code clamped only the next-month candidate; the
+    // current-month candidate was built with day($resetDay), which
+    // overflows into the next month in short months (anchor 29–31 in
+    // February, anchor 31 in a 30-day month) and was then returned
+    // early as a date in the wrong month.
+    $currentMonthTarget = $this->clampedCandidate($from->year, $from->month, $resetDay, $resetTime);
     if ($currentMonthTarget->timestamp > $from->timestamp) {
       return $currentMonthTarget;
     }
-    
-    $nextMonthTarget = $from->copy()->startOfMonth()->addMonths(1)->day($resetDay)->setTime(...$resetTime);
-    
-    if ($nextMonthTarget->month !== ($from->month % 12) + 1) {
-      $nextMonth = ($from->month % 12) + 1;
-      $nextYear = $from->year + ($from->month === 12 ? 1 : 0);
-      $lastDayOfNextMonth = Carbon::create($nextYear, $nextMonth, 1)->endOfMonth()->day;
-      $targetDay = min($resetDay, $lastDayOfNextMonth);
-      $nextMonthTarget = Carbon::create($nextYear, $nextMonth, $targetDay)->setTime(...$resetTime);
-    }
-    
-    return $nextMonthTarget;
+
+    $nextMonth = $from->copy()->startOfMonth()->addMonth();
+    return $this->clampedCandidate($nextMonth->year, $nextMonth->month, $resetDay, $resetTime);
   }
 
   /**
@@ -209,21 +246,17 @@ class TrafficResetService
     $resetDay = $expiredAt->day;
     $resetTime = [$expiredAt->hour, $expiredAt->minute, $expiredAt->second];
 
-    $currentYearTarget = $from->copy()->month($resetMonth)->day($resetDay)->setTime(...$resetTime);
+    // SB-TA-008: same defect shape as the monthly path — only the
+    // next-year candidate was clamped; the current-year candidate
+    // overflowed (Feb 29 anchor in a non-leap year became Mar 1) and
+    // could be returned early. Both candidates are now built clamped
+    // (clampedCandidate takes the anchor month as the target month).
+    $currentYearTarget = $this->clampedCandidate($from->year, $resetMonth, $resetDay, $resetTime);
     if ($currentYearTarget->timestamp > $from->timestamp) {
       return $currentYearTarget;
     }
-    
-    $nextYearTarget = $from->copy()->startOfYear()->addYears(1)->month($resetMonth)->day($resetDay)->setTime(...$resetTime);
-    
-    if ($nextYearTarget->month !== $resetMonth) {
-      $nextYear = $from->year + 1;
-      $lastDayOfMonth = Carbon::create($nextYear, $resetMonth, 1)->endOfMonth()->day;
-      $targetDay = min($resetDay, $lastDayOfMonth);
-      $nextYearTarget = Carbon::create($nextYear, $resetMonth, $targetDay)->setTime(...$resetTime);
-    }
-    
-    return $nextYearTarget;
+
+    return $this->clampedCandidate($from->year + 1, $resetMonth, $resetDay, $resetTime);
   }
 
 
@@ -446,6 +479,10 @@ class TrafficResetService
       return false;
     }
 
+    // SB-TA-011: forward the audit metadata (reason + admin id) into
+    // the reset transaction so it lands on the reset log — via the
+    // one-shot channel documented on $resetLogMetadata.
+    $this->resetLogMetadata = $metadata;
     return $this->performReset($user, TrafficResetLog::SOURCE_MANUAL);
   }
 }

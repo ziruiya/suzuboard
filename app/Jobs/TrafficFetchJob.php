@@ -10,7 +10,6 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Redis;
 
 class TrafficFetchJob implements ShouldQueue
 {
@@ -57,7 +56,7 @@ class TrafficFetchJob implements ShouldQueue
         ksort($data);
         $userIds = array_keys($data);
 
-        $processed = DB::transaction(function () use ($data, $userIds) {
+        DB::transaction(function () use ($data, $userIds) {
             if (!TrafficBatchGuard::claimForProcessor(
                 $this->batchHash,
                 (int) ($this->server['id'] ?? 0),
@@ -134,6 +133,18 @@ class TrafficFetchJob implements ShouldQueue
                     );
             }
 
+            // SB-TA-006: the over-quota check event is persisted HERE,
+            // inside the quota transaction. The previous shape wrote
+            // the user ids to a Redis set only after this transaction
+            // committed; a failed write (or a worker dying in between)
+            // lost the signal permanently, because a retry of this job
+            // short-circuits on the batch claim above and never
+            // re-attempted the write. Inside the transaction the event
+            // exists exactly when the increments exist.
+            if (!empty($userIds)) {
+                \App\Models\TrafficPendingCheck::recordForUsers($userIds);
+            }
+
             return true;
         });
 
@@ -142,10 +153,6 @@ class TrafficFetchJob implements ShouldQueue
             // durable inbox row to 'processed' if the other two
             // processors have claimed the batch as well.
             TrafficBatchGuard::noteBatchProcessed($this->batchHash, (int) ($this->server['id'] ?? 0));
-        }
-
-        if ($processed && !empty($userIds)) {
-            Redis::sadd('traffic:pending_check', ...$userIds);
         }
     }
 }

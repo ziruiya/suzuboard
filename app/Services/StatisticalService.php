@@ -286,16 +286,21 @@ class StatisticalService
             $endAt = $times[1];
         }
 
-        $statistics = Server::whereHas(
-            'stats',
-            function ($query) use ($startAt, $endAt) {
-                $query->where('record_at', '>=', $startAt)
-                    ->where('record_at', '<', $endAt)
-                    ->where('record_type', 'd');
-            }
-        )
-            ->withSum('stats as u', 'u') // 预加载 u 的总和
-            ->withSum('stats as d', 'd') // 预加载 d 的总和
+        // SB-TA-009: the existence filter and the two aggregates must
+        // use the SAME range + record_type conditions. Previously
+        // whereHas() filtered by the requested range while withSum()
+        // aggregated the unfiltered stats relation, so the ranking
+        // summed every retained record (including out-of-range days)
+        // for every node that had any in-range record.
+        $rangeFilter = function ($query) use ($startAt, $endAt) {
+            $query->where('record_at', '>=', $startAt)
+                ->where('record_at', '<', $endAt)
+                ->where('record_type', 'd');
+        };
+
+        $statistics = Server::whereHas('stats', $rangeFilter)
+            ->withSum(['stats as u' => $rangeFilter], 'u') // 预加载 u 的总和
+            ->withSum(['stats as d' => $rangeFilter], 'd') // 预加载 d 的总和
             ->get()
             ->map(function ($item) {
                 return [

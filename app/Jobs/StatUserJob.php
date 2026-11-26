@@ -23,6 +23,7 @@ class StatUserJob implements ShouldQueue
     protected ?string $batchHash;
     protected ?string $batchId;
     protected ?string $contentHash;
+    protected ?int $timestamp;
 
     public $tries = 3;
     public $timeout = 60;
@@ -39,7 +40,7 @@ class StatUserJob implements ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null)
+    public function __construct(array $server, array $data, string $protocol, string $recordType = 'd', ?string $batchHash = null, ?string $batchId = null, ?string $contentHash = null, ?int $timestamp = null)
     {
         $this->onQueue('stat');
         $this->data = $data;
@@ -49,13 +50,22 @@ class StatUserJob implements ShouldQueue
         $this->batchHash = $batchHash;
         $this->batchId = $batchId;
         $this->contentHash = $contentHash;
+        $this->timestamp = $timestamp;
     }
 
     public function handle(): void
     {
+        // SB-TA-007: the stat bucket is derived from the batch's
+        // receipt timestamp (the same immutable value the dispatcher
+        // hands to StatServerJob and TrafficFetchJob), never from this
+        // worker's execution clock. Previously a batch received before
+        // midnight but executed after it landed in the next day's
+        // bucket — and the user/server pair could even split across
+        // days when only one of the two jobs crossed midnight.
+        $bucketTs = $this->timestamp ?? time();
         $recordAt = $this->recordType === 'm'
-            ? strtotime(date('Y-m-01'))
-            : strtotime(date('Y-m-d'));
+            ? strtotime(date('Y-m-01', $bucketTs))
+            : strtotime(date('Y-m-d', $bucketTs));
 
         // SB-AUD-022: the whole chunk runs in one transaction together
         // with the batch claim. Previously each user's upsert committed

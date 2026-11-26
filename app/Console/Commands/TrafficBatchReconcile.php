@@ -101,8 +101,12 @@ class TrafficBatchReconcile extends Command
             $batchId = $row->batch_hash;
 
             TrafficFetchJob::dispatch($server, $data, $protocol, $timestamp, $row->batch_hash, $batchId, $contentHash, $payload['collected_from'] ?? null, $payload['collected_to'] ?? null);
-            StatUserJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash);
-            StatServerJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash);
+            // SB-TA-007: a re-driven batch keeps its ORIGINAL receipt
+            // timestamp as the stat bucket, so a batch received before
+            // midnight and recovered after it still lands in the
+            // receipt day's stats.
+            StatUserJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash, $timestamp);
+            StatServerJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash, $timestamp);
             $summary['redriven']++;
         }
 
