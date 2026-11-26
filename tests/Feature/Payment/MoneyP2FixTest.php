@@ -649,6 +649,74 @@ class MoneyP2FixTest extends TestCase
         $this->assertSame(1, OrderReceipt::count());
     }
 
+    public function test_receipt_callback_no_reused_on_another_order_is_refused(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $orderA = $this->makeOrder($user, $plan, [
+            'status' => Order::STATUS_COMPLETED,
+            'callback_no' => 'TXN-A-FIRST',
+            'paid_at' => time(),
+        ]);
+        $orderB = $this->makeOrder($user, $plan, [
+            'status' => Order::STATUS_COMPLETED,
+            'callback_no' => 'TXN-B-FIRST',
+            'paid_at' => time(),
+        ]);
+
+        // A second payment lands on A and is recorded under TXN-SHARED.
+        $this->assertTrue($this->callHandle($orderA, 'TXN-SHARED', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+
+        // The same gateway transaction number now arrives for order B.
+        // M-P2-01: the recorded row belongs to a different order, so
+        // this is not a replay — pre-fix the bare existence check
+        // acknowledged it and B's payment left no trace at all. It
+        // must be refused (gateway keeps retrying) and the recorded
+        // receipt must stay untouched.
+        $this->assertFalse($this->callHandle($orderB, 'TXN-SHARED', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+        $this->assertSame($orderA->id, (int) OrderReceipt::first()->order_id);
+    }
+
+    public function test_receipt_replay_with_different_amount_is_refused(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan, [
+            'status' => Order::STATUS_COMPLETED,
+            'callback_no' => 'TXN-FIRST',
+            'paid_at' => time(),
+        ]);
+
+        // A second payment is recorded under TXN-SECOND at 2900.
+        $this->assertTrue($this->callHandle($order, 'TXN-SECOND', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+
+        // A re-notification of TXN-SECOND reporting a DIFFERENT
+        // amount is not the recorded receipt: M-P2-01 refuses the
+        // acknowledgement instead of folding it into the 2900 row,
+        // and the books keep the original amount.
+        $this->assertFalse($this->callHandle($order, 'TXN-SECOND', [
+            'paid_amount_cents' => 3000, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+        $this->assertSame(2900, (int) OrderReceipt::first()->paid_amount_cents);
+
+        // The genuine replay (same order, amount and currency) is
+        // still acknowledged idempotently.
+        $this->assertTrue($this->callHandle($order, 'TXN-SECOND', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+    }
+
     public function test_checkout_records_payment_attempt(): void
     {
         Plugin::create([

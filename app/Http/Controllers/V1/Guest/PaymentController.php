@@ -177,8 +177,18 @@ class PaymentController extends Controller
      * Acknowledgement rules mirror the cancelled-order path
      * (SB-MONEY-002): incomplete evidence (no amount/currency) fails
      * so the gateway keeps retrying; a definitive currency mismatch
-     * is logged and acknowledged without recording; a recorded (or
-     * already recorded) receipt is acknowledged.
+     * is logged and acknowledged without recording; a recorded
+     * receipt is acknowledged.
+     *
+     * M-P2-01: an already-recorded row under the same callback_no is
+     * acknowledged ONLY when it is verifiably the same receipt —
+     * same order, same amount, same currency. callback_no existence
+     * alone proves nothing: the unique key is global, so the row may
+     * belong to a DIFFERENT order (the gateway reusing a transaction
+     * number, or a misrouted callback), or the re-notification may
+     * report a different amount than the recorded one. Either
+     * mismatch is refused (no acknowledgement), logged as a conflict
+     * naming both orders, and left to manual reconciliation.
      */
     private function recordReceiptOnPaidOrder(Order $order, $callbackNo, array $verify): bool
     {
@@ -204,10 +214,11 @@ class PaymentController extends Controller
             ]);
             return true;
         }
+        $existing = \App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->first();
+        if ($existing) {
+            return $this->acknowledgeRecordedReceipt($existing, $order, $callbackNo, $verify);
+        }
         try {
-            if (\App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->exists()) {
-                return true;
-            }
             \App\Models\OrderReceipt::create([
                 'order_id' => $order->id,
                 'callback_no' => (string) $callbackNo,
@@ -216,8 +227,14 @@ class PaymentController extends Controller
                 'note' => 'second receipt on already-paid order; recorded for manual reconciliation',
             ]);
         } catch (\Exception $e) {
-            if (\App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->exists()) {
-                return true;
+            // A concurrent callback may have recorded the receipt
+            // first (the callback_no unique key then rejects this
+            // insert). That row is held to the same strict standard
+            // as the pre-check above — it is NOT acknowledged on
+            // existence alone.
+            $existing = \App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->first();
+            if ($existing) {
+                return $this->acknowledgeRecordedReceipt($existing, $order, $callbackNo, $verify);
             }
             Log::error('payment notify for paid order: receipt could not be persisted', [
                 'trade_no' => $order->trade_no,
@@ -232,6 +249,39 @@ class PaymentController extends Controller
             'paid_amount_cents' => $verify['paid_amount_cents'],
         ]);
         return true;
+    }
+
+    /**
+     * M-P2-01: decide whether a callback whose callback_no is already
+     * on the books may be acknowledged as a replay of that recorded
+     * receipt. Only an exact match — same order, same amount, same
+     * currency — is a genuine gateway re-notification. Anything else
+     * means the transaction number collides with a different payment:
+     * refusing the acknowledgement keeps the gateway retrying while
+     * the conflict (both orders identified) is logged for manual
+     * reconciliation; the recorded receipt stays untouched.
+     */
+    private function acknowledgeRecordedReceipt(\App\Models\OrderReceipt $receipt, Order $order, $callbackNo, array $verify): bool
+    {
+        $isSameReceipt = (int) $receipt->order_id === (int) $order->id
+            && (int) $receipt->paid_amount_cents === (int) $verify['paid_amount_cents']
+            && strtoupper((string) $receipt->paid_currency) === strtoupper((string) $verify['paid_currency']);
+        if ($isSameReceipt) {
+            return true;
+        }
+        $recordedOrder = Order::find($receipt->order_id);
+        Log::error('payment notify for paid order: callback_no already recorded for a different receipt, acknowledgement refused for manual reconciliation', [
+            'callback_no' => $callbackNo,
+            'recorded_order_id' => $receipt->order_id,
+            'recorded_trade_no' => $recordedOrder ? $recordedOrder->trade_no : null,
+            'recorded_paid_amount_cents' => $receipt->paid_amount_cents,
+            'recorded_paid_currency' => $receipt->paid_currency,
+            'order_id' => $order->id,
+            'trade_no' => $order->trade_no,
+            'paid_amount_cents' => $verify['paid_amount_cents'],
+            'paid_currency' => $verify['paid_currency'],
+        ]);
+        return false;
     }
 
     /**
