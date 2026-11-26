@@ -434,4 +434,26 @@ class AuditTailFixesTest extends EnterpriseTestCase
             ], $protocolOverrides),
         ];
     }
+
+    public function test_admin_audit_masks_webhook_urls_in_configuration(): void
+    {
+        $admin = $this->makeUser(['is_admin' => true]);
+        $request = Request::create('/api/v2/secret/config/save', 'POST', [
+            'telegram_webhook_url' => 'https://hooks.example.test/hook?access_token=TEST-CREDENTIAL',
+            'telegram_bot_enable' => true,
+            'server_ws_url' => 'wss://example.test/stream?options%5Bapi_key%5D=OTHER-TEST-CREDENTIAL',
+            'app_url' => 'https://admin:TEST-PASSWORD@example.test/',
+            'tos_url' => 'https://example.test/tos?lang=zh',
+        ]);
+        $request->setUserResolver(fn () => $admin);
+        (new RequestLog())->handle($request, fn () => new Response('ok'));
+
+        $data = json_decode(AdminAuditLog::latest('id')->firstOrFail()->request_data, true);
+        $this->assertSame('***', $data['telegram_webhook_url']);
+        $this->assertTrue($data['telegram_bot_enable']);
+        $this->assertSame('***', $data['server_ws_url']);
+        $this->assertSame('***', $data['app_url']);
+        $this->assertSame('https://example.test/tos?lang=zh', $data['tos_url']);
+    }
+
 }

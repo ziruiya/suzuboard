@@ -39,6 +39,7 @@ class SuzuEndpointContract extends Model
         'logical_node_id',
         'legacy_hostname',
         'client_port',
+        'client_port_range',
         'server_port',
         'protocol',
         'transport',

@@ -50,8 +50,12 @@ return new class extends Migration {
                 'protocol_settings' => json_encode([
                     'allow_insecure' => $server->allow_insecure,
                     'server_name' => $server->server_name,
+                    'tls_settings' => [
+                        'allow_insecure' => (bool) $server->allow_insecure,
+                        'server_name' => $server->server_name,
+                    ],
                     'network' => $server->network,
-                    'network_settings' => $server->networkSettings
+                    'network_settings' => json_decode($server->networkSettings ?? 'null', true)
                 ]),
                 'show' => $server->show,
                 'sort' => $server->sort,
@@ -111,7 +115,7 @@ return new class extends Migration {
                     'flow' => $server->flow,
                     'network' => $server->network,
                     'network_settings' => json_decode($server->network_settings),
-                    'reality_settings' => ($tlsSettings && $tlsSettings->public_key && $tlsSettings->short_id && $tlsSettings->server_name) ? [
+                    'reality_settings' => ((int) $server->tls === 2 && $tlsSettings->public_key && $tlsSettings->server_name) ? [
                         'public_key' => $tlsSettings->public_key,
                         'short_id' => $tlsSettings->short_id,
                         'server_name' => $tlsSettings->server_name,
@@ -227,35 +231,35 @@ return new class extends Migration {
         }
     }
 
-    /**
-     * Restore parent_id references when rolling back
-     */
-    private function restoreParentIds(string $type, string $table): void
+    public function down(): void
     {
-        // Get all servers of the specified type that have a parent_id
-        $servers = DB::table($table)
-            ->whereNotNull('parent_id')
-            ->get();
-
-        // Update each server's parent_id to reference back to the original id
-        foreach ($servers as $server) {
-            $originalParentId = DB::table('v2_server')
-                ->where('type', $type)
-                ->where('id', $server->parent_id)
-                ->value('code');
-
-            if ($originalParentId) {
-                DB::table($table)
-                    ->where('id', $server->id)
-                    ->update(['parent_id' => $originalParentId]);
+        $rows = $this->legacyRows();
+        foreach (array_keys($rows) as $table) {
+            if (Schema::hasTable($table)) {
+                throw new RuntimeException("Cannot roll back unified servers: $table already exists.");
             }
+        }
+
+        $created = [];
+        try {
+            $this->createLegacyTables($created);
+            DB::transaction(function () use ($rows) {
+                foreach ($rows as $table => $servers) {
+                    foreach ($servers as $row) {
+                        DB::table($table)->insert($row);
+                    }
+                }
+            });
+            Schema::drop('v2_server');
+        } catch (\Throwable $error) {
+            foreach (array_reverse($created) as $table) {
+                Schema::dropIfExists($table);
+            }
+            throw $error;
         }
     }
 
-    /**
-     * Reverse the migrations.
-     */
-    public function down(): void
+    private function createLegacyTables(array &$created): void
     {
         // Recreate old tables
         Schema::create('v2_server_trojan', function (Blueprint $table) {
@@ -280,6 +284,7 @@ return new class extends Migration {
             $table->integer('created_at');
             $table->integer('updated_at');
         });
+        $created[] = 'v2_server_trojan';
 
         Schema::create('v2_server_vmess', function (Blueprint $table) {
             $table->integer('id', true);
@@ -304,6 +309,7 @@ return new class extends Migration {
             $table->integer('created_at');
             $table->integer('updated_at');
         });
+        $created[] = 'v2_server_vmess';
 
         Schema::create('v2_server_vless', function (Blueprint $table) {
             $table->integer('id', true);
@@ -316,7 +322,7 @@ return new class extends Migration {
             $table->string('host');
             $table->integer('port');
             $table->integer('server_port');
-            $table->boolean('tls');
+            $table->integer('tls');
             $table->text('tls_settings')->nullable();
             $table->string('flow', 64)->nullable();
             $table->string('network', 11);
@@ -328,6 +334,7 @@ return new class extends Migration {
             $table->integer('created_at');
             $table->integer('updated_at');
         });
+        $created[] = 'v2_server_vless';
 
         Schema::create('v2_server_shadowsocks', function (Blueprint $table) {
             $table->integer('id', true);
@@ -350,6 +357,7 @@ return new class extends Migration {
             $table->integer('created_at');
             $table->integer('updated_at');
         });
+        $created[] = 'v2_server_shadowsocks';
 
         Schema::create('v2_server_hysteria', function (Blueprint $table) {
             $table->integer('id', true);
@@ -376,43 +384,77 @@ return new class extends Migration {
             $table->integer('created_at');
             $table->integer('updated_at');
         });
+        $created[] = 'v2_server_hysteria';
 
-        // Migrate data back to old tables
-        $servers = DB::table('v2_server')->get();
+    }
+
+    private function legacyRows(): array
+    {
+        $types = ['trojan', 'vmess', 'vless', 'shadowsocks', 'hysteria'];
+        $rows = array_fill_keys(array_map(fn ($type) => 'v2_server_' . $type, $types), []);
+        $servers = DB::table('v2_server')->get()->keyBy('id');
+        $legacyIds = [];
+        $usedIds = [];
         foreach ($servers as $server) {
-            $settings = json_decode($server->protocol_settings, true);
+            $id = filter_var($server->code ?? $server->id, FILTER_VALIDATE_INT, [
+                'options' => ['min_range' => 1, 'max_range' => 2147483647],
+            ]);
+            if (!in_array($server->type, $types, true) || $id === false || isset($usedIds[$server->type][$id])) {
+                throw new RuntimeException("Cannot roll back unified server $server->id: unsupported type or conflicting legacy ID.");
+            }
+            $legacyIds[$server->id] = $id;
+            $usedIds[$server->type][$id] = true;
+        }
+
+        foreach ($servers as $server) {
+            $settings = json_decode($server->protocol_settings ?? 'null', true, 512, JSON_THROW_ON_ERROR);
+            $parent = $servers->get($server->parent_id);
+            if (!is_array($settings) || strlen($server->port) > 11
+                || ($server->type === 'vless' && !ctype_digit($server->port))
+                || ($server->parent_id !== null && (!$parent || $parent->type !== $server->type))) {
+                throw new RuntimeException("Cannot roll back unified server $server->id: invalid settings, port or parent.");
+            }
+            if ($server->type !== 'vless' && max(strlen($server->group_ids ?? ''), strlen($server->route_ids ?? ''), strlen($server->tags ?? '')) > 255) {
+                throw new RuntimeException("Cannot roll back unified server $server->id: legacy list exceeds column capacity.");
+            }
+            $parentId = $parent ? $legacyIds[$parent->id] : null;
             $timestamp = strtotime($server->created_at);
             $updated = strtotime($server->updated_at);
             switch ($server->type) {
                 case 'trojan':
-                    DB::table('v2_server_trojan')->insert([
-                        'id' => (int) $server->code,
-                        'group_id' => $server->group_ids,
+                    if ((int) ($settings['tls'] ?? 1) !== 1) {
+                        throw new RuntimeException("Cannot roll back Trojan server $server->id: unsupported TLS mode.");
+                    }
+                    $row = [
+                        'id' => $legacyIds[$server->id],
+                        'group_id' => $server->group_ids ?? '[]',
                         'route_id' => $server->route_ids,
-                        'parent_id' => $server->parent_id,
+                        'parent_id' => $parentId,
                         'tags' => $server->tags,
                         'name' => $server->name,
                         'rate' => (string) $server->rate,
                         'host' => $server->host,
                         'port' => $server->port,
                         'server_port' => $server->server_port,
-                        'allow_insecure' => $settings['allow_insecure'],
-                        'server_name' => $settings['server_name'],
+                        'allow_insecure' => $settings['tls_settings']['allow_insecure'] ?? $settings['allow_insecure'] ?? false,
+                        'server_name' => $settings['tls_settings']['server_name'] ?? $settings['server_name'] ?? null,
                         'network' => $settings['network'] ?? null,
-                        'networkSettings' => $settings['network_settings'] ?? null,
+                        'networkSettings' => is_string($settings['network_settings'] ?? null)
+                            ? $settings['network_settings']
+                            : json_encode($settings['network_settings'] ?? null, JSON_THROW_ON_ERROR),
                         'show' => $server->show,
                         'sort' => $server->sort,
                         'created_at' => $timestamp,
                         'updated_at' => $updated
-                    ]);
+                    ];
                     break;
                 case 'vmess':
-                    DB::table('v2_server_vmess')->insert([
-                        'id' => (int) $server->code,
-                        'group_id' => $server->group_ids,
+                    $row = [
+                        'id' => $legacyIds[$server->id],
+                        'group_id' => $server->group_ids ?? '[]',
                         'route_id' => $server->route_ids,
                         'name' => $server->name,
-                        'parent_id' => $server->parent_id,
+                        'parent_id' => $parentId,
                         'host' => $server->host,
                         'port' => $server->port,
                         'server_port' => $server->server_port,
@@ -420,56 +462,61 @@ return new class extends Migration {
                         'tags' => $server->tags,
                         'rate' => (string) $server->rate,
                         'network' => $settings['network'],
-                        'rules' => json_encode($settings['rules']),
-                        'networkSettings' => json_encode($settings['network_settings']),
-                        'tlsSettings' => json_encode($settings['tls_settings']),
+                        'rules' => json_encode($settings['rules'] ?? null),
+                        'networkSettings' => json_encode($settings['network_settings'] ?? null, JSON_THROW_ON_ERROR),
+                        'tlsSettings' => json_encode($settings['tls_settings'] ?? null, JSON_THROW_ON_ERROR),
                         'show' => $server->show,
                         'sort' => $server->sort,
                         'created_at' => $timestamp,
                         'updated_at' => $updated
-                    ]);
+                    ];
                     break;
                 case 'vless':
-                    // 处理 reality settings
-                    $tlsSettings = $settings['tls_settings'] ?? new \stdClass();
-                    if (isset($settings['reality_settings'])) {
-                        $tlsSettings = array_merge((array) $tlsSettings, [
-                            'public_key' => $settings['reality_settings']['public_key'],
-                            'short_id' => $settings['reality_settings']['short_id'],
-                            'server_name' => explode(':', $settings['reality_settings']['dest'])[0],
-                            'server_port' => explode(':', $settings['reality_settings']['dest'])[1] ?? null,
-                            'private_key' => $settings['reality_settings']['private_key']
-                        ]);
+                    $tlsSettings = $settings['tls_settings'] ?? [];
+                    if ((int) $settings['tls'] === 2) {
+                        $reality = $settings['reality_settings'] ?? [];
+                        if (isset($reality['dest'])) {
+                            $dest = parse_url('tcp://' . $reality['dest']);
+                            $reality['server_name'] ??= $dest['host'] ?? null;
+                            $reality['server_port'] ??= $dest['port'] ?? null;
+                        }
+                        if (empty($reality['server_name']) || empty($reality['server_port'])
+                            || empty($reality['public_key']) || empty($reality['private_key'])) {
+                            throw new RuntimeException("Cannot roll back Reality server $server->id: incomplete settings.");
+                        }
+                        $tlsSettings = array_merge($tlsSettings, array_intersect_key($reality, array_flip([
+                            'public_key', 'short_id', 'server_name', 'server_port', 'private_key',
+                        ])));
                     }
 
-                    DB::table('v2_server_vless')->insert([
-                        'id' => (int) $server->code,
-                        'group_id' => $server->group_ids,
+                    $row = [
+                        'id' => $legacyIds[$server->id],
+                        'group_id' => $server->group_ids ?? '[]',
                         'route_id' => $server->route_ids,
                         'name' => $server->name,
-                        'parent_id' => $server->parent_id,
+                        'parent_id' => $parentId,
                         'host' => $server->host,
                         'port' => $server->port,
                         'server_port' => $server->server_port,
                         'tls' => $settings['tls'],
                         'tls_settings' => json_encode($tlsSettings),
-                        'flow' => $settings['flow'],
+                        'flow' => $settings['flow'] ?? null,
                         'network' => $settings['network'],
-                        'network_settings' => json_encode($settings['network_settings']),
+                        'network_settings' => json_encode($settings['network_settings'] ?? null, JSON_THROW_ON_ERROR),
                         'tags' => $server->tags,
                         'rate' => (string) $server->rate,
                         'show' => $server->show,
                         'sort' => $server->sort,
                         'created_at' => $timestamp,
                         'updated_at' => $updated
-                    ]);
+                    ];
                     break;
                 case 'shadowsocks':
-                    DB::table('v2_server_shadowsocks')->insert([
-                        'id' => (int) $server->code,
-                        'group_id' => $server->group_ids,
+                    $row = [
+                        'id' => $legacyIds[$server->id],
+                        'group_id' => $server->group_ids ?? '[]',
                         'route_id' => $server->route_ids,
-                        'parent_id' => $server->parent_id,
+                        'parent_id' => $parentId,
                         'tags' => $server->tags,
                         'name' => $server->name,
                         'rate' => (string) $server->rate,
@@ -477,21 +524,26 @@ return new class extends Migration {
                         'port' => $server->port,
                         'server_port' => $server->server_port,
                         'cipher' => $settings['cipher'],
-                        'obfs' => $settings['obfs'],
-                        'obfs_settings' => json_encode($settings['obfs_settings']),
+                        'obfs' => $settings['obfs'] ?? null,
+                        'obfs_settings' => json_encode($settings['obfs_settings'] ?? null, JSON_THROW_ON_ERROR),
                         'show' => (int) $server->show,
                         'sort' => $server->sort,
                         'created_at' => $timestamp,
                         'updated_at' => $updated
-                    ]);
+                    ];
                     break;
                 case 'hysteria':
-                    DB::table('v2_server_hysteria')->insert([
-                        'id' => (int) $server->code,
-                        'group_id' => $server->group_ids,
+                    $obfs = $settings['obfs'] ?? [];
+                    if (!empty($obfs['open']) && (($obfs['type'] ?? null) !== 'salamander'
+                        || ($obfs['password'] ?? null) !== Helper::getServerKey($timestamp, 16))) {
+                        throw new RuntimeException("Cannot roll back Hysteria server $server->id: custom obfuscation.");
+                    }
+                    $row = [
+                        'id' => $legacyIds[$server->id],
+                        'group_id' => $server->group_ids ?? '[]',
                         'route_id' => $server->route_ids,
                         'name' => $server->name,
-                        'parent_id' => $server->parent_id,
+                        'parent_id' => $parentId,
                         'host' => $server->host,
                         'port' => $server->port,
                         'server_port' => $server->server_port,
@@ -499,25 +551,20 @@ return new class extends Migration {
                         'rate' => (string) $server->rate,
                         'show' => $server->show,
                         'sort' => $server->sort,
+                        'version' => $settings['version'] ?? 1,
+                        'is_obfs' => $obfs['open'] ?? false,
                         'up_mbps' => $settings['bandwidth']['up'],
                         'down_mbps' => $settings['bandwidth']['down'],
-                        'server_name' => $settings['tls']['server_name'],
-                        'insecure' => $settings['tls']['allow_insecure'],
+                        'server_name' => $settings['tls']['server_name'] ?? null,
+                        'insecure' => $settings['tls']['allow_insecure'] ?? false,
                         'created_at' => $timestamp,
                         'updated_at' => $updated
-                    ]);
+                    ];
                     break;
             }
+            $rows['v2_server_' . $server->type][] = $row;
         }
 
-        // Restore parent_id references for each server type
-        $this->restoreParentIds('trojan', 'v2_server_trojan');
-        $this->restoreParentIds('vmess', 'v2_server_vmess');
-        $this->restoreParentIds('vless', 'v2_server_vless');
-        $this->restoreParentIds('shadowsocks', 'v2_server_shadowsocks');
-        $this->restoreParentIds('hysteria', 'v2_server_hysteria');
-
-        // Drop new table
-        Schema::dropIfExists('v2_server');
+        return $rows;
     }
 };

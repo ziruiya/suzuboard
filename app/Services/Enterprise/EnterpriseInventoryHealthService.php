@@ -187,7 +187,7 @@ class EnterpriseInventoryHealthService
             try {
                 $servers = ServerService::getAvailableServers($probeUser->fresh());
                 $byId = collect($servers)->keyBy('id');
-                foreach ($kit->nodes as $invNode) {
+                foreach ($kit->nodes()->get() as $invNode) {
                     $row = $byId->get($invNode->server_id);
                     $checks[] = [
                         'name' => "subscription_{$invNode->node_role}",

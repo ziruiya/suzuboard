@@ -59,7 +59,13 @@ class SuzuEndpointContractService
             $sni = $settings['server_name'];
         }
 
+        $range = null;
+        if (preg_match('/^\s*(\d+)\s*-\s*(\d+)\s*$/D', (string) $server->port, $matches)) {
+            $range = (int) $matches[1] . '-' . (int) $matches[2];
+        }
+
         return [
+            'client_port_range' => $range,
             'logical_node_id' => (int) $server->id,
             'legacy_hostname' => (string) $server->host,
             'client_port' => (int) $server->port,
@@ -82,6 +88,13 @@ class SuzuEndpointContractService
         $canonical = [];
         foreach (SuzuEndpointContract::FROZEN_FIELDS as $field) {
             $canonical[$field] = $frozenFields[$field] ?? null;
+        }
+        // Scalar ports keep their v1 hashes. Range contracts use the v2 hash domain.
+        $range = $canonical['client_port_range'];
+        unset($canonical['client_port_range']);
+        if ($range !== null) {
+            $canonical['client_port_range'] = $range;
+            $canonical['hash_version'] = 2;
         }
         return hash('sha256', json_encode($canonical, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
     }
@@ -195,7 +208,7 @@ class SuzuEndpointContractService
         // A client port different from the origin listen port means a relay
         // (VX) fronts the node; equal ports mean clients resolve the name
         // straight to an origin via DNS.
-        if ($fields['server_port'] !== null && $fields['client_port'] !== $fields['server_port']) {
+        if ($fields['server_port'] !== null && ($fields['client_port_range'] !== null || $fields['client_port'] !== $fields['server_port'])) {
             return SuzuEndpointBinding::ENTRY_VX;
         }
         return SuzuEndpointBinding::ENTRY_DNS;

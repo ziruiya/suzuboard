@@ -38,7 +38,7 @@
   <div id="app"></div>
   {!! $theme_config['custom_html'] !!}
   <script src="/theme/{{$theme}}/assets/suzu-login.js?v=20261121a" defer></script>
-  <script src="/theme/{{$theme}}/assets/suzu-enterprise.js?v=20261125a" defer></script>
+  <script src="/theme/{{$theme}}/assets/suzu-enterprise.js?v=20261126a" defer></script>
 </body>
 
 </html>

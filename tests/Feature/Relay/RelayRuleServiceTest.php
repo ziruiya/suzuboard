@@ -40,14 +40,14 @@ class RelayRuleServiceTest extends RelayTestCase
     public function test_both_transport_expands_to_two_claims_and_conflict_is_rejected(): void
     {
         $machine = $this->enableRelay($this->makeMachine('M1'));
-        $rule = $this->rules()->create($machine, $this->manualRule(['transport' => 'both', 'listen_port' => 20010]));
+        $rule = $this->rules()->create($machine, $this->manualRule(['transport' => 'both', 'listen_port' => 20010, 'listen_ip' => '127.0.0.1']));
         $claims = RelayPortClaim::where('rule_id', $rule->id)->orderBy('transport')->get();
         $this->assertCount(2, $claims);
         $this->assertSame(['tcp', 'udp'], $claims->pluck('transport')->all());
 
         // A second rule claiming the same ip/port for tcp must be refused.
         try {
-            $this->rules()->create($machine, $this->manualRule(['transport' => 'tcp', 'listen_port' => 20010, 'name' => 'clash']));
+            $this->rules()->create($machine, $this->manualRule(['transport' => 'tcp', 'listen_port' => 20010, 'listen_ip' => '127.0.0.1', 'name' => 'clash']));
             $this->fail('conflicting claim should be rejected');
         } catch (RelayValidationException $e) {
             $this->assertStringContainsString('already claimed', $e->getMessage());
@@ -55,7 +55,7 @@ class RelayRuleServiceTest extends RelayTestCase
 
         // UDP-only on the same port still conflicts with the BOTH rule's udp claim.
         try {
-            $this->rules()->create($machine, $this->manualRule(['transport' => 'udp', 'listen_port' => 20010, 'name' => 'clash2']));
+            $this->rules()->create($machine, $this->manualRule(['transport' => 'udp', 'listen_port' => 20010, 'listen_ip' => '127.0.0.1', 'name' => 'clash2']));
             $this->fail('udp claim should conflict with the both rule');
         } catch (RelayValidationException $e) {
             $this->assertStringContainsString('already claimed', $e->getMessage());
@@ -217,4 +217,32 @@ class RelayRuleServiceTest extends RelayTestCase
         }
         $this->assertSame(0, RelayRule::count());
     }
+
+    public function test_listener_claims_reject_wildcard_and_equivalent_address_overlaps(): void
+    {
+        $machine = $this->enableRelay($this->makeMachine('M1'));
+        $rules = $this->rules();
+        foreach ([
+            ['0.0.0.0', '127.0.0.1'],
+            ['127.0.0.1', '0.0.0.0'],
+            ['::', '127.0.0.1'],
+            ['::1', '0:0:0:0:0:0:0:1'],
+            ['127.0.0.2', '::ffff:127.0.0.2'],
+        ] as $index => [$first, $second]) {
+            $port = 20100 + $index;
+            $rules->create($machine, $this->manualRule(['listen_ip' => $first, 'listen_port' => $port]));
+            $udp = $rules->create($machine, $this->manualRule([
+                'transport' => 'udp', 'listen_ip' => $second, 'listen_port' => $port,
+            ]));
+            try {
+                $rules->update($udp, ['transport' => 'both']);
+                $this->fail("Expected $first and $second to overlap on TCP");
+            } catch (RelayValidationException $e) {
+                $this->assertStringContainsString('already claimed', $e->getMessage());
+            }
+            $this->assertSame('udp', $udp->fresh()->transport);
+            $rules->delete($udp);
+        }
+    }
+
 }

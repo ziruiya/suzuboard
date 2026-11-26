@@ -105,8 +105,24 @@ return new class extends Migration {
     public function down(): void
     {
         $ids = DB::table('suzu_enterprise_purpose')->whereIn('code', $this->newCodes)->pluck('id');
-        DB::table('suzu_enterprise_inventory_config')->whereIn('purpose_id', $ids)->delete();
-        DB::table('suzu_enterprise_purpose')->whereIn('id', $ids)->delete();
+        foreach ([
+            'suzu_enterprise_inventory_kits',
+            'suzu_enterprise_inventory_rules',
+            'suzu_enterprise_order_intents',
+            'suzu_enterprise_inventory_alerts',
+        ] as $table) {
+            if (DB::table($table)->whereIn('purpose_id', $ids)->exists()) {
+                throw new RuntimeException("Cannot roll back Model A SKUs: references exist in $table.");
+            }
+        }
+        if (DB::table('v2_order')->whereIn('enterprise_purpose_code', $this->newCodes)->exists()) {
+            throw new RuntimeException('Cannot roll back Model A SKUs: references exist in v2_order.');
+        }
+
+        DB::transaction(function () use ($ids) {
+            DB::table('suzu_enterprise_inventory_config')->whereIn('purpose_id', $ids)->delete();
+            DB::table('suzu_enterprise_purpose')->whereIn('id', $ids)->delete();
+        });
 
         Schema::table('suzu_enterprise_purpose', function (Blueprint $table) {
             $table->dropColumn(['region', 'usage_key']);

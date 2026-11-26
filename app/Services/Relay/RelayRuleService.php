@@ -30,9 +30,9 @@ class RelayRuleService
 
     public function create(ServerMachine $machine, array $data, string $actorType = 'admin', ?int $actorId = null): RelayRule
     {
-        $this->assertMachineCanTakeRules($machine);
-
         return DB::transaction(function () use ($machine, $data, $actorType, $actorId) {
+            $machine = ServerMachine::whereKey($machine->id)->lockForUpdate()->firstOrFail();
+            $this->assertMachineCanTakeRules($machine);
             $attrs = $this->validateAndNormalize($machine, $data, null);
             $rule = new RelayRule($attrs);
             $rule->machine_id = $machine->id;
@@ -50,6 +50,8 @@ class RelayRuleService
     {
         $machine = $rule->machine;
         return DB::transaction(function () use ($rule, $machine, $data, $actorType, $actorId) {
+            $machine = ServerMachine::whereKey($machine->id)->lockForUpdate()->firstOrFail();
+            $rule = RelayRule::whereKey($rule->id)->lockForUpdate()->firstOrFail();
             $merged = array_merge($rule->only([
                 'name', 'transport', 'listen_ip', 'listen_port', 'target_type',
                 'target_node_id', 'target_host', 'target_port', 'allowlist_cidrs',
@@ -82,39 +84,46 @@ class RelayRuleService
     public function setEnabled(RelayRule $rule, bool $enabled, string $actorType = 'admin', ?int $actorId = null): RelayRule
     {
         $machine = $rule->machine;
-        if ($enabled) {
-            $this->assertMachineCanTakeRules($machine);
-            // Re-validate the target: a node that lost eligibility while the
-            // rule was disabled must not come back (it goes BROKEN instead).
-            $this->validateAndNormalize($machine, $rule->only([
-                'name', 'transport', 'listen_ip', 'listen_port', 'target_type',
-                'target_node_id', 'target_host', 'target_port', 'allowlist_cidrs',
-                'allowlist_approved', 'max_connections', 'udp_max_sessions',
-            ]), $rule);
-        }
-        // B01 (GPT round 2, reproduced defect): capture the revocation
-        // obligation BEFORE the status flips to DISABLED. Round 1's
-        // publish-time capture queried status=APPLIED *after* this flip
-        // had already run, so a disabled-while-serving rule never
-        // entered the pending window at all — the panel assumed the
-        // agent stopped serving it, with no record anywhere.
-        if (!$enabled && $rule->status === RelayRule::STATUS_APPLIED) {
-            RelayRevocation::record($machine->id, $rule->rule_code, $rule->id, RelayRevocation::REASON_DISABLED);
-            $rule->forceFill(['revocation_pending_at' => now()])->save();
-        }
-        $rule->forceFill([
-            'enabled' => $enabled,
-            'status' => $enabled ? RelayRule::STATUS_NOT_APPLIED : RelayRule::STATUS_DISABLED,
-        ])->save();
-        RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, $enabled ? 'rule.enable' : 'rule.disable', $rule->rule_code);
-        $this->config->publish($machine, $actorType, $actorId);
-        return $rule->fresh();
+        return DB::transaction(function () use ($machine, $rule, $enabled, $actorType, $actorId) {
+            $machine = ServerMachine::whereKey($machine->id)->lockForUpdate()->firstOrFail();
+            $rule = RelayRule::whereKey($rule->id)->lockForUpdate()->firstOrFail();
+            if ($enabled) {
+                $this->assertMachineCanTakeRules($machine);
+                // Re-validate the target: a node that lost eligibility while the
+                // rule was disabled must not come back (it goes BROKEN instead).
+                $this->validateAndNormalize($machine, $rule->only([
+                    'name', 'transport', 'listen_ip', 'listen_port', 'target_type',
+                    'target_node_id', 'target_host', 'target_port', 'allowlist_cidrs',
+                    'allowlist_approved', 'max_connections', 'udp_max_sessions',
+                ]), $rule);
+                $this->assertClaimsAvailable($rule);
+            }
+            // B01 (GPT round 2, reproduced defect): capture the revocation
+            // obligation BEFORE the status flips to DISABLED. Round 1's
+            // publish-time capture queried status=APPLIED *after* this flip
+            // had already run, so a disabled-while-serving rule never
+            // entered the pending window at all — the panel assumed the
+            // agent stopped serving it, with no record anywhere.
+            if (!$enabled && $rule->status === RelayRule::STATUS_APPLIED) {
+                RelayRevocation::record($machine->id, $rule->rule_code, $rule->id, RelayRevocation::REASON_DISABLED);
+                $rule->forceFill(['revocation_pending_at' => now()])->save();
+            }
+            $rule->forceFill([
+                'enabled' => $enabled,
+                'status' => $enabled ? RelayRule::STATUS_NOT_APPLIED : RelayRule::STATUS_DISABLED,
+            ])->save();
+            RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, $enabled ? 'rule.enable' : 'rule.disable', $rule->rule_code);
+            $this->config->publish($machine, $actorType, $actorId);
+            return $rule->fresh();
+        });
     }
 
     public function delete(RelayRule $rule, string $actorType = 'admin', ?int $actorId = null): void
     {
         $machine = $rule->machine;
         DB::transaction(function () use ($rule, $machine, $actorType, $actorId) {
+            $machine = ServerMachine::whereKey($machine->id)->lockForUpdate()->firstOrFail();
+            $rule = RelayRule::whereKey($rule->id)->lockForUpdate()->firstOrFail();
             // B01: the obligation is recorded BEFORE the row goes away —
             // it lives in its own table precisely so this delete cannot
             // take the "agent has not confirmed it stopped" fact with
@@ -168,6 +177,7 @@ class RelayRuleService
         if (filter_var($listenIp, FILTER_VALIDATE_IP) === false) {
             throw new RelayValidationException('listen_ip must be a valid IP address');
         }
+        $listenIp = $this->normalizeBindIp($listenIp);
         $listenPort = (int) ($data['listen_port'] ?? 0);
         if (!RelayPorts::inPool($listenPort)) {
             throw new RelayValidationException(
@@ -508,8 +518,45 @@ class RelayRuleService
         ]));
     }
 
+    private function normalizeBindIp(string $ip): string
+    {
+        $binary = inet_pton($ip);
+        if (strlen($binary) === 16 && substr($binary, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+            $binary = substr($binary, 12);
+        }
+
+        return inet_ntop($binary);
+    }
+
+    private function bindsOverlap(string $first, string $second): bool
+    {
+        $first = $this->normalizeBindIp($first);
+        $second = $this->normalizeBindIp($second);
+        // The agent's tcp/udp listeners can cover both families for either wildcard.
+        $wildcards = ['0.0.0.0', '::'];
+
+        return $first === $second || in_array($first, $wildcards, true) || in_array($second, $wildcards, true);
+    }
+
+    private function assertClaimsAvailable(RelayRule $rule): void
+    {
+        $claims = RelayPortClaim::where('machine_id', $rule->machine_id)
+            ->where('listen_port', $rule->listen_port)
+            ->whereIn('transport', $rule->transports())
+            ->where('rule_id', '!=', $rule->id)
+            ->lockForUpdate()->get();
+        foreach ($claims as $claim) {
+            if ($this->bindsOverlap($rule->listen_ip, $claim->bind_ip)) {
+                throw new RelayValidationException(
+                    'listen port ' . $rule->listen_port . '/' . $claim->transport . ' on ' . $rule->listen_ip . ' is already claimed on this machine'
+                );
+            }
+        }
+    }
+
     private function syncClaims(RelayRule $rule): void
     {
+        $this->assertClaimsAvailable($rule);
         RelayPortClaim::where('rule_id', $rule->id)->delete();
         foreach ($rule->transports() as $transport) {
             try {

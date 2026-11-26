@@ -225,4 +225,27 @@ class PortRotationFlowTest extends MachineTestCase
         $this->assertTrue($status['can_rotate']);
         $this->assertSame(0, $status['cooldown_seconds']);
     }
+
+    public function test_a_cooldown_log_write_failure_rolls_back_ports(): void
+    {
+        $user = $this->makeUser();
+        $fulfillment = $this->deliverFor($user);
+        $user = $user->fresh();
+        $before = Server::whereIn('id', $fulfillment->nodeIds())->orderBy('id')->pluck('server_port', 'id')->all();
+        $forcedFailure = new \RuntimeException('forced cooldown log write failure');
+        PortRotationLog::creating(fn () => throw $forcedFailure);
+
+        try {
+            $this->rotation()->rotateForUser($user);
+            $this->fail('the log write should fail');
+        } catch (\RuntimeException $e) {
+            $this->assertSame($forcedFailure, $e);
+        } finally {
+            PortRotationLog::flushEventListeners();
+        }
+
+        $this->assertSame($before, Server::whereIn('id', $fulfillment->nodeIds())->orderBy('id')->pluck('server_port', 'id')->all());
+        $this->assertSame(0, $this->rotation()->cooldownRemaining($user));
+    }
+
 }

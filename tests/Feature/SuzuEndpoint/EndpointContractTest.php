@@ -196,4 +196,24 @@ class EndpointContractTest extends TestCase
         $this->assertSame('trojan', $bContract->protocol);
         $this->assertSame('grpc', $bContract->transport);
     }
+
+    public function test_range_endpoints_are_frozen_and_verified(): void
+    {
+        $server = $this->makeRealityNode(['port' => '08443 - 08445']);
+        $original = $this->service->snapshotFromServer($server)['contract'];
+        $this->assertSame('8443-8445', $original->fresh()->client_port_range);
+
+        $server->update(['port' => '8443-8445']);
+        $this->assertTrue($this->service->verifyIntegrity($original)['ok']);
+        $this->assertFalse($this->service->snapshotFromServer($server)['created']);
+
+        $server->update(['port' => '8443-8446']);
+        $result = $this->service->verifyIntegrity($original);
+        $this->assertFalse($result['ok']);
+        $this->assertSame(['contract' => '8443-8445', 'live' => '8443-8446'], $result['drift']['client_port_range']);
+        $next = $this->service->snapshotFromServer($server);
+        $this->assertTrue($next['alarm']);
+        $this->assertSame(2, $next['contract']->version);
+    }
+
 }

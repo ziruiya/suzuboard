@@ -3,6 +3,8 @@
 namespace App\Services\Machine;
 
 use App\Models\EnterpriseInventoryKit;
+use App\Models\EnterpriseInventoryNode;
+use App\Models\EnterpriseKitContractSnapshot;
 use App\Models\MachineFulfillment;
 use App\Models\PortRotationLog;
 use App\Models\RelayPortClaim;
@@ -41,11 +43,15 @@ class PortRotationService
     /** Seconds of cooldown left for this user (0 = may rotate now). */
     public function cooldownRemaining(User $user): int
     {
-        $last = PortRotationLog::where('user_id', $user->id)->orderByDesc('created_at')->first();
+        return $this->remainingFrom(PortRotationLog::where('user_id', $user->id)->latest('created_at')->first());
+    }
+
+    private function remainingFrom(?PortRotationLog $last): int
+    {
         if (!$last || !$last->created_at) {
             return 0;
         }
-        $elapsed = $last->created_at->diffInSeconds(now());
+        $elapsed = $last->created_at->diffInSeconds(now(), true);
         return max(0, self::COOLDOWN_SECONDS - (int) $elapsed);
     }
 
@@ -84,7 +90,17 @@ class PortRotationService
      */
     public function rotateForUser(User $user): array
     {
-        $remaining = $this->cooldownRemaining($user);
+        return DB::transaction(function () use ($user) {
+            $lockedUser = User::whereKey($user->id)->lockForUpdate()->firstOrFail();
+
+            return $this->rotateLockedUser($lockedUser);
+        }, 3);
+    }
+
+    private function rotateLockedUser(User $user): array
+    {
+        $last = PortRotationLog::where('user_id', $user->id)->latest('created_at')->lockForUpdate()->first();
+        $remaining = $this->remainingFrom($last);
         if ($remaining > 0) {
             throw new PortRotationCooldownException($remaining);
         }
@@ -114,13 +130,13 @@ class PortRotationService
 
         $results = [];
         foreach ($targets as [$type, $assignmentId, $servers]) {
-            $summary = DB::transaction(function () use ($servers, $user) {
-                $out = [];
-                foreach ($servers as $server) {
-                    $out[] = $this->rotateNode($server);
-                }
-                return $out;
-            });
+            $summary = [];
+            foreach ($servers as $server) {
+                $summary[] = $this->rotateNode($server);
+            }
+            if ($type === PortRotationLog::TYPE_KIT) {
+                $this->updateKitContract($assignmentId, $summary);
+            }
             PortRotationLog::create([
                 'user_id' => $user->id,
                 'assignment_type' => $type,
@@ -131,6 +147,35 @@ class PortRotationService
             $results = array_merge($results, $summary);
         }
         return $results;
+    }
+
+    private function updateKitContract(int $kitId, array $summary): void
+    {
+        $kit = EnterpriseInventoryKit::whereKey($kitId)->lockForUpdate()->firstOrFail();
+        $ports = collect($summary)->keyBy('server_id');
+        EnterpriseInventoryNode::where('kit_id', $kitId)->get()->each(function (EnterpriseInventoryNode $node) use ($ports) {
+            if ($result = $ports->get($node->server_id)) {
+                $node->update(['port' => $result['entry_port'], 'landing_port' => $result['new_port']]);
+            }
+        });
+
+        $version = $kit->current_contract_version + 1;
+        $snapshots = EnterpriseKitContractSnapshot::where('kit_id', $kitId)
+            ->where('contract_version', $kit->current_contract_version)->get();
+        foreach ($snapshots as $snapshot) {
+            $copy = $snapshot->replicate();
+            if ($result = $ports->get($snapshot->server_id)) {
+                $copy->entry_port = $result['entry_port'];
+                $copy->target_port = $result['new_port'];
+            }
+            $copy->contract_version = $version;
+            $copy->revision = $version;
+            $copy->captured_at = now();
+            $copy->save();
+        }
+        if ($snapshots->isNotEmpty()) {
+            $kit->update(['current_contract_version' => $version]);
+        }
     }
 
     /** Rotate one dedicated node; only its ports may change. */
@@ -153,13 +198,13 @@ class PortRotationService
             // and move the landing port; RelayRuleService republishes.
             $machine = $rule->machine;
             $newEntry = $this->allocatePoolPort(function (int $port) use ($machine, $rule) {
-                return !RelayPortClaim::where('machine_id', $machine->id)
+                return $port !== (int) $rule->listen_port && !RelayPortClaim::where('machine_id', $machine->id)
                     ->where('listen_port', $port)
                     ->where('rule_id', '!=', $rule->id)
                     ->exists();
             });
             $newLanding = $this->allocatePoolPort(function (int $port) use ($server) {
-                return !Server::where('machine_id', $server->machine_id)
+                return $port !== (int) $server->server_port && !Server::where('machine_id', $server->machine_id)
                     ->where('server_port', $port)
                     ->where('id', '!=', $server->id)
                     ->exists();
@@ -188,7 +233,7 @@ class PortRotationService
         if ($server->machine_id && $this->isMachineFulfillmentNode($server)) {
             // Direct dedicated-VPS node: entry port == landing port.
             $newPort = $this->allocatePoolPort(function (int $port) use ($server) {
-                return !Server::where('machine_id', $server->machine_id)
+                return $port !== (int) $server->server_port && !Server::where('machine_id', $server->machine_id)
                     ->where('server_port', $port)
                     ->where('id', '!=', $server->id)
                     ->exists();

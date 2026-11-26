@@ -642,4 +642,22 @@ class TrafficP2FixTest extends TestCase
             $this->assertTrue($found, "{$table} must have a unique key on (" . implode(', ', $columns) . ')');
         }
     }
+
+    public function test_controller_records_manual_reset_admin_without_reason(): void
+    {
+        $admin = $this->makeUser(['is_admin' => true]);
+        $user = $this->makeUser([
+            'plan_id' => $this->makePlan()->id,
+            'expired_at' => time() + 86400,
+            'u' => 12345,
+        ]);
+        $this->actingAs($admin);
+        $request = \Illuminate\Http\Request::create('/', 'POST', ['user_id' => $user->id]);
+        $response = app(\App\Http\Controllers\V2\Admin\TrafficResetController::class)->resetUser($request);
+        $this->assertSame(200, $response->getStatusCode());
+        $log = TrafficResetLog::where('user_id', $user->id)->sole();
+        $this->assertSame($admin->id, $log->metadata['admin_id'] ?? null);
+        $this->assertArrayNotHasKey('reason', $log->metadata);
+    }
+
 }

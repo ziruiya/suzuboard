@@ -29,6 +29,7 @@ class RequestLog
         'credential',
         'auth',
         'subscribe_url',
+        'webhook_url',
     ];
 
     private const REDACTED = '***';
@@ -82,7 +83,25 @@ class RequestLog
         if ($key !== null && $this->isSensitiveKey($key)) {
             return self::REDACTED;
         }
+        if (is_string($value) && $this->urlHasCredentials($value)) {
+            return self::REDACTED;
+        }
         return $value;
+    }
+
+    private function urlHasCredentials(string $value): bool
+    {
+        if (!preg_match('#^(?:https?|wss?)://#i', $value)) {
+            return false;
+        }
+
+        $url = parse_url($value);
+        if ($url === false || isset($url['user']) || isset($url['pass'])) {
+            return true;
+        }
+
+        parse_str($url['query'] ?? '', $query);
+        return $this->sanitize($query) !== $query;
     }
 
     private function isSensitiveKey(string $key): bool

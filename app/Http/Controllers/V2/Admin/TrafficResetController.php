@@ -158,10 +158,9 @@ class TrafficResetController extends Controller
             ], 400);
         }
 
-    $metadata = [];
+    $metadata = ['admin_id' => auth()->user()?->id];
     if ($request->filled('reason')) {
       $metadata['reason'] = $request->reason;
-      $metadata['admin_id'] = auth()->user()?->id;
     }
 
     $success = $this->trafficResetService->manualReset($user, $metadata);
