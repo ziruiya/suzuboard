@@ -2,12 +2,15 @@
 
 namespace Tests\Feature\SuzuEndpoint;
 
+use App\Models\RelayRule;
 use App\Models\Server;
+use App\Models\ServerMachine;
 use App\Models\SuzuEndpointBinding;
 use App\Models\SuzuEndpointChange;
 use App\Models\SuzuEndpointContract;
 use App\Services\SuzuEndpointContractService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Str;
 use LogicException;
 use Tests\TestCase;
 
@@ -93,6 +96,42 @@ class EndpointContractTest extends TestCase
         $result = $this->service->snapshotFromServer($server);
         $binding = SuzuEndpointBinding::where('contract_id', $result['contract']->id)->first();
         $this->assertSame('vx', $binding->entry_mode);
+    }
+
+    public function test_snapshot_marks_direct_port_range_as_dns(): void
+    {
+        $server = $this->makeRealityNode(['port' => '20000-20010', 'server_port' => 8443]);
+        $contract = $this->service->snapshotFromServer($server)['contract'];
+        $binding = SuzuEndpointBinding::where('contract_id', $contract->id)->firstOrFail();
+
+        $this->assertSame('20000-20010', $contract->client_port_range);
+        $this->assertSame('dns', $binding->entry_mode);
+    }
+
+    public function test_snapshot_marks_port_range_with_verified_relay_as_vx(): void
+    {
+        $server = $this->makeRealityNode(['port' => '20000-20010', 'server_port' => 8443]);
+        $relay = ServerMachine::create([
+            'name' => 'Endpoint relay',
+            'token' => Str::random(40),
+            'role' => ServerMachine::ROLE_RELAY,
+        ]);
+        RelayRule::create([
+            'machine_id' => $relay->id,
+            'name' => 'Endpoint port range relay',
+            'listen_port' => 20001,
+            'target_type' => RelayRule::TARGET_NODE,
+            'target_node_id' => $server->id,
+            'target_host' => $server->host,
+            'target_port' => 8443,
+            'enabled' => true,
+        ]);
+
+        $contract = $this->service->snapshotFromServer($server)['contract'];
+        $binding = SuzuEndpointBinding::where('contract_id', $contract->id)->firstOrFail();
+
+        $this->assertSame('vx', $binding->entry_mode);
+        $this->assertSame('20000-20010', $contract->client_port_range);
     }
 
     public function test_snapshot_is_idempotent_when_node_unchanged(): void

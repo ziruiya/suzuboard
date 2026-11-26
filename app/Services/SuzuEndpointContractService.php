@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\RelayRule;
 use App\Models\Server;
 use App\Models\SuzuEndpointBinding;
 use App\Models\SuzuEndpointChange;
@@ -134,7 +135,7 @@ class SuzuEndpointContractService
             $binding = SuzuEndpointBinding::firstOrCreate(
                 ['contract_id' => $contract->id],
                 [
-                    'entry_mode' => $this->inferEntryMode($fields),
+                    'entry_mode' => $this->inferEntryMode($fields, $server),
                     'origin_id' => $server->machine_id !== null ? (int) $server->machine_id : null,
                     'health_status' => SuzuEndpointBinding::HEALTH_UNKNOWN,
                     'revision' => 1,
@@ -203,14 +204,32 @@ class SuzuEndpointContractService
         return $drift;
     }
 
-    private function inferEntryMode(array $fields): string
+    private function inferEntryMode(array $fields, Server $server): string
     {
-        // A client port different from the origin listen port means a relay
-        // (VX) fronts the node; equal ports mean clients resolve the name
-        // straight to an origin via DNS.
-        if ($fields['server_port'] !== null && ($fields['client_port_range'] !== null || $fields['client_port'] !== $fields['server_port'])) {
+        if ($this->hasVerifiedRelayBinding($server)) {
+            return SuzuEndpointBinding::ENTRY_VX;
+        }
+
+        // A range alone never proves relay fronting. It may be direct origin
+        // port hopping, where DNS resolves straight to the origin (ENTRY_DNS).
+        // Bindings have no unverified entry mode, and resync must still issue
+        // the snapshot. If a relay binding is verified later, the next contract
+        // version will use VX for its new binding.
+        if ($fields['client_port_range'] !== null) {
+            return SuzuEndpointBinding::ENTRY_DNS;
+        }
+
+        if ($fields['server_port'] !== null && $fields['client_port'] !== $fields['server_port']) {
             return SuzuEndpointBinding::ENTRY_VX;
         }
         return SuzuEndpointBinding::ENTRY_DNS;
+    }
+
+    private function hasVerifiedRelayBinding(Server $server): bool
+    {
+        return RelayRule::where('target_type', RelayRule::TARGET_NODE)
+            ->where('target_node_id', $server->id)
+            ->where('enabled', true)
+            ->exists();
     }
 }
