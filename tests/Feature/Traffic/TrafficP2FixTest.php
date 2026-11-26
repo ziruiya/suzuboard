@@ -8,6 +8,7 @@ use App\Jobs\StatUserJob;
 use App\Jobs\TrafficFetchJob;
 use App\Models\Plan;
 use App\Models\Server;
+use App\Models\TrafficPendingCheck;
 use App\Models\StatServer;
 use App\Models\StatUser;
 use App\Models\TrafficResetLog;
@@ -30,6 +31,9 @@ use Tests\TestCase;
  *               aborted-transaction portability defect);
  *  - SB-TA-006  over-quota check events persist inside the quota
  *               transaction instead of a post-commit Redis write;
+ *  - SB-TA-006-R1 pending-check rows carry an event version; the
+ *               consumer deletes only the version it read, so an
+ *               event re-booked mid-check survives to the next round;
  *  - SB-TA-007  stat jobs bucket by the batch receipt timestamp, not
  *               the worker execution clock;
  *  - SB-TA-008  monthly/yearly reset date construction clamps the
@@ -265,6 +269,82 @@ class TrafficP2FixTest extends TestCase
 
         $exit = Artisan::call('check:traffic-exceeded');
 
+        $this->assertSame(0, $exit);
+        $this->assertSame(0, DB::table('suzu_traffic_pending_checks')->count());
+    }
+
+    // ---------------- SB-TA-006-R1 (event versions) ----------------
+
+    public function test_pending_check_rebooking_advances_version(): void
+    {
+        $user = $this->makeUser();
+        $other = $this->makeUser();
+
+        TrafficPendingCheck::recordForUsers([$user->id, $other->id]);
+        $this->assertSame(
+            1,
+            (int) DB::table('suzu_traffic_pending_checks')->where('user_id', $user->id)->value('version'),
+            'first booking must create version 1'
+        );
+
+        // A repeated booking must NOT be folded away by the unique
+        // key (the old insertOrIgnore shape): it advances the event
+        // version so consumers can tell the events apart.
+        TrafficPendingCheck::recordForUsers([$user->id]);
+        TrafficPendingCheck::recordForUsers([$user->id, $other->id]);
+
+        $this->assertSame(2, DB::table('suzu_traffic_pending_checks')->count(), 'still one row per user');
+        $this->assertSame(
+            3,
+            (int) DB::table('suzu_traffic_pending_checks')->where('user_id', $user->id)->value('version'),
+            'each re-booking must advance the version by exactly one'
+        );
+        $this->assertSame(
+            2,
+            (int) DB::table('suzu_traffic_pending_checks')->where('user_id', $other->id)->value('version'),
+            'versions advance per user, independently'
+        );
+    }
+
+    public function test_pending_check_rebooked_during_consume_survives_conditional_delete(): void
+    {
+        // GPT's reproduction sequence for the TA-006 No-Go: consumer
+        // reads the pending row, a producer books the same user
+        // again before the consumer deletes, and the consumer's
+        // cleanup must not erase the fresh event.
+        $user = $this->makeUser();
+
+        // 1. Producer books the first event.
+        TrafficPendingCheck::recordForUsers([$user->id]);
+
+        // 2. Consumer reads (user_id, version) — its claim on the
+        //    events it is about to check.
+        $chunk = TrafficPendingCheck::nextChunk();
+        $this->assertCount(1, $chunk);
+        $this->assertSame($user->id, $chunk[0]->user_id);
+        $this->assertSame(1, $chunk[0]->version);
+
+        // 3. While the check runs, the producer books a NEW event
+        //    for the same user (new quota booking lands).
+        TrafficPendingCheck::recordForUsers([$user->id]);
+
+        // 4. Consumer finishes and deletes what it consumed. The row
+        //    now carries version 2 — an event the consumer never
+        //    checked — so it must survive.
+        $deleted = TrafficPendingCheck::deleteConsumed($chunk);
+        $this->assertSame(0, $deleted, 'stale-version delete must not remove a re-booked row');
+        $survivor = DB::table('suzu_traffic_pending_checks')->where('user_id', $user->id)->first();
+        $this->assertNotNull($survivor, 'the re-booked event must survive for the next round');
+        $this->assertSame(2, (int) $survivor->version);
+
+        // 5. The next consumer round sees the surviving event…
+        $nextChunk = TrafficPendingCheck::nextChunk();
+        $this->assertCount(1, $nextChunk);
+        $this->assertSame(2, $nextChunk[0]->version);
+
+        // …and the real command consumes it end-to-end.
+        Redis::shouldReceive('scard')->andThrow(new \RuntimeException('redis is down'));
+        $exit = Artisan::call('check:traffic-exceeded');
         $this->assertSame(0, $exit);
         $this->assertSame(0, DB::table('suzu_traffic_pending_checks')->count());
     }

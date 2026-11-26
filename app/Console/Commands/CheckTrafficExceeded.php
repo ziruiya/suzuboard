@@ -21,27 +21,28 @@ class CheckTrafficExceeded extends Command
         // chunk-wise: process first, delete afterwards — a crash in
         // between only causes an idempotent re-check next run (the
         // node push below is a remove-delta, safe to repeat).
+        // TA-006-R1: chunks are read as (user_id, version) pairs and
+        // deletion is conditional on the version being unchanged —
+        // a user re-booked by a producer while this check was running
+        // keeps the row (with its newer version) for the next round
+        // instead of having the fresh event erased unseen.
         $totalChecked = 0;
         $totalNotified = 0;
         $totalExceeded = 0;
 
         while (true) {
-            $pendingUserIds = TrafficPendingCheck::query()
-                ->orderBy('id')
-                ->limit(1000)
-                ->pluck('user_id')
-                ->map(fn($id) => (int) $id)
-                ->all();
-            if (empty($pendingUserIds)) {
+            $pending = TrafficPendingCheck::nextChunk(1000);
+            if (empty($pending)) {
                 break;
             }
+            $pendingUserIds = array_map(fn($row) => $row->user_id, $pending);
 
             [$notified, $exceeded] = $this->checkUsers($pendingUserIds);
             $totalChecked += count($pendingUserIds);
             $totalNotified += $notified;
             $totalExceeded += $exceeded;
 
-            TrafficPendingCheck::query()->whereIn('user_id', $pendingUserIds)->delete();
+            TrafficPendingCheck::deleteConsumed($pending);
         }
 
         // Legacy drain: ids written to the Redis set by the pre-TA-006
