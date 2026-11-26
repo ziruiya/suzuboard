@@ -9,8 +9,6 @@ use App\Models\Server;
 
 class Surge extends AbstractProtocol
 {
-    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
-
     public $flags = ['surge'];
     const CUSTOM_TEMPLATE_FILE = 'resources/rules/custom.surge.conf';
     const DEFAULT_TEMPLATE_FILE = 'resources/rules/default.surge.conf';
@@ -245,8 +243,9 @@ class Surge extends AbstractProtocol
     public static function buildHysteria($password, $server)
     {
         $protocol_settings = $server['protocol_settings'];
-        if ($protocol_settings['version'] != 2)
+        if ($protocol_settings['version'] != 2 || data_get($protocol_settings, 'obfs.open')) {
             return '';
+        }
         $config = [
             "{$server['name']} = hysteria2",
             "{$server['host']}",
@@ -264,14 +263,6 @@ class Surge extends AbstractProtocol
         }
         if (data_get($protocol_settings, 'tls.allow_insecure')) {
             $config[] = !!data_get($protocol_settings, 'tls.allow_insecure') ? 'skip-cert-verify=true' : 'skip-cert-verify=false';
-        }
-        if (data_get($protocol_settings, 'obfs.open')) {
-            $obfsPassword = data_get($protocol_settings, 'obfs.password');
-            if (data_get($protocol_settings, 'obfs.type') !== 'salamander'
-                || !is_string($obfsPassword) || $obfsPassword === '' || strpbrk($obfsPassword, ",\r\n") !== false) {
-                return '';
-            }
-            $config[] = "salamander-password={$obfsPassword}";
         }
         $config = array_filter($config);
         $uri = implode(',', $config);

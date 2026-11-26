@@ -2,10 +2,14 @@
 
 namespace App\Services;
 
+use App\Models\AdminAuditLog;
+use App\Support\Setting;
 use App\Utils\CacheKey;
+use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
-/** Send budgets and anomaly telemetry for verification email. */
+/** Send budgets and anomaly protection for verification email. */
 class EmailVerifyGuardService
 {
     public const SETTING_DOMAIN_LIMIT = 'app_email_verify_domain_limit';
@@ -21,6 +25,8 @@ class EmailVerifyGuardService
 
     public const DEFAULT_ANOMALY_THRESHOLD = 120;
     public const DEFAULT_ANOMALY_WINDOW = 600;
+
+    public const AUDIT_ACTION_AUTO_FLIP = 'security.app_captcha_auto_flip';
 
     public function __construct(private AppRateLimitService $rateLimit)
     {
@@ -57,15 +63,71 @@ class EmailVerifyGuardService
         ], 3600);
     }
 
-    public function recordSend(): void
+    public function recordSend(string $ip): void
     {
-        $count = $this->rateLimit->hit('APP_EMAIL_VERIFY_ANOMALY_RATE_LIMIT', 'ALL', $this->anomalyWindow());
-        if ($count === $this->anomalyThreshold()) {
-            Log::warning('Verification email send threshold reached', [
-                'window_seconds' => $this->anomalyWindow(),
-                'window_count' => $count,
-            ]);
+        $this->recordAttemptAndDetectAnomaly($ip);
+    }
+
+    public function recordAttemptAndDetectAnomaly(string $ip): void
+    {
+        $window = $this->anomalyWindow();
+        $threshold = $this->anomalyThreshold();
+        $count = $this->rateLimit->hit('APP_EMAIL_VERIFY_ANOMALY_RATE_LIMIT', 'ALL', $window);
+        if ($count < $threshold) {
+            return;
         }
+
+        try {
+            Cache::lock(self::AUDIT_ACTION_AUTO_FLIP, 10)
+                ->block(1, fn () => $this->flipToTurnstile($ip, $window, $count, $threshold));
+        } catch (LockTimeoutException) {
+            Log::warning('AUD-001 auto-flip lock timed out');
+        }
+    }
+
+    private function flipToTurnstile(string $ip, int $window, int $count, int $threshold): void
+    {
+        // Reload settings after acquiring the lock to see any preceding flip.
+        app()->forgetInstance(Setting::class);
+        $mode = CaptchaService::appCaptchaMode();
+        if ($mode === 'turnstile') {
+            return;
+        }
+
+        // Application write path: flushes the settings cache (raw SQL would not).
+        admin_setting(['app_captcha_mode' => 'turnstile']);
+
+        try {
+            AdminAuditLog::insert([
+                'admin_id' => 0,
+                'action' => self::AUDIT_ACTION_AUTO_FLIP,
+                'method' => 'SYSTEM',
+                'uri' => '/api/v1/passport/comm/sendEmailVerify',
+                'request_data' => json_encode([
+                    'key' => 'app_captcha_mode',
+                    'old_value' => $mode,
+                    'new_value' => 'turnstile',
+                    'window_seconds' => $window,
+                    'window_count' => $count,
+                    'threshold' => $threshold,
+                    'trigger_ip' => $ip,
+                    'result' => 'applied',
+                ], JSON_UNESCAPED_UNICODE),
+                'ip' => $ip,
+                'created_at' => time(),
+                'updated_at' => time(),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('AUD-001 auto-flip audit write failed: ' . $e->getMessage());
+        }
+
+        Log::warning('AUD-001 anomaly tripwire: app_captcha_mode flipped to turnstile', [
+            'old_mode' => $mode,
+            'window_seconds' => $window,
+            'window_count' => $count,
+            'threshold' => $threshold,
+            'trigger_ip' => $ip,
+        ]);
     }
 
     private function positiveSetting(string $key, int $default): int

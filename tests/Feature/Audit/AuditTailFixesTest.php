@@ -343,7 +343,7 @@ class AuditTailFixesTest extends EnterpriseTestCase
         $server = $this->hysteriaServer(2, 'Obfuscated');
         $server['protocol_settings']['obfs'] = ['open' => true, 'type' => 'salamander', 'password' => 'obfs-test'];
         $this->assertStringContainsString('salamander-password=obfs-test', Loon::buildHysteria('pw', $server, []));
-        $this->assertStringContainsString('salamander-password=obfs-test', Surge::buildHysteria('pw', $server));
+        $this->assertSame('', Surge::buildHysteria('pw', $server));
 
         $server['protocol_settings']['obfs']['type'] = 'unsupported-type';
         $this->assertSame('', Loon::buildHysteria('pw', $server, []));
@@ -382,6 +382,28 @@ class AuditTailFixesTest extends EnterpriseTestCase
         $this->assertStringContainsString('G = select, New-Hysteria', $content);
         $this->assertStringNotContainsString('Old-Hysteria', $content);
         $this->assertStringNotContainsString('Future-Hysteria', $content);
+    }
+
+    public function test_surge_omits_salamander_regardless_of_version_metadata(): void
+    {
+        SubscribeTemplate::updateOrCreate(['name' => 'surge'], ['content' => "[Proxy]\n\$proxies\n[Proxy Group]\nG = select, \$proxy_group\n"]);
+        Cache::store('redis')->flush();
+
+        $plain = $this->hysteriaServer(2, 'Plain-Hysteria');
+        $obfuscated = $this->hysteriaServer(2, 'Salamander-Hysteria');
+        $obfuscated['protocol_settings']['obfs'] = ['open' => true, 'type' => 'salamander', 'password' => 'obfs-test'];
+
+        foreach ([[null, null], ['surge', null], ['surge', '1'], ['surge', '2398'], ['surge', '9999']] as [$client, $version]) {
+            $content = (new Surge($this->subscriptionUser(), [$plain, $obfuscated], $client, $version))->handle()->getContent();
+            $this->assertStringNotContainsString('Salamander-Hysteria', $content);
+            $this->assertStringNotContainsString('salamander-password', $content);
+            if ($client === null || in_array($version, ['2398', '9999'], true)) {
+                $this->assertStringContainsString('Plain-Hysteria = hysteria2', $content);
+                $this->assertStringContainsString('G = select, Plain-Hysteria', $content);
+            } else {
+                $this->assertStringNotContainsString('Plain-Hysteria', $content);
+            }
+        }
     }
 
     private function subscriptionUser(): array

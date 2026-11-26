@@ -29,6 +29,7 @@ class CommController extends Controller
         $captchaService = app(CaptchaService::class);
         [$captchaValid, $captchaError] = $captchaService->verify($request);
         if (!$captchaValid) {
+            app(EmailVerifyGuardService::class)->recordAttemptAndDetectAnomaly((string) $request->ip());
             return $this->fail($captchaError, CaptchaService::errorDataFor($request));
         }
 
@@ -70,7 +71,7 @@ class CommController extends Controller
         ]);
 
         Cache::put(CacheKey::get('EMAIL_VERIFY_CODE', $email), $code, 300);
-        $guard->recordSend();
+        $guard->recordSend((string) $request->ip());
         return $this->success(true);
     }
 
