@@ -2,6 +2,7 @@
 
 namespace Tests\Feature\Audit;
 
+use App\Http\Controllers\V1\Client\ClientController;
 use App\Http\Middleware\RequestLog;
 use App\Models\AdminAuditLog;
 use App\Models\Plan;
@@ -9,10 +10,13 @@ use App\Models\Server;
 use App\Models\ServerGroup;
 use App\Models\SubscribeTemplate;
 use App\Models\User;
+use App\Protocols\Loon;
 use App\Protocols\QuantumultX;
+use App\Protocols\Shadowrocket;
 use App\Protocols\Surfboard;
 use App\Protocols\Surge;
 use App\Services\NodeSyncService;
+use App\Support\AbstractProtocol;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
@@ -263,6 +267,135 @@ class AuditTailFixesTest extends EnterpriseTestCase
         $ids = collect($published[0]['data']['users'])->pluck('id')->all();
         $this->assertContains($live->id, $ids);
         $this->assertNotContains($banned->id, $ids);
+    }
+
+    public function test_shadowrocket_applies_version_floor_and_version_independent_whitelist(): void
+    {
+        $anytls = array_replace($this->trojanServer([]), [
+            'name' => 'New-AnyTLS',
+            'type' => Server::TYPE_ANYTLS,
+            'protocol_settings' => [],
+        ]);
+        $unknownTransport = array_replace($this->trojanServer(['network' => 'xhttp']), ['name' => 'Bad-Trojan']);
+        $plain = array_replace($this->trojanServer(['network' => 'tcp']), ['name' => 'Plain-Trojan']);
+        $servers = [$anytls, $unknownTransport, $plain];
+
+        foreach (['2591', '2592', null, 'invalid'] as $version) {
+            $content = base64_decode((new Shadowrocket($this->subscriptionUser(), $servers, 'shadowrocket', $version))
+                ->handle()->getContent(), true);
+            $this->assertStringContainsString('Plain-Trojan', $content);
+            $this->assertStringNotContainsString('Bad-Trojan', $content);
+            $this->assertSame($version === '2592', str_contains($content, 'New-AnyTLS'));
+        }
+    }
+
+    public function test_shadowrocket_applies_transport_whitelist_with_no_version(): void
+    {
+        $server = array_replace($this->trojanServer(['network' => 'xhttp']), ['name' => 'Bad-Trojan']);
+        $request = Request::create('/subscribe', 'GET', ['flag' => 'shadowrocket']);
+        $content = app(ClientController::class)->doSubscribe($request, $this->subscriptionUser(), [$server])->getContent();
+
+        $this->assertStringNotContainsString('Bad-Trojan', base64_decode($content, true));
+    }
+
+    public function test_incompatible_rule_applies_without_a_client_version(): void
+    {
+        $servers = [
+            $this->trojanServer(['network' => 'tcp']),
+            $this->trojanServer(['network' => 'xhttp']),
+        ];
+        $renderer = new class([], $servers) extends AbstractProtocol {
+            protected $protocolRequirements = [
+                '*.trojan.incompatible' => ['protocol_settings.network' => ['xhttp']],
+            ];
+
+            public function handle(): array
+            {
+                return $this->servers;
+            }
+        };
+
+        $this->assertSame([$servers[0]], $renderer->handle());
+    }
+
+    public function test_transport_matrix_only_emits_supported_combinations(): void
+    {
+        $ws = ['network' => 'ws', 'network_settings' => ['path' => '/ws-test']];
+        $vmessWs = $this->trojanServer($ws);
+        $vmessGrpc = $this->trojanServer(['network' => 'grpc']);
+        $vmessReality = $this->trojanServer(['network' => 'tcp', 'tls' => 2]);
+
+        foreach ([QuantumultX::class, Surge::class, Surfboard::class] as $client) {
+            $this->assertStringContainsString('/ws-test', $client::buildVmess('pw', $vmessWs));
+            $this->assertSame('', $client::buildVmess('pw', $vmessGrpc));
+            $this->assertSame('', $client::buildVmess('pw', $vmessReality));
+        }
+        $this->assertSame('', QuantumultX::buildVless('pw', $vmessGrpc));
+        $this->assertSame('', Surge::buildTrojan('pw', $this->trojanServer($ws)));
+        $this->assertSame('', Surfboard::buildTrojan('pw', $this->trojanServer($ws)));
+        $trojanDefaultTls = $this->trojanServer([]);
+        unset($trojanDefaultTls['protocol_settings']['tls']);
+        $this->assertStringContainsString('over-tls=true', QuantumultX::buildTrojan('pw', $trojanDefaultTls));
+    }
+
+    public function test_hysteria_obfuscation_includes_type_and_password_when_supported(): void
+    {
+        $server = $this->hysteriaServer(2, 'Obfuscated');
+        $server['protocol_settings']['obfs'] = ['open' => true, 'type' => 'salamander', 'password' => 'obfs-test'];
+        $this->assertStringContainsString('salamander-password=obfs-test', Loon::buildHysteria('pw', $server, []));
+        $this->assertStringContainsString('salamander-password=obfs-test', Surge::buildHysteria('pw', $server));
+
+        $server['protocol_settings']['obfs']['type'] = 'unsupported-type';
+        $this->assertSame('', Loon::buildHysteria('pw', $server, []));
+        $this->assertSame('', Surge::buildHysteria('pw', $server));
+        $content = base64_decode((new Shadowrocket($this->subscriptionUser(), [$server]))->handle()->getContent(), true);
+        $this->assertStringNotContainsString('Obfuscated', $content);
+    }
+
+    public function test_unknown_requested_types_yield_empty_subscription(): void
+    {
+        $controller = app(ClientController::class);
+        $server = $this->trojanServer(['network' => 'tcp']);
+
+        foreach (['unknown-type', '|,｜'] as $types) {
+            $request = Request::create('/subscribe', 'GET', ['types' => $types]);
+            $this->assertSame('', $controller->doSubscribe($request, $this->subscriptionUser(), [$server])->getContent());
+        }
+
+        $request = Request::create('/subscribe');
+        $content = $controller->doSubscribe($request, $this->subscriptionUser(), [$server])->getContent();
+        $this->assertStringContainsString('trojan://', base64_decode($content, true));
+    }
+
+    public function test_surge_groups_only_include_rendered_hysteria_version(): void
+    {
+        SubscribeTemplate::updateOrCreate(['name' => 'surge'], ['content' => "[Proxy]\n\$proxies\n[Proxy Group]\nG = select, \$proxy_group\n"]);
+        Cache::store('redis')->flush();
+
+        $servers = [
+            $this->hysteriaServer(1, 'Old-Hysteria'),
+            $this->hysteriaServer(2, 'New-Hysteria'),
+            $this->hysteriaServer(3, 'Future-Hysteria'),
+        ];
+        $content = (new Surge($this->subscriptionUser(), $servers, 'surge', '2398'))->handle()->getContent();
+        $this->assertStringContainsString('New-Hysteria = hysteria2', $content);
+        $this->assertStringContainsString('G = select, New-Hysteria', $content);
+        $this->assertStringNotContainsString('Old-Hysteria', $content);
+        $this->assertStringNotContainsString('Future-Hysteria', $content);
+    }
+
+    private function subscriptionUser(): array
+    {
+        return ['u' => 0, 'd' => 0, 'transfer_enable' => 107374182400, 'expired_at' => null, 'token' => 'test-token'];
+    }
+
+    private function hysteriaServer(int $version, string $name): array
+    {
+        return array_replace($this->trojanServer([]), [
+            'type' => Server::TYPE_HYSTERIA,
+            'name' => $name,
+            'protocol_settings' => ['version' => $version, 'tls' => ['server_name' => 'node.example.test']],
+        ]);
     }
 
     private function trojanServer(array $protocolOverrides): array

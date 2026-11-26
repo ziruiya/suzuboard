@@ -7,6 +7,8 @@ use App\Models\Server;
 
 class Loon extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['loon'];
 
     public $allowedProtocols = [
@@ -356,6 +358,14 @@ class Loon extends AbstractProtocol
             $config[] = "download-bandwidth={$down}";
         }
         $config[] = "udp=true";
+        if (data_get($protocol_settings, 'obfs.open')) {
+            $obfsPassword = data_get($protocol_settings, 'obfs.password');
+            if (data_get($protocol_settings, 'obfs.type') !== 'salamander'
+                || !is_string($obfsPassword) || $obfsPassword === '' || strpbrk($obfsPassword, ",\r\n") !== false) {
+                return '';
+            }
+            $config[] = "salamander-password={$obfsPassword}";
+        }
         $config = array_filter($config);
         $uri = implode(',', $config);
         $uri .= "\r\n";

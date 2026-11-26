@@ -9,6 +9,8 @@ use App\Models\Server;
 
 class Surge extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['surge'];
     const CUSTOM_TEMPLATE_FILE = 'resources/rules/custom.surge.conf';
     const DEFAULT_TEMPLATE_FILE = 'resources/rules/default.surge.conf';
@@ -23,7 +25,13 @@ class Surge extends AbstractProtocol
         Server::TYPE_HTTP,
     ];
     protected $protocolRequirements = [
-        'surge.hysteria.protocol_settings.version' => [2 => '2398'],
+        '*.hysteria.protocol_settings.version' => ['whitelist' => [2], 'strict' => true],
+        'surge.hysteria.base_version' => '2398',
+    ];
+
+    protected const TRANSPORTS = [
+        'vmess' => [0 => ['tcp', 'ws'], 1 => ['tcp', 'ws']],
+        'trojan' => [1 => ['tcp']],
     ];
 
     public function handle()
@@ -34,9 +42,10 @@ class Surge extends AbstractProtocol
         $appName = admin_setting('app_name', 'XBoard');
 
         $proxies = '';
-        $proxyGroup = '';
+        $proxyGroup = [];
 
         foreach ($servers as $item) {
+            $line = '';
             if (
                 $item['type'] === Server::TYPE_SHADOWSOCKS
                 && in_array(data_get($item, 'protocol_settings.cipher'), [
@@ -48,42 +57,31 @@ class Surge extends AbstractProtocol
                     '2022-blake3-aes-256-gcm'
                 ])
             ) {
-                $proxies .= self::buildShadowsocks($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildShadowsocks($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_VMESS) {
-                $proxies .= self::buildVmess($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildVmess($item['password'], $item);
             }
-            // AUD-033: Surge supports gRPC for VLESS only; a Trojan+gRPC
-            // node rendered as plain Trojan is a permanently broken line,
-            // so it is omitted from this client's config (the same
-            // treatment this codebase gives every unsupported combination).
-            if (
-                $item['type'] === Server::TYPE_TROJAN
-                && data_get($item, 'protocol_settings.network') !== 'grpc'
-            ) {
-                $proxies .= self::buildTrojan($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+            if ($item['type'] === Server::TYPE_TROJAN) {
+                $line = self::buildTrojan($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_HYSTERIA) {
-                $proxies .= self::buildHysteria($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildHysteria($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_ANYTLS) {
-                $proxies .= self::buildAnyTLS($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildAnyTLS($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_SOCKS) {
-                $proxies .= self::buildSocks($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildSocks($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_HTTP) {
-                $proxies .= self::buildHttp($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildHttp($item['password'], $item);
+            }
+            if ($line !== '') {
+                $proxies .= $line;
+                $proxyGroup[] = $item['name'];
             }
         }
-
 
         $config = subscribe_template('surge');
 
@@ -94,7 +92,7 @@ class Surge extends AbstractProtocol
         $config = str_replace('$subs_link', $subsURL, $config);
         $config = str_replace('$subs_domain', $subsDomain, $config);
         $config = str_replace('$proxies', $proxies, $config);
-        $config = str_replace('$proxy_group', rtrim($proxyGroup, ', '), $config);
+        $config = str_replace('$proxy_group', implode(', ', $proxyGroup), $config);
 
         $upload = round($user['u'] / (1024 * 1024 * 1024), 2);
         $download = round($user['d'] / (1024 * 1024 * 1024), 2);
@@ -158,6 +156,9 @@ class Surge extends AbstractProtocol
     public static function buildVmess($uuid, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('vmess', $protocol_settings)) {
+            return '';
+        }
         $config = [
             "{$server['name']} = vmess",
             "{$server['host']}",
@@ -197,6 +198,9 @@ class Surge extends AbstractProtocol
     public static function buildTrojan($password, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('trojan', $protocol_settings)) {
+            return '';
+        }
         $config = [
             "{$server['name']} = trojan",
             "{$server['host']}",
@@ -260,6 +264,14 @@ class Surge extends AbstractProtocol
         }
         if (data_get($protocol_settings, 'tls.allow_insecure')) {
             $config[] = !!data_get($protocol_settings, 'tls.allow_insecure') ? 'skip-cert-verify=true' : 'skip-cert-verify=false';
+        }
+        if (data_get($protocol_settings, 'obfs.open')) {
+            $obfsPassword = data_get($protocol_settings, 'obfs.password');
+            if (data_get($protocol_settings, 'obfs.type') !== 'salamander'
+                || !is_string($obfsPassword) || $obfsPassword === '' || strpbrk($obfsPassword, ",\r\n") !== false) {
+                return '';
+            }
+            $config[] = "salamander-password={$obfsPassword}";
         }
         $config = array_filter($config);
         $uri = implode(',', $config);

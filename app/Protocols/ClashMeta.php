@@ -10,6 +10,8 @@ use App\Support\AbstractProtocol;
 
 class ClashMeta extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['meta', 'verge', 'flclash', 'nekobox', 'clashmetaforandroid'];
     const CUSTOM_TEMPLATE_FILE = 'resources/rules/custom.clashmeta.yaml';
     const CUSTOM_CLASH_TEMPLATE_FILE = 'resources/rules/custom.clash.yaml';

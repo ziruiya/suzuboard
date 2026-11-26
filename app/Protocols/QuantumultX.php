@@ -19,6 +19,12 @@ class QuantumultX extends AbstractProtocol
         Server::TYPE_HTTP,
     ];
 
+    protected const TRANSPORTS = [
+        'vmess' => [0 => ['tcp', 'tcp-http', 'ws'], 1 => ['tcp', 'ws']],
+        'vless' => [0 => ['tcp', 'tcp-http', 'ws'], 1 => ['tcp', 'ws'], 2 => ['tcp']],
+        'trojan' => [1 => ['tcp', 'ws']],
+    ];
+
     public function handle()
     {
         $servers = $this->servers;
@@ -86,6 +92,9 @@ class QuantumultX extends AbstractProtocol
     public static function buildVmess($uuid, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('vmess', $protocol_settings)) {
+            return '';
+        }
         $addr = Helper::wrapIPv6($server['host']);
         $config = [
             "vmess={$addr}:{$server['port']}",
@@ -102,6 +111,9 @@ class QuantumultX extends AbstractProtocol
     public static function buildVless($uuid, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('vless', $protocol_settings)) {
+            return '';
+        }
         $addr = Helper::wrapIPv6($server['host']);
         $config = [
             "vless={$addr}:{$server['port']}",
@@ -122,7 +134,7 @@ class QuantumultX extends AbstractProtocol
 
     private static function applyTransportSettings(&$config, $settings, bool $nativeTls = false, ?array $tlsData = null)
     {
-        $tlsMode = (int) data_get($settings, 'tls', 0);
+        $tlsMode = (int) (data_get($settings, 'tls') ?? ($nativeTls ? 1 : 0));
         $network = data_get($settings, 'network', 'tcp');
         $host = null;
         $isWs = $network === 'ws';
@@ -184,13 +196,7 @@ class QuantumultX extends AbstractProtocol
     public static function buildTrojan($password, $server)
     {
         $protocol_settings = $server['protocol_settings'];
-        // AUD-032: Quantumult X cannot express Trojan over gRPC (its
-        // Trojan transports are TCP/WebSocket only; gRPC exists only for
-        // VMess). Rendering the node as plain Trojan would hand users a
-        // permanently broken line, so — like every other unsupported
-        // combination in this codebase — the node is omitted from this
-        // client's config instead of being silently degraded.
-        if (data_get($protocol_settings, 'network') === 'grpc') {
+        if (!self::supportsTransport('trojan', $protocol_settings)) {
             return '';
         }
         $addr = Helper::wrapIPv6($server['host']);

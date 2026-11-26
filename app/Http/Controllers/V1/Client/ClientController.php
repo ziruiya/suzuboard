@@ -126,7 +126,7 @@ class ClientController extends Controller
     {
         return collect($servers)->filter(function ($server) use ($allowedTypes, $filterKeywords) {
             // Condition 1: Server type must be in the list of allowed types
-            if ($allowedTypes && !in_array($server['type'], $allowedTypes)) {
+            if (!in_array($server['type'], $allowedTypes, true)) {
                 return false; // Filter out (don't keep)
             }
 
@@ -151,36 +151,18 @@ class ClientController extends Controller
 
         $clientName = null;
         $clientVersion = null;
-
-        if (preg_match('/([a-zA-Z0-9\-_]+)[\/\s]+(v?[0-9]+(?:\.[0-9]+){0,2})/', $flag, $matches)) {
-            $potentialName = strtolower($matches[1]);
-            $clientVersion = preg_replace('/^v/', '', $matches[2]);
-
-            if (in_array($potentialName, app('protocols.flags'))) {
-                $clientName = $potentialName;
+        $flags = collect(app('protocols.flags'))->sortByDesc(fn($name) => strlen($name));
+        foreach ($flags as $name) {
+            if (!str_contains($flag, $name)) {
+                continue;
             }
-        }
 
-        if (!$clientName) {
-            $flags = collect(app('protocols.flags'))->sortByDesc(fn($f) => strlen($f))->values()->all();
-            foreach ($flags as $name) {
-                if (stripos($flag, $name) !== false) {
-                    $clientName = $name;
-                    if (!$clientVersion) {
-                        $pattern = '/' . preg_quote($name, '/') . '[\/\s]+(v?[0-9]+(?:\.[0-9]+){0,2})/i';
-                        if (preg_match($pattern, $flag, $vMatches)) {
-                            $clientVersion = preg_replace('/^v/', '', $vMatches[1]);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if (!$clientVersion) {
-            if (preg_match('/\/v?(\d+(?:\.\d+){0,2})/', $flag, $matches)) {
+            $clientName = $name;
+            $pattern = '/' . preg_quote($name, '/') . '[\/\s]+v?(\d+(?:\.\d+)*)(?=$|[\s\/;(])/';
+            if (preg_match($pattern, $flag, $matches)) {
                 $clientVersion = $matches[1];
             }
+            break;
         }
 
         return [

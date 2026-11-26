@@ -9,6 +9,8 @@ use Log;
 
 class SingBox extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['sing-box', 'hiddify', 'sfm'];
     public $allowedProtocols = [
         Server::TYPE_SHADOWSOCKS,

@@ -117,12 +117,19 @@ class LocalCaptchaService
     public function verify(string $id, string $answer): string
     {
         $key = CacheKey::get('LOCAL_CAPTCHA_CHALLENGE', $id);
-        $stored = Cache::get($key);
-        if (!is_string($stored)) {
+        try {
+            $stored = Cache::lock('local_captcha_consume_' . hash('sha256', $id), 10)
+                ->block(1, function () use ($key) {
+                    $stored = Cache::get($key);
+                    return is_string($stored) && Cache::forget($key) ? $stored : null;
+                });
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException) {
             return self::RESULT_EXPIRED;
         }
 
-        Cache::forget($key);
+        if ($stored === null) {
+            return self::RESULT_EXPIRED;
+        }
 
         return hash_equals($stored, $this->hashAnswer($answer))
             ? self::RESULT_OK

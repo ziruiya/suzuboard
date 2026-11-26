@@ -115,13 +115,9 @@ class MailLinkService
             return $lock->block(5, function () use ($key) {
                 $payload = Cache::get($key);
 
-                if ($payload === null) {
+                if ($payload === null || !Cache::forget($key)) {
                     return null;
                 }
-
-                // Consume exactly once, whatever the validation outcome:
-                // a ticket that fails validation is dead, not retryable.
-                Cache::forget($key);
 
                 // SB-TA-012 hard cut (GPT review ruling): tickets
                 // issued by the previous code stored a bare user id

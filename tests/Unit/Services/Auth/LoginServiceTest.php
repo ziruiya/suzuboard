@@ -4,6 +4,7 @@ namespace Tests\Unit\Services\Auth;
 
 use App\Models\User;
 use App\Services\Auth\LoginService;
+use App\Support\Setting;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -80,6 +81,27 @@ class LoginServiceTest extends TestCase
 
         $this->assertTrue($validator->fails());
         $this->assertArrayHasKey('email_code', $validator->errors()->toArray());
+    }
+
+    public function test_credential_budget_is_recorded_before_account_lookup(): void
+    {
+        config()->set('cache.stores.redis', ['driver' => 'array']);
+        Cache::forgetDriver('redis');
+        app()->forgetInstance(Setting::class);
+        admin_setting(['password_limit_enable' => 1, 'password_limit_count' => 1]);
+
+        [, $result] = $this->service->login('missing@example.com', 'any-password');
+        $this->assertSame(400, $result[0]);
+        $this->assertSame(1, Cache::get(CacheKey::get('PASSWORD_ERROR_LIMIT', 'missing@example.com')));
+    }
+
+    public function test_reset_reserves_budget_before_successful_validation(): void
+    {
+        $user = $this->createUser('reserve@example.com', 'old-password');
+        Cache::put(CacheKey::get('EMAIL_VERIFY_CODE', $user->email), 123456, 300);
+
+        $this->assertSame([true, true], $this->service->resetPassword($user->email, '123456', 'new-password'));
+        $this->assertSame(1, Cache::get(CacheKey::get('FORGET_REQUEST_LIMIT', $user->email)));
     }
 
     private function createUser(string $email, string $password): User

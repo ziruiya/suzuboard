@@ -137,6 +137,7 @@ class ServerService
     public static function getAvailableServers(User $user): array
     {
         $servers = Server::whereJsonContains('group_ids', (string) $user->group_id)
+            ->where('enabled', true)
             ->where('show', true)
             ->whereNotIn('id', \App\Models\SuzuNodeProfile::query()
                 ->where('rollout_stage', '!=', 'production')

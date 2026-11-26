@@ -8,6 +8,8 @@ use App\Models\Server;
 
 class Shadowrocket extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['shadowrocket'];
     public $allowedProtocols = [
         Server::TYPE_SHADOWSOCKS,
@@ -22,8 +24,8 @@ class Shadowrocket extends AbstractProtocol
 
     protected $protocolRequirements = [
         'shadowrocket.hysteria.protocol_settings.version' => [2 => '1993'],
-        'shadowrocket.anytls.base_version' => '2592',
-        'shadowrocket.trojan.protocol_settings.network' => [
+        '*.anytls.base_version' => '2592',
+        '*.trojan.protocol_settings.network' => [
             'whitelist' => ['tcp', 'ws', 'grpc', 'h2', 'httpupgrade'],
             'strict' => true,
         ],

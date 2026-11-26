@@ -3,6 +3,7 @@
 namespace App\Services\Auth;
 
 use App\Models\User;
+use App\Services\AppRateLimitService;
 use App\Services\Plugin\HookManager;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
@@ -21,20 +22,17 @@ class LoginService
     {
         $email = User::normalizeEmail($email);
 
-        // 检查密码错误限制
-        if ((int) admin_setting('password_limit_enable', true)) {
-            $passwordErrorCount = (int) Cache::get(CacheKey::get('PASSWORD_ERROR_LIMIT', $email), 0);
-            if ($passwordErrorCount >= (int) admin_setting('password_limit_count', 5)) {
-                return [
-                    false,
-                    [
-                        429,
-                        __('There are too many password errors, please try again after :minute minutes.', [
-                            'minute' => admin_setting('password_limit_expire', 60)
-                        ])
-                    ]
-                ];
-            }
+        $limitMinutes = (int) admin_setting('password_limit_expire', 60);
+        if ((int) admin_setting('password_limit_enable', true)
+            && !app(AppRateLimitService::class)->attempt(
+                'PASSWORD_ERROR_LIMIT',
+                $email,
+                (int) admin_setting('password_limit_count', 5),
+                60 * max(1, $limitMinutes)
+            )) {
+            return [false, [429, __('There are too many password errors, please try again after :minute minutes.', [
+                'minute' => $limitMinutes,
+            ])]];
         }
 
         // 查找用户
@@ -52,15 +50,6 @@ class LoginService
                 $user->password
             )
         ) {
-            // 增加密码错误计数
-            if ((int) admin_setting('password_limit_enable', true)) {
-                $passwordErrorCount = (int) Cache::get(CacheKey::get('PASSWORD_ERROR_LIMIT', $email), 0);
-                Cache::put(
-                    CacheKey::get('PASSWORD_ERROR_LIMIT', $email),
-                    (int) $passwordErrorCount + 1,
-                    60 * (int) admin_setting('password_limit_expire', 60)
-                );
-            }
             return [false, [400, __('Incorrect email or password')]];
         }
 
@@ -90,16 +79,13 @@ class LoginService
         $email = User::normalizeEmail($email);
 
         // 检查重置请求限制
-        $forgetRequestLimitKey = CacheKey::get('FORGET_REQUEST_LIMIT', $email);
-        $forgetRequestLimit = (int) Cache::get($forgetRequestLimitKey);
-        if ($forgetRequestLimit >= 3) {
+        if (!app(AppRateLimitService::class)->attempt('FORGET_REQUEST_LIMIT', $email, 3, 300)) {
             return [false, [429, __('Reset failed, Please try again later')]];
         }
 
         // 验证邮箱验证码
         $cachedEmailCode = Cache::get(CacheKey::get('EMAIL_VERIFY_CODE', $email));
         if ($cachedEmailCode === null || !hash_equals((string) $cachedEmailCode, $emailCode)) {
-            Cache::put($forgetRequestLimitKey, $forgetRequestLimit ? $forgetRequestLimit + 1 : 1, 300);
             return [false, [400, __('Incorrect email verification code')]];
         }
 

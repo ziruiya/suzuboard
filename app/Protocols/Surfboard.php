@@ -20,6 +20,11 @@ class Surfboard extends AbstractProtocol
     const DEFAULT_TEMPLATE_FILE = 'resources/rules/default.surfboard.conf';
 
 
+    protected const TRANSPORTS = [
+        'vmess' => [0 => ['tcp', 'ws'], 1 => ['tcp', 'ws']],
+        'trojan' => [1 => ['tcp']],
+    ];
+
     public function handle()
     {
         $servers = $this->servers;
@@ -28,9 +33,10 @@ class Surfboard extends AbstractProtocol
         $appName = admin_setting('app_name', 'XBoard');
 
         $proxies = '';
-        $proxyGroup = '';
+        $proxyGroup = [];
 
         foreach ($servers as $item) {
+            $line = '';
             if (
                 $item['type'] === Server::TYPE_SHADOWSOCKS
                 && in_array(data_get($item, 'protocol_settings.cipher'), [
@@ -43,33 +49,20 @@ class Surfboard extends AbstractProtocol
                     '2022-blake3-chacha20-poly1305'      
                 ])
             ) {
-                // [Proxy]
-                $proxies .= self::buildShadowsocks($item['password'], $item);
-                // [Proxy Group]
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildShadowsocks($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_VMESS) {
-                // [Proxy]
-                $proxies .= self::buildVmess($item['password'], $item);
-                // [Proxy Group]
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildVmess($item['password'], $item);
             }
-            // AUD-033: Surfboard explicitly does not support Trojan
-            // gRPC; rendering it as plain Trojan would produce a
-            // permanently broken line, so it is omitted from this
-            // client's config instead of being silently degraded.
-            if (
-                $item['type'] === Server::TYPE_TROJAN
-                && data_get($item, 'protocol_settings.network') !== 'grpc'
-            ) {
-                // [Proxy]
-                $proxies .= self::buildTrojan($item['password'], $item);
-                // [Proxy Group]
-                $proxyGroup .= $item['name'] . ', ';
+            if ($item['type'] === Server::TYPE_TROJAN) {
+                $line = self::buildTrojan($item['password'], $item);
             }
             if ($item['type'] === Server::TYPE_ANYTLS) {
-                $proxies .= self::buildAnyTLS($item['password'], $item);
-                $proxyGroup .= $item['name'] . ', ';
+                $line = self::buildAnyTLS($item['password'], $item);
+            }
+            if ($line !== '') {
+                $proxies .= $line;
+                $proxyGroup[] = $item['name'];
             }
         }
 
@@ -81,7 +74,7 @@ class Surfboard extends AbstractProtocol
         $config = str_replace('$subs_link', $subsURL, $config);
         $config = str_replace('$subs_domain', $subsDomain, $config);
         $config = str_replace('$proxies', $proxies, $config);
-        $config = str_replace('$proxy_group', rtrim($proxyGroup, ', '), $config);
+        $config = str_replace('$proxy_group', implode(', ', $proxyGroup), $config);
 
         $upload = round($user['u'] / (1024 * 1024 * 1024), 2);
         $download = round($user['d'] / (1024 * 1024 * 1024), 2);
@@ -147,6 +140,9 @@ class Surfboard extends AbstractProtocol
     public static function buildVmess($uuid, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('vmess', $protocol_settings)) {
+            return '';
+        }
         $config = [
             "{$server['name']}=vmess",
             "{$server['host']}",
@@ -188,6 +184,9 @@ class Surfboard extends AbstractProtocol
     public static function buildTrojan($password, $server)
     {
         $protocol_settings = $server['protocol_settings'];
+        if (!self::supportsTransport('trojan', $protocol_settings)) {
+            return '';
+        }
         $config = [
             "{$server['name']}=trojan",
             "{$server['host']}",

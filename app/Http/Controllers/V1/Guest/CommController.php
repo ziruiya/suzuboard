@@ -3,12 +3,13 @@
 namespace App\Http\Controllers\V1\Guest;
 
 use App\Http\Controllers\Controller;
+use App\Services\AppRateLimitService;
 use App\Services\CaptchaService;
 use App\Services\LocalCaptchaService;
 use App\Services\Plugin\HookManager;
-use App\Utils\Dict;
+use App\Utils\CacheKey;
 use App\Utils\Helper;
-use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Request;
 
 class CommController extends Controller
 {
@@ -49,8 +50,20 @@ class CommController extends Controller
      * The answer is stored server-side only; the response carries the
      * challenge id and the PNG as a base64 data URI.
      */
-    public function captcha()
+    public function captcha(Request $request, AppRateLimitService $rateLimit)
     {
+        if (CaptchaService::appCaptchaMode() !== 'local') {
+            return $this->fail([404, __('Local captcha is unavailable')]);
+        }
+
+        $global = CacheKey::get('LOCAL_CAPTCHA_GLOBAL_RATE_LIMIT', 'ALL');
+        if (!$rateLimit->reserve($global, [
+            $global => 300,
+            CacheKey::get('LOCAL_CAPTCHA_IP_RATE_LIMIT', (string) $request->ip()) => 15,
+        ], 60)) {
+            return $this->fail([429, __('Too many requests')]);
+        }
+
         $challenge = app(LocalCaptchaService::class)->issue();
 
         return $this->success([

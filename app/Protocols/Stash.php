@@ -10,6 +10,8 @@ use App\Models\Server;
 
 class Stash extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['stash'];
     public $allowedProtocols = [
         Server::TYPE_SHADOWSOCKS,

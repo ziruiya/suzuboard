@@ -46,6 +46,11 @@ abstract class AbstractProtocol
      */
     protected $allowedProtocols = [];
 
+    /** Supported transports indexed by protocol and TLS mode. */
+    protected const TRANSPORTS = [];
+
+    protected const HYSTERIA2_OBFUSCATION = [];
+
     /**
      * 构造函数
      *
@@ -64,6 +69,17 @@ abstract class AbstractProtocol
         $this->userAgent = $userAgent;
         $this->protocolRequirements = $this->normalizeProtocolRequirements($this->protocolRequirements);
         $this->servers = HookManager::filter('protocol.servers.filtered', $this->filterServersByVersion());
+        $this->servers = collect($this->servers)->filter(static function ($server): bool {
+            if (($server['type'] ?? null) !== 'hysteria'
+                || (int) data_get($server, 'protocol_settings.version') !== 2
+                || !data_get($server, 'protocol_settings.obfs.open')) {
+                return true;
+            }
+
+            $password = data_get($server, 'protocol_settings.obfs.password');
+            return is_string($password) && $password !== ''
+                && in_array(data_get($server, 'protocol_settings.obfs.type'), static::HYSTERIA2_OBFUSCATION, true);
+        })->values()->all();
     }
 
     /**
@@ -93,10 +109,6 @@ abstract class AbstractProtocol
         $this->filterByAllowedProtocols();
         $hasGlobalConfig = isset($this->protocolRequirements['*']);
         $hasClientConfig = isset($this->protocolRequirements[$this->clientName]);
-
-        if ((blank($this->clientName) || blank($this->clientVersion)) && !$hasGlobalConfig) {
-            return $this->servers;
-        }
 
         if (!$hasGlobalConfig && !$hasClientConfig) {
             return $this->servers;
@@ -141,57 +153,69 @@ abstract class AbstractProtocol
      */
     private function checkRequirements(array $requirements, array $server): bool
     {
-        foreach ($requirements as $field => $filterRule) {
-            if (in_array($field, ['base_version', 'incompatible'])) {
+        if (!$this->meetsMinimumVersion($requirements['base_version'] ?? '0.0.0')) {
+            return false;
+        }
+
+        $incompatible = $requirements['incompatible'] ?? false;
+        if ($incompatible === true) {
+            return false;
+        }
+        // Each incompatible field lists values that this renderer rejects.
+        foreach ((array) $incompatible as $field => $values) {
+            if (in_array(data_get($server, $field), (array) $values, true)) {
+                return false;
+            }
+        }
+
+        foreach ($requirements as $field => $rule) {
+            if ($field === 'base_version' || $field === 'incompatible') {
                 continue;
             }
 
-            $actualValue = data_get($server, $field);
+            $values = $rule['whitelist'] ?? $rule;
+            if (isset($rule['whitelist']) && array_is_list($values)) {
+                $values = array_fill_keys($values, '0.0.0');
+            }
 
-            if (is_array($filterRule) && isset($filterRule['whitelist'])) {
-                $allowedValues = $filterRule['whitelist'];
-                $strict = $filterRule['strict'] ?? false;
-                // Normalize flat array ['tcp', 'ws'] to ['tcp' => '0.0.0', 'ws' => '0.0.0']
-                if (!empty($allowedValues) && is_int(array_key_first($allowedValues))) {
-                    $allowedValues = array_fill_keys($allowedValues, '0.0.0');
+            $actual = data_get($server, $field);
+            if (is_bool($actual)) {
+                $actual = (int) $actual;
+            }
+            if ((!is_string($actual) && !is_int($actual)) || !isset($values[$actual])) {
+                if ($rule['strict'] ?? false) {
+                    return false;
                 }
-                if ($strict) {
-                    if ($actualValue === null) {
-                        return false;
-                    }
-                    if (!is_string($actualValue) && !is_int($actualValue)) {
-                        return false;
-                    }
-                    if (!isset($allowedValues[$actualValue])) {
-                        return false;
-                    }
-                    $requiredVersion = $allowedValues[$actualValue];
-                    if ($requiredVersion !== '0.0.0' && version_compare($this->clientVersion, $requiredVersion, '<')) {
-                        return false;
-                    }
-                    continue;
-                }
-            } else {
-                $allowedValues = $filterRule;
-                $strict = false;
-            }
-
-            if ($actualValue === null) {
                 continue;
             }
-            if (!is_string($actualValue) && !is_int($actualValue)) {
-                continue;
-            }
-            if (!isset($allowedValues[$actualValue])) {
-                continue;
-            }
-            $requiredVersion = $allowedValues[$actualValue];
-            if ($requiredVersion !== '0.0.0' && version_compare($this->clientVersion, $requiredVersion, '<')) {
+            if (!$this->meetsMinimumVersion($values[$actual])) {
                 return false;
             }
         }
 
         return true;
+    }
+
+    private function meetsMinimumVersion(string $minimum): bool
+    {
+        return $minimum === '0.0.0'
+            || (is_string($this->clientVersion)
+                && preg_match('/^[0-9]+(?:\.[0-9]+)*$/D', $this->clientVersion)
+                && version_compare($this->clientVersion, $minimum, '>='));
+    }
+
+    protected static function supportsTransport(string $protocol, array $settings): bool
+    {
+        $tls = $settings['tls'] ?? ($protocol === 'trojan' ? 1 : 0);
+        $network = $settings['network'] ?? 'tcp';
+        if (!in_array($network, static::TRANSPORTS[$protocol][$tls] ?? [], true)) {
+            return false;
+        }
+
+        $header = data_get($settings, 'network_settings.header.type') ?? 'none';
+        return $network !== 'tcp'
+            || in_array($header, ['none', 'tcp'], true)
+            || ($header === 'http' && in_array('tcp-http', static::TRANSPORTS[$protocol][$tls], true));
     }
 
     /**

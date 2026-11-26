@@ -2,20 +2,15 @@
 
 namespace Tests\Feature\Passport;
 
-use App\Models\AdminAuditLog;
 use App\Services\CaptchaService;
 use App\Services\EmailVerifyGuardService;
 use App\Support\Setting;
+use App\Utils\CacheKey;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
-/**
- * AUD-001 Part A: layered rate limits on sendEmailVerify (per-domain
- * and site-wide, on top of the unchanged per-IP limit) and the anomaly
- * tripwire that flips app_captcha_mode to 'turnstile'.
- */
 class EmailVerifyGuardTest extends TestCase
 {
     use RefreshDatabase;
@@ -66,54 +61,37 @@ class EmailVerifyGuardTest extends TestCase
         $this->send('d@four.example')->assertStatus(429);
     }
 
-    public function test_anomaly_tripwire_flips_mode_to_turnstile_and_writes_an_audit_row(): void
-    {
-        admin_setting([EmailVerifyGuardService::SETTING_ANOMALY_THRESHOLD => 3]);
-
-        $this->send('a@one.example')->assertOk();
-        $this->send('b@two.example')->assertOk();
-        $this->assertSame('exempt', CaptchaService::appCaptchaMode());
-        $this->assertSame(0, AdminAuditLog::where('action', EmailVerifyGuardService::AUDIT_ACTION_AUTO_FLIP)->count());
-
-        // The third attempt crosses the threshold: the flip happens
-        // inside this request, so the request itself now faces
-        // Turnstile and fails - the brake engaging is the point.
-        $this->send('c@three.example')->assertStatus(400);
-
-        $this->assertSame('turnstile', CaptchaService::appCaptchaMode());
-        $row = AdminAuditLog::where('action', EmailVerifyGuardService::AUDIT_ACTION_AUTO_FLIP)->first();
-        $this->assertNotNull($row);
-        $data = json_decode((string) $row->request_data, true);
-        $this->assertSame('exempt', $data['old_value']);
-        $this->assertSame('turnstile', $data['new_value']);
-        $this->assertSame(3, $data['window_count']);
-    }
-
-    public function test_anomaly_tripwire_stays_quiet_below_the_threshold(): void
-    {
-        admin_setting([EmailVerifyGuardService::SETTING_ANOMALY_THRESHOLD => 5]);
-
-        $this->send('a@one.example')->assertOk();
-        $this->send('b@two.example')->assertOk();
-        $this->send('c@three.example')->assertOk();
-
-        $this->assertSame('exempt', CaptchaService::appCaptchaMode());
-        $this->assertSame(0, AdminAuditLog::where('action', EmailVerifyGuardService::AUDIT_ACTION_AUTO_FLIP)->count());
-    }
-
-    public function test_anomaly_tripwire_does_not_flip_when_already_turnstile(): void
+    public function test_rejected_challenge_leaves_send_budget_and_mode_untouched(): void
     {
         admin_setting([
-            EmailVerifyGuardService::SETTING_ANOMALY_THRESHOLD => 2,
-            'app_captcha_mode' => 'turnstile',
+            EmailVerifyGuardService::SETTING_ANOMALY_THRESHOLD => 1,
+            'app_captcha_mode' => 'local',
         ]);
 
-        // Requests fail Turnstile (no token), but the attempts are
-        // still counted; no flip and no audit row may be produced.
         $this->send('a@one.example')->assertStatus(400);
-        $this->send('b@two.example')->assertStatus(400);
 
-        $this->assertSame('turnstile', CaptchaService::appCaptchaMode());
-        $this->assertSame(0, AdminAuditLog::where('action', EmailVerifyGuardService::AUDIT_ACTION_AUTO_FLIP)->count());
+        $this->assertSame('local', CaptchaService::appCaptchaMode());
+        $this->assertNull(Cache::get(CacheKey::get('APP_EMAIL_VERIFY_GLOBAL_RATE_LIMIT', 'ALL')));
+        $this->assertNull(Cache::get(CacheKey::get('APP_EMAIL_VERIFY_DOMAIN_RATE_LIMIT', 'one.example')));
+        $this->assertNull(Cache::get(CacheKey::get('APP_EMAIL_VERIFY_ANOMALY_RATE_LIMIT', 'ALL')));
+    }
+
+    public function test_address_cooldown_leaves_budget_for_another_address(): void
+    {
+        admin_setting([EmailVerifyGuardService::SETTING_GLOBAL_LIMIT => 2]);
+
+        $this->send('a@one.example')->assertOk();
+        $this->send('a@one.example')->assertStatus(400);
+        $this->send('b@one.example')->assertOk();
+    }
+
+    public function test_successful_send_at_anomaly_threshold_keeps_admin_mode(): void
+    {
+        admin_setting([EmailVerifyGuardService::SETTING_ANOMALY_THRESHOLD => 1]);
+
+        $this->send('a@one.example')->assertOk();
+
+        $this->assertSame('exempt', CaptchaService::appCaptchaMode());
+        $this->assertSame(1, Cache::get(CacheKey::get('APP_EMAIL_VERIFY_ANOMALY_RATE_LIMIT', 'ALL')));
     }
 }

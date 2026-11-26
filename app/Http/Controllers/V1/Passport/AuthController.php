@@ -8,11 +8,13 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Passport\AuthForget;
 use App\Http\Requests\Passport\AuthLogin;
 use App\Http\Requests\Passport\AuthRegister;
+use App\Services\AppRateLimitService;
 use App\Services\Auth\LoginService;
 use App\Services\Auth\MailLinkService;
 use App\Services\Auth\RegisterService;
 use App\Services\AuthService;
 use App\Services\CaptchaService;
+use App\Utils\CacheKey;
 use Illuminate\Http\Request;
 
 class AuthController extends Controller
@@ -79,6 +81,11 @@ class AuthController extends Controller
      */
     public function login(AuthLogin $request)
     {
+        if ((int) admin_setting('password_limit_enable', true)
+            && !$this->reserveCredentialRequest($request, 'LOGIN')) {
+            return $this->fail([429, __('Too many requests')]);
+        }
+
         $email = $request->input('email');
         $password = $request->input('password');
 
@@ -175,6 +182,10 @@ class AuthController extends Controller
      */
     public function forget(AuthForget $request)
     {
+        if (!$this->reserveCredentialRequest($request, 'RESET')) {
+            return $this->fail([429, __('Too many requests')]);
+        }
+
         [$success, $result] = $this->loginService->resetPassword(
             $request->input('email'),
             $request->input('email_code'),
@@ -186,5 +197,14 @@ class AuthController extends Controller
         }
 
         return $this->success(true);
+    }
+
+    private function reserveCredentialRequest(Request $request, string $action): bool
+    {
+        $global = CacheKey::get($action . '_GLOBAL_RATE_LIMIT', 'ALL');
+        return app(AppRateLimitService::class)->reserve($global, [
+            $global => 600,
+            CacheKey::get($action . '_IP_RATE_LIMIT', (string) $request->ip()) => 30,
+        ], 60);
     }
 }

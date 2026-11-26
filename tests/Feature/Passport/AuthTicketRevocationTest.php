@@ -6,6 +6,7 @@ use App\Models\User;
 use App\Services\Auth\LoginService;
 use App\Services\Auth\MailLinkService;
 use App\Services\AuthService;
+use App\Utils\CacheKey;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -99,6 +100,23 @@ class AuthTicketRevocationTest extends TestCase
     }
 
     // ---------------- TA-012 ----------------
+
+    public function test_ticket_requires_confirmed_cache_deletion(): void
+    {
+        $ticket = 'cache-delete-failure';
+        $key = CacheKey::get('TEMP_TOKEN', $ticket);
+        Cache::put($key, MailLinkService::ticketPayload($this->makeUser(), null), 60);
+        $store = new class extends \Illuminate\Cache\ArrayStore {
+            public function forget($key): bool
+            {
+                return false;
+            }
+        };
+        $store->put($key, Cache::get($key), 60);
+        Cache::swap(new \Illuminate\Cache\Repository($store));
+
+        $this->assertNull(app(MailLinkService::class)->handleTokenLogin($ticket));
+    }
 
     public function test_quick_login_ticket_redeems_once_and_dies_with_its_session(): void
     {

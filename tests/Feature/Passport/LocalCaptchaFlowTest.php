@@ -80,6 +80,49 @@ class LocalCaptchaFlowTest extends TestCase
         $this->assertIsString(Cache::get(CacheKey::get('LOCAL_CAPTCHA_CHALLENGE', $id)));
     }
 
+    public function test_non_local_mode_skips_challenge_generation(): void
+    {
+        admin_setting(['app_captcha_mode' => 'exempt']);
+        $issuer = $this->mock(LocalCaptchaService::class);
+        $issuer->shouldReceive('issue')->andReturn([
+            'id' => 'challenge-stub',
+            'image' => 'data:image/png;base64,',
+            'expires_in' => LocalCaptchaService::TTL_SECONDS,
+        ]);
+
+        $this->getJson('/api/v1/guest/comm/captcha')->assertNotFound();
+        $issuer->shouldNotHaveReceived('issue');
+    }
+
+    public function test_capped_source_skips_challenge_generation(): void
+    {
+        Cache::put(CacheKey::get('LOCAL_CAPTCHA_IP_RATE_LIMIT', '127.0.0.1'), 15, 60);
+        $issuer = $this->mock(LocalCaptchaService::class);
+        $issuer->shouldReceive('issue')->andReturn([
+            'id' => 'challenge-stub',
+            'image' => 'data:image/png;base64,',
+            'expires_in' => LocalCaptchaService::TTL_SECONDS,
+        ]);
+
+        $this->getJson('/api/v1/guest/comm/captcha')->assertTooManyRequests();
+        $issuer->shouldNotHaveReceived('issue');
+        $this->assertNull(Cache::get(CacheKey::get('LOCAL_CAPTCHA_GLOBAL_RATE_LIMIT', 'ALL')));
+    }
+
+    public function test_capped_global_budget_skips_challenge_generation(): void
+    {
+        Cache::put(CacheKey::get('LOCAL_CAPTCHA_GLOBAL_RATE_LIMIT', 'ALL'), 300, 60);
+        $issuer = $this->mock(LocalCaptchaService::class);
+        $issuer->shouldReceive('issue')->andReturn([
+            'id' => 'challenge-stub',
+            'image' => 'data:image/png;base64,',
+            'expires_in' => LocalCaptchaService::TTL_SECONDS,
+        ]);
+
+        $this->getJson('/api/v1/guest/comm/captcha')->assertTooManyRequests();
+        $issuer->shouldNotHaveReceived('issue');
+    }
+
     public function test_send_email_verify_without_captcha_fields_reports_app_captcha_required(): void
     {
         $response = $this->appPost('/api/v1/passport/comm/sendEmailVerify', [

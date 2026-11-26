@@ -65,6 +65,18 @@ class AgentNodeVisibilityTest extends EnterpriseTestCase
         ]);
     }
 
+    public function test_subscription_excludes_disabled_visible_nodes(): void
+    {
+        $group = (int) $this->ordinaryGroup->id;
+        $user = $this->liveUser($group);
+        $live = $this->makePlainServer([$group]);
+        $disabled = $this->makePlainServer([$group], ['enabled' => false]);
+
+        $ids = array_column(ServerService::getAvailableServers($user), 'id');
+        $this->assertContains($live->id, $ids);
+        $this->assertNotContains($disabled->id, $ids);
+    }
+
     private function stockServer(): Server
     {
         $kit = $this->buildReadyKit();

@@ -3,11 +3,11 @@
 namespace App\Services;
 
 use App\Utils\CacheKey;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
 
 /**
- * Fixed-window per-IP attempt counter used as a compensating control
- * on the passport endpoints (sendEmailVerify / register).
+ * Fixed-window budgets for public endpoints and authentication.
  *
  * Follows the codebase's existing Cache-based rate-limit style
  * (see RegisterService's REGISTER_IP_RATE_LIMIT). The IP passed in is
@@ -27,7 +27,37 @@ class AppRateLimitService
      */
     public function attempt(string $bucket, string $ip, int $maxAttempts, int $decaySeconds = 3600): bool
     {
-        return $this->hit($bucket, $ip, $decaySeconds) <= $maxAttempts;
+        $key = CacheKey::get($bucket, $ip);
+        return $this->reserve($key, [$key => $maxAttempts], $decaySeconds);
+    }
+
+    /**
+     * Reserve all budgets together after checking each cap under the same lock.
+     *
+     * @param array<string, int> $limits Cache keys and their caps
+     */
+    public function reserve(string $scope, array $limits, int $decaySeconds): bool
+    {
+        try {
+            return $this->lock($scope)
+                ->block(1, function () use ($limits, $decaySeconds) {
+                    foreach ($limits as $key => $maxAttempts) {
+                        if ((int) Cache::get($key, 0) >= $maxAttempts) {
+                            return false;
+                        }
+                    }
+
+                    foreach ($limits as $key => $maxAttempts) {
+                        if ($this->increment($key, $decaySeconds) < 1) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                });
+        } catch (LockTimeoutException) {
+            return false;
+        }
     }
 
     /**
@@ -40,6 +70,21 @@ class AppRateLimitService
     public function hit(string $bucket, string $key, int $decaySeconds = 3600): int
     {
         $cacheKey = CacheKey::get($bucket, $key);
+        try {
+            return $this->lock($cacheKey)
+                ->block(1, fn() => $this->increment($cacheKey, $decaySeconds));
+        } catch (LockTimeoutException) {
+            return 0;
+        }
+    }
+
+    private function lock(string $scope): \Illuminate\Contracts\Cache\Lock
+    {
+        return Cache::lock('rate_limit:' . hash('sha256', $scope), 10);
+    }
+
+    private function increment(string $cacheKey, int $decaySeconds): int
+    {
         // Open the window on first sight; add() is a no-op afterwards.
         Cache::add($cacheKey, 0, $decaySeconds);
         return (int) Cache::increment($cacheKey);

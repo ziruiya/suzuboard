@@ -25,18 +25,6 @@ class CommController extends Controller
             return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
         }
 
-        // Layered abuse guard (AUD-001): count the attempt for the
-        // anomaly tripwire, then enforce the per-domain limit and the
-        // site-wide hourly budget on top of the per-IP limit above.
-        $guard = app(EmailVerifyGuardService::class);
-        $guard->recordAttemptAndDetectAnomaly((string) $request->ip());
-        if (!$guard->domainAllowed((string) $request->input('email'))) {
-            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
-        }
-        if (!$guard->globalAllowed()) {
-            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
-        }
-
         // 验证人机验证码
         $captchaService = app(CaptchaService::class);
         [$captchaValid, $captchaError] = $captchaService->verify($request);
@@ -57,9 +45,16 @@ class CommController extends Controller
             }
         }
 
-        if (Cache::get(CacheKey::get('LAST_SEND_EMAIL_VERIFY_TIMESTAMP', $email))) {
+        $cooldownKey = CacheKey::get('LAST_SEND_EMAIL_VERIFY_TIMESTAMP', $email);
+        if (!Cache::add($cooldownKey, time(), 60)) {
             return $this->fail([400, __('Email verification code has been sent, please request again later')]);
         }
+        $guard = app(EmailVerifyGuardService::class);
+        if (!$guard->reserveSend($email)) {
+            Cache::forget($cooldownKey);
+            return $this->fail([429, __('Sending frequently, please try again after :minute minute', ['minute' => 60])]);
+        }
+
         $code = rand(100000, 999999);
         $subject = admin_setting('app_name', 'XBoard') . __('Email verification code');
 
@@ -75,7 +70,7 @@ class CommController extends Controller
         ]);
 
         Cache::put(CacheKey::get('EMAIL_VERIFY_CODE', $email), $code, 300);
-        Cache::put(CacheKey::get('LAST_SEND_EMAIL_VERIFY_TIMESTAMP', $email), time(), 60);
+        $guard->recordSend();
         return $this->success(true);
     }
 

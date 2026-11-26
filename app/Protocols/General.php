@@ -9,6 +9,8 @@ use App\Support\AbstractProtocol;
 
 class General extends AbstractProtocol
 {
+    protected const HYSTERIA2_OBFUSCATION = ['salamander'];
+
     public $flags = ['general', 'v2rayn', 'v2rayng', 'passwall', 'ssrplus', 'sagernet'];
 
     public $allowedProtocols = [

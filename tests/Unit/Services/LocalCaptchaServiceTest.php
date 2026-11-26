@@ -79,6 +79,21 @@ class LocalCaptchaServiceTest extends TestCase
         $this->assertSame(LocalCaptchaService::RESULT_EXPIRED, $this->service->verify('challenge-replay', 'AB3K'));
     }
 
+    public function test_captcha_requires_confirmed_cache_deletion(): void
+    {
+        $this->seedChallenge('store-failure', 'AB3K');
+        $store = new class extends \Illuminate\Cache\ArrayStore {
+            public function forget($key): bool
+            {
+                return false;
+            }
+        };
+        $store->put(CacheKey::get('LOCAL_CAPTCHA_CHALLENGE', 'store-failure'), Cache::get(CacheKey::get('LOCAL_CAPTCHA_CHALLENGE', 'store-failure')), 60);
+        Cache::swap(new \Illuminate\Cache\Repository($store));
+
+        $this->assertSame(LocalCaptchaService::RESULT_EXPIRED, $this->service->verify('store-failure', 'AB3K'));
+    }
+
     public function test_unknown_challenge_reports_expired(): void
     {
         $this->assertSame(LocalCaptchaService::RESULT_EXPIRED, $this->service->verify('no-such-id', 'AB3K'));
