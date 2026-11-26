@@ -188,7 +188,12 @@ class PaymentController extends Controller
      * number, or a misrouted callback), or the re-notification may
      * report a different amount than the recorded one. Either
      * mismatch is refused (no acknowledgement), logged as a conflict
-     * naming both orders, and left to manual reconciliation.
+     * naming both orders, and left to manual reconciliation. The
+     * recorded-receipt check runs before the currency early return:
+     * that return is the policy for a callback_no with nothing on
+     * the books, never a bypass around the strict check. Incomplete
+     * evidence still fails first — a missing currency cannot be
+     * compared against the recorded row at all.
      */
     private function recordReceiptOnPaidOrder(Order $order, $callbackNo, array $verify): bool
     {
@@ -207,16 +212,23 @@ class PaymentController extends Controller
             ]);
             return false;
         }
+        // M-P2-01 (final branch): the recorded-receipt check runs
+        // BEFORE the currency early return below. A callback_no that
+        // is already on the books must pass the strict replay check
+        // whatever currency this notification claims — otherwise a
+        // same-number foreign-currency callback would be silently
+        // acknowledged here without ever being compared against the
+        // recorded CNY receipt.
+        $existing = \App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->first();
+        if ($existing) {
+            return $this->acknowledgeRecordedReceipt($existing, $order, $callbackNo, $verify);
+        }
         if (strtoupper((string) $verify['paid_currency']) !== 'CNY') {
             Log::warning('payment notify for paid order: currency mismatch, receipt not recorded', [
                 'trade_no' => $order->trade_no,
                 'paid_currency' => $verify['paid_currency'],
             ]);
             return true;
-        }
-        $existing = \App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->first();
-        if ($existing) {
-            return $this->acknowledgeRecordedReceipt($existing, $order, $callbackNo, $verify);
         }
         try {
             \App\Models\OrderReceipt::create([

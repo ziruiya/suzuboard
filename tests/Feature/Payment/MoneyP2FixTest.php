@@ -717,6 +717,49 @@ class MoneyP2FixTest extends TestCase
         $this->assertSame(1, OrderReceipt::count());
     }
 
+    public function test_receipt_replay_with_foreign_currency_is_refused_when_receipt_recorded(): void
+    {
+        $user = $this->makeUser();
+        $plan = $this->makePlan();
+        $order = $this->makeOrder($user, $plan, [
+            'status' => Order::STATUS_COMPLETED,
+            'callback_no' => 'TXN-FIRST',
+            'paid_at' => time(),
+        ]);
+
+        // A second payment is recorded under TX-100 in CNY at 2900.
+        $this->assertTrue($this->callHandle($order, 'TX-100', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+
+        // A same-number callback now claims USD at the same amount.
+        // M-P2-01 (final branch): the recorded-receipt check runs
+        // before the currency early return, so this must hit the
+        // strict comparison and be REFUSED as a currency conflict,
+        // with the conflict logged and the recorded receipt
+        // untouched — pre-fix the non-CNY branch acknowledged it
+        // outright without ever looking at the recorded CNY receipt.
+        \Illuminate\Support\Facades\Log::spy();
+        $this->assertFalse($this->callHandle($order, 'TX-100', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'USD',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+        $receipt = OrderReceipt::first();
+        $this->assertSame('CNY', $receipt->paid_currency);
+        $this->assertSame(2900, (int) $receipt->paid_amount_cents);
+        $this->assertSame($order->id, (int) $receipt->order_id);
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('error');
+
+        // The currency early return itself is unchanged for a
+        // callback_no with nothing on the books: logged and
+        // acknowledged, nothing recorded.
+        $this->assertTrue($this->callHandle($order, 'TX-200', [
+            'paid_amount_cents' => 2900, 'paid_currency' => 'USD',
+        ]));
+        $this->assertSame(1, OrderReceipt::count());
+    }
+
     public function test_checkout_records_payment_attempt(): void
     {
         Plugin::create([
