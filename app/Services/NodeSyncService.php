@@ -23,6 +23,36 @@ class NodeSyncService
      * behind it (node reconnects already trigger a full sync as well).
      */
     public const USERS_RESYNC_PENDING_KEY = 'node:users_resync_pending';
+    public const CONFIG_RESYNC_PENDING_KEY = 'node:config_resync_pending';
+
+    public static function updateConfigResyncPending(int $nodeId, int $revision, bool $clear): void
+    {
+        try {
+            $updated = Redis::eval(<<<'LUA'
+                local pending = redis.call('HGET', KEYS[1], ARGV[1])
+                local revision = ARGV[2]
+                -- Compare decimal strings to preserve the full Redis integer range.
+                local newer = pending and (#pending > #revision or (#pending == #revision and pending > revision))
+                if not newer then
+                    if ARGV[3] == '1' then
+                        redis.call('HDEL', KEYS[1], ARGV[1])
+                    else
+                        redis.call('HSET', KEYS[1], ARGV[1], revision)
+                    end
+                end
+                return 1
+                LUA, 1, self::CONFIG_RESYNC_PENDING_KEY, (string) $nodeId, (string) $revision, $clear ? '1' : '0');
+            if ($updated === false) {
+                throw new \RuntimeException('Redis rejected the config resync update');
+            }
+        } catch (\Throwable $e) {
+            Log::warning("[NodePush] Redis config resync update failed: {$e->getMessage()}", [
+                'node_id' => $nodeId,
+                'state_revision' => $revision,
+                'clear' => $clear,
+            ]);
+        }
+    }
 
     public static function markUsersResyncPending(int $nodeId): void
     {

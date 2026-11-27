@@ -28,16 +28,24 @@ class NodeUserResync extends Command
 {
     protected $signature = 'suzu:node-resync';
 
-    protected $description = 'Re-push full user lists to nodes whose WS delta may have been missed (AUD-035)';
+    protected $description = 'Re-push pending full node configurations and user lists (AUD-035)';
 
     public function handle(): int
+    {
+        $this->resyncUsers();
+        $this->resyncConfig();
+
+        return self::SUCCESS;
+    }
+
+    private function resyncUsers(): void
     {
         try {
             $nodeIds = Redis::smembers(NodeSyncService::USERS_RESYNC_PENDING_KEY);
         } catch (\Throwable $e) {
             Log::warning("[NodeResync] Redis read failed: {$e->getMessage()}");
             $this->warn('redis unavailable, nothing to reconcile');
-            return self::SUCCESS;
+            return;
         }
 
         $pushed = 0;
@@ -58,6 +66,31 @@ class NodeUserResync extends Command
         }
 
         $this->info("node-resync: {$pushed} node(s) re-pushed, " . count($nodeIds) . ' pending total');
-        return self::SUCCESS;
+    }
+
+    private function resyncConfig(): void
+    {
+        try {
+            $pending = Redis::hgetall(NodeSyncService::CONFIG_RESYNC_PENDING_KEY);
+            if ($pending === false) {
+                throw new \RuntimeException('Redis rejected the pending config read');
+            }
+        } catch (\Throwable $e) {
+            Log::warning("[NodeResync] Redis config read failed: {$e->getMessage()}");
+            return;
+        }
+
+        foreach ($pending as $nodeId => $revision) {
+            $nodeId = (int) $nodeId;
+            $node = Server::find($nodeId);
+            if (!$node || !ServerService::isMachineDeliverable($node)) {
+                NodeSyncService::updateConfigResyncPending($nodeId, (int) $revision, true);
+                continue;
+            }
+            if (NodeSyncService::isNodeOnline($nodeId)) {
+                NodeSyncService::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
+                // Only the worker can confirm the socket write and clear the mark.
+            }
+        }
     }
 }

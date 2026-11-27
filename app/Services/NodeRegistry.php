@@ -136,7 +136,7 @@ class NodeRegistry
         }
 
         $result = $conn->send($payload);
-        if ($result !== false && $revisionKey !== null && is_int($revision)) {
+        if ($result === true && $revisionKey !== null && is_int($revision)) {
             $conn->stateRevisions[$revisionKey] = $revision;
         }
 

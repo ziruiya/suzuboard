@@ -6,9 +6,12 @@ use App\Services\DevicePushDelivery;
 use App\Services\DeviceStateService;
 use App\Services\NodeRegistry;
 use App\Services\NodeSyncService;
+use App\Services\ServerService;
 use App\WebSocket\NodeEventHandlers;
 use App\WebSocket\NodeWorker;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Redis;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Mockery;
 use Workerman\Connection\TcpConnection;
 
@@ -51,7 +54,12 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
     public function test_initial_sync_uses_current_revisions_and_suppresses_older_queued_events(): void
     {
         $nodeId = $this->vipServer->id;
-        Redis::shouldReceive('eval')->once()->andReturn(null);
+        Redis::shouldReceive('eval')->once()
+            ->with(Mockery::type('string'), 2, 'device:push_pending_nodes', "device:push_delivery:{$nodeId}", $nodeId, Mockery::type('int'))
+            ->andReturn(null);
+        Redis::shouldReceive('eval')->once()
+            ->with(Mockery::type('string'), 1, NodeSyncService::CONFIG_RESYNC_PENDING_KEY, (string) $nodeId, '2', '1')
+            ->andReturn(1);
         Redis::shouldReceive('get')->with("node:state_revision:{$nodeId}:config")->once()->andReturn('2');
         Redis::shouldReceive('get')->with("node:state_revision:{$nodeId}:users")->once()->andReturn('5');
         $conn = Mockery::mock(TcpConnection::class);
@@ -75,6 +83,112 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
             'base_revision' => 3,
             'state_revision' => 4,
         ]));
+    }
+
+    public static function unconfirmedSocketResults(): array
+    {
+        return ['false' => [false], 'null' => [null]];
+    }
+
+    #[DataProvider('unconfirmedSocketResults')]
+    public function test_unconfirmed_send_preserves_watermark_until_same_revision_is_written(?bool $unconfirmed): void
+    {
+        $nodeId = $this->vipServer->id;
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('send')->twice()->andReturn($unconfirmed, true);
+        NodeRegistry::add($nodeId, $conn);
+
+        $data = ['config' => [], 'state_revision' => 7];
+        $key = "{$nodeId}:config";
+        $this->assertFalse(NodeRegistry::send($nodeId, 'sync.config', $data));
+        $this->assertArrayNotHasKey($key, $conn->stateRevisions ?? []);
+        $this->assertTrue(NodeRegistry::send($nodeId, 'sync.config', $data));
+        $this->assertSame(7, $conn->stateRevisions[$key]);
+        $this->assertFalse(NodeRegistry::send($nodeId, 'sync.config', ['config' => [], 'state_revision' => 6]));
+        $this->assertSame(7, $conn->stateRevisions[$key]);
+    }
+
+    public function test_failed_initial_config_write_is_recorded_and_cleared_on_reconnect(): void
+    {
+        $this->useDedicatedRedis();
+        $nodeId = $this->vipServer->id;
+        $key = NodeSyncService::CONFIG_RESYNC_PENDING_KEY;
+        NodeSyncService::push($nodeId, 'sync.config', ['config' => []]);
+
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('send')->twice()->andReturn(null, true);
+        NodeRegistry::add($nodeId, $conn);
+        NodeEventHandlers::pushFullSync($this->vipServer);
+
+        $this->assertSame('1', Redis::hget($key, $nodeId));
+
+        NodeRegistry::remove($nodeId, $conn);
+        $reconnected = Mockery::mock(TcpConnection::class);
+        $frames = [];
+        $reconnected->shouldReceive('send')->twice()->andReturnUsing(function (string $payload) use (&$frames) {
+            $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+            return true;
+        });
+        NodeRegistry::add($nodeId, $reconnected);
+        NodeEventHandlers::pushFullSync($this->vipServer->fresh());
+
+        $this->assertSame(['sync.config', 'sync.users'], array_column($frames, 'event'));
+        $this->assertSame(1, $frames[0]['data']['state_revision']);
+        $this->assertEquals(ServerService::buildNodeConfig($this->vipServer), $frames[0]['data']['config']);
+        $this->assertFalse(Redis::hexists($key, $nodeId));
+    }
+
+    public function test_worker_config_failure_survives_periodic_publish_until_socket_write(): void
+    {
+        $socket = $this->useDedicatedRedis();
+        $channel = config('database.redis.options.prefix') . 'node:push';
+        $subscriber = stream_socket_client('unix://' . $socket, timeout: 2);
+        stream_set_timeout($subscriber, 2);
+        fwrite($subscriber, "SUBSCRIBE {$channel}\r\n");
+        $this->assertSame(['subscribe', $channel, 1], $this->readPubSubFrame($subscriber));
+
+        try {
+            $nodeId = $this->vipServer->id;
+            $key = NodeSyncService::CONFIG_RESYNC_PENDING_KEY;
+            Cache::put("node_ws_alive:{$nodeId}", true);
+
+            $worker = new NodeWorker('127.0.0.1', 0);
+            $conn = Mockery::mock(TcpConnection::class);
+            $frames = [];
+            $conn->shouldReceive('send')->times(3)->andReturnUsing(function (string $payload) use (&$frames) {
+                $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+                return count($frames) === 3;
+            });
+            NodeRegistry::add($nodeId, $conn);
+
+            NodeSyncService::push($nodeId, 'sync.config', ['config' => []]);
+            [, , $first] = $this->readPubSubFrame($subscriber);
+            $worker->onRedisPush($first);
+            $this->assertSame('1', Redis::hget($key, $nodeId));
+
+            $this->artisan('suzu:node-resync')->assertExitCode(0);
+            $this->assertSame('1', Redis::hget($key, $nodeId));
+            [, , $retry] = $this->readPubSubFrame($subscriber);
+            $worker->onRedisPush($retry);
+            $this->assertSame('2', Redis::hget($key, $nodeId));
+
+            $this->artisan('suzu:node-resync')->assertExitCode(0);
+            $this->assertSame('2', Redis::hget($key, $nodeId));
+            [, , $recovered] = $this->readPubSubFrame($subscriber);
+            $worker->onRedisPush($recovered);
+
+            $this->assertSame(['sync.config', 'sync.config', 'sync.config'], array_column($frames, 'event'));
+            $this->assertSame([1, 2, 3], array_column(array_column($frames, 'data'), 'state_revision'));
+            $this->assertEquals(ServerService::buildNodeConfig($this->vipServer), $frames[2]['data']['config']);
+            $this->assertFalse(Redis::hexists($key, $nodeId));
+
+            $worker->onRedisPush($retry);
+            $this->assertFalse(Redis::hexists($key, $nodeId));
+            $this->artisan('suzu:node-resync')->assertExitCode(0);
+            $this->assertSame(3, NodeSyncService::currentRevision($nodeId, 'sync.config'));
+        } finally {
+            fclose($subscriber);
+        }
     }
 
     public function test_device_failure_remains_pending_until_write_then_report_confirms_it(): void

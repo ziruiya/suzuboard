@@ -263,6 +263,11 @@ class AuditTailFixesTest extends EnterpriseTestCase
             ->once()
             ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY, $server->id);
 
+        Redis::shouldReceive('hgetall')
+            ->once()
+            ->with(NodeSyncService::CONFIG_RESYNC_PENDING_KEY)
+            ->andReturn([]);
+
         $this->artisan('suzu:node-resync')->assertExitCode(0);
 
         $this->assertCount(1, $published);

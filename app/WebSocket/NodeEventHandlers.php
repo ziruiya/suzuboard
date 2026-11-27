@@ -109,6 +109,17 @@ class NodeEventHandlers
         Log::debug("[WS] Device sync to node#{$nodeId}", ['written' => $sent]);
     }
 
+    public static function recordConfigWriteResult(int $nodeId, int $revision, bool $written): void
+    {
+        $conn = NodeRegistry::get($nodeId);
+        if (!$written && $revision <= ($conn->stateRevisions["{$nodeId}:config"] ?? -1)) {
+            // The registry already confirmed this revision or a newer snapshot.
+            return;
+        }
+
+        NodeSyncService::updateConfigResyncPending($nodeId, $revision, $written);
+    }
+
     /**
      * Push full config + users to newly connected node.
      */
@@ -123,6 +134,8 @@ class NodeEventHandlers
                 'config' => ServerService::buildNodeConfig($node),
                 'state_revision' => $configRevision,
             ]);
+
+            self::recordConfigWriteResult($nodeId, $configRevision, $configSent);
 
             $usersRevision = NodeSyncService::currentRevision($nodeId, 'sync.users');
             $users = ServerService::getAvailableUsers($node)->toArray();

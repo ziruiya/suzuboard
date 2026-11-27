@@ -431,6 +431,9 @@ class NodeWorker
         if ($nodeId && $event && NodeRegistry::get($nodeId)) {
             // Registry checks the epoch immediately before writing to the socket.
             $sent = NodeRegistry::send($nodeId, $event, $data);
+            if ($event === 'sync.config' && is_int($data['state_revision'] ?? null)) {
+                NodeEventHandlers::recordConfigWriteResult($nodeId, $data['state_revision'], $sent);
+            }
             Log::debug("[WS] {$event} to node#{$nodeId}", ['written' => $sent]);
         }
     }
