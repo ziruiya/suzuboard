@@ -158,21 +158,19 @@ class AuthController extends Controller
             ], 401);
         }
 
-        $user = AuthService::findUserByBearerToken($authorization);
+        $session = AuthService::findAccessTokenByBearerToken($authorization);
+        $user = $session?->tokenable;
 
-        if (!$user) {
+        if (!$user instanceof User) {
             return response()->json([
                 'message' => ResponseEnum::CLIENT_HTTP_UNAUTHORIZED_EXPIRED
             ], 401);
         }
 
-        // SB-TA-012: bind the quick-login ticket to this session, so
-        // revoking the session kills the ticket with it.
-        $accessToken = AuthService::findAccessTokenByBearerToken($authorization);
         $url = $this->loginService->generateQuickLoginUrl(
             $user,
             $request->input('redirect'),
-            $accessToken ? (int) $accessToken->id : null
+            (int) $session->id
         );
         return $this->success($url);
     }

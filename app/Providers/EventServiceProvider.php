@@ -10,6 +10,8 @@ use App\Observers\PlanObserver;
 use App\Observers\ServerObserver;
 use App\Observers\ServerRouteObserver;
 use App\Observers\UserObserver;
+use App\Support\CommittedModelUpdates;
+use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Foundation\Support\Providers\EventServiceProvider as ServiceProvider;
 use Illuminate\Support\Facades\Event;
 
@@ -29,6 +31,10 @@ class EventServiceProvider extends ServiceProvider
     public function boot()
     {
         parent::boot();
+
+        $updates = new CommittedModelUpdates();
+        $this->app->instance(CommittedModelUpdates::class, $updates);
+        Event::listen(TransactionCommitted::class, $updates->flush(...));
 
         User::observe(UserObserver::class);
         Plan::observe(PlanObserver::class);

@@ -7,6 +7,7 @@ use App\Models\TrafficResetLog;
 use App\Services\TrafficResetService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Database\Eloquent\Builder;
 
 class ResetTraffic extends Command
 {
@@ -34,11 +35,26 @@ class ResetTraffic extends Command
     }
 
     try {
-      $result = $fixNull ? $this->performFix() : ($force ? $this->performForce() : $this->performReset());
+      $result = $fixNull || $force ? $this->recalculate($fixNull) : $this->performReset();
+      if ($fixNull || $force) {
+        $remaining = 0;
+        foreach ($this->recalculationQuery(true)->with('plan')->lazyById(500) as $user) {
+          if ($this->trafficResetService->calculateNextResetTime($user) !== null) {
+            $remaining++;
+          }
+        }
+        if ($remaining > 0) {
+          $this->error("仍有 {$remaining} 名符合条件的用户缺少重置时间");
+        }
+        if ($remaining > 0 || $result['error_count'] > 0) {
+          $this->displayFixResults($result);
+          return self::FAILURE;
+        }
+      }
       $this->displayResults($result, $fixNull || $force);
       return self::SUCCESS;
 
-    } catch (\Exception $e) {
+    } catch (\Throwable $e) {
       $this->error("❌ 任务执行失败: {$e->getMessage()}");
 
       Log::error('流量重置命令执行失败', [
@@ -147,105 +163,46 @@ class ResetTraffic extends Command
     ];
   }
 
-  private function performFix(): array
+  private function recalculate(bool $onlyNull): array
   {
     $startTime = microtime(true);
-    $nullUsers = $this->getNullResetTimeUsers();
+    $found = 0;
+    $fixed = 0;
+    $errors = 0;
 
-    if ($nullUsers->isEmpty()) {
-      $this->info("✅ 没有发现next_reset_at为null的用户");
-      return [
-        'total_found' => 0,
-        'total_fixed' => 0,
-        'error_count' => 0,
-        'duration' => round(microtime(true) - $startTime, 2),
-      ];
-    }
-
-    $this->info("🔧 发现 {$nullUsers->count()} 个next_reset_at为null的用户，开始修正...");
-
-    $fixedCount = 0;
-    $errors = [];
-
-    foreach ($nullUsers as $user) {
+    foreach ($this->recalculationQuery($onlyNull)->select('id')->lazyById(500) as $candidate) {
+      $found++;
       try {
-        $nextResetTime = $this->trafficResetService->calculateNextResetTime($user);
-        if ($nextResetTime) {
-          $user->next_reset_at = $nextResetTime->timestamp;
-          $user->save();
-          $fixedCount++;
-        }
-      } catch (\Exception $e) {
-        $errors[] = [
-          'user_id' => $user->id,
-          'email' => $user->email,
-          'error' => $e->getMessage(),
-        ];
-        Log::error('修正用户next_reset_at失败', [
-          'user_id' => $user->id,
+        $fixed += (int) $candidate->getConnection()->transaction(function () use ($candidate, $onlyNull): bool {
+          $user = $this->recalculationQuery($onlyNull)->lockForUpdate()->find($candidate->id);
+          if (!$user) {
+            return false;
+          }
+          $user->next_reset_at = $this->trafficResetService->calculateNextResetTime($user)?->timestamp;
+          if (!$user->isDirty('next_reset_at')) {
+            return false;
+          }
+          if (!$user->save()) {
+            throw new \RuntimeException('User reset time update was rejected');
+          }
+          return true;
+        });
+      } catch (\Throwable $e) {
+        $errors++;
+        Log::error('重新计算用户 next_reset_at 失败', [
+          'user_id' => $candidate->id,
           'error' => $e->getMessage(),
         ]);
       }
     }
 
     return [
-      'total_found' => $nullUsers->count(),
-      'total_fixed' => $fixedCount,
-      'error_count' => count($errors),
+      'total_found' => $found,
+      'total_fixed' => $fixed,
+      'error_count' => $errors,
       'duration' => round(microtime(true) - $startTime, 2),
     ];
   }
-
-  private function performForce(): array
-  {
-    $startTime = microtime(true);
-    $allUsers = $this->getAllUsers();
-
-    if ($allUsers->isEmpty()) {
-      $this->info("✅ 没有发现需要处理的用户");
-      return [
-        'total_found' => 0,
-        'total_fixed' => 0,
-        'error_count' => 0,
-        'duration' => round(microtime(true) - $startTime, 2),
-      ];
-    }
-
-    $this->info("⚡ 发现 {$allUsers->count()} 个用户，开始重新计算重置时间...");
-
-    $fixedCount = 0;
-    $errors = [];
-
-    foreach ($allUsers as $user) {
-      try {
-        $nextResetTime = $this->trafficResetService->calculateNextResetTime($user);
-        if ($nextResetTime) {
-          $user->next_reset_at = $nextResetTime->timestamp;
-          $user->save();
-          $fixedCount++;
-        }
-      } catch (\Exception $e) {
-        $errors[] = [
-          'user_id' => $user->id,
-          'email' => $user->email,
-          'error' => $e->getMessage(),
-        ];
-        Log::error('强制重新计算用户next_reset_at失败', [
-          'user_id' => $user->id,
-          'error' => $e->getMessage(),
-        ]);
-      }
-    }
-
-    return [
-      'total_found' => $allUsers->count(),
-      'total_fixed' => $fixedCount,
-      'error_count' => count($errors),
-      'duration' => round(microtime(true) - $startTime, 2),
-    ];
-  }
-
-
 
   private function getResetQuery()
   {
@@ -261,29 +218,13 @@ class ResetTraffic extends Command
 
 
 
-  private function getNullResetTimeUsers()
+  private function recalculationQuery(bool $onlyNull): Builder
   {
-    return User::whereNull('next_reset_at')
-      ->whereNotNull('plan_id')
+    return User::query()->useWritePdo()->whereNotNull('plan_id')
       ->where(function ($query) {
-        $query->where('expired_at', '>', time())
-          ->orWhereNull('expired_at');
+        $query->where('expired_at', '>', time())->orWhereNull('expired_at');
       })
       ->where('banned', 0)
-      ->with('plan:id,name,reset_traffic_method')
-      ->get();
+      ->when($onlyNull, fn (Builder $query) => $query->whereNull('next_reset_at'));
   }
-
-  private function getAllUsers()
-  {
-    return User::whereNotNull('plan_id')
-      ->where(function ($query) {
-        $query->where('expired_at', '>', time())
-          ->orWhereNull('expired_at');
-      })
-      ->where('banned', 0)
-      ->with('plan:id,name,reset_traffic_method')
-      ->get();
-  }
-
 }

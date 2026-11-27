@@ -10,6 +10,7 @@ use App\Services\AppRateLimitService;
 use App\Services\CaptchaService;
 use App\Services\Plugin\HookManager;
 use App\Services\UserService;
+use App\Support\Setting;
 use App\Utils\CacheKey;
 use App\Utils\Dict;
 use App\Utils\Helper;
@@ -27,6 +28,10 @@ class RegisterService
      */
     public function validateRegister(Request $request): array
     {
+        if (!app(Setting::class)->isAvailable()) {
+            return [false, [503, __('Registration temporarily unavailable')]];
+        }
+
         // Compensating per-IP rate limit for this endpoint (hourly window)
         if (!app(AppRateLimitService::class)->attempt('APP_REGISTER_IP_RATE_LIMIT', (string) $request->ip(), 50)) {
             return [

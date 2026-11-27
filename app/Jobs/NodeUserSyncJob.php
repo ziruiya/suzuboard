@@ -20,13 +20,26 @@ class NodeUserSyncJob implements ShouldQueue
     public function __construct(
         private readonly int $userId,
         private readonly string $action,
-        private readonly ?int $oldGroupId = null
+        private readonly ?int $oldGroupId = null,
+        private readonly array $groupIds = [],
     ) {
         $this->onQueue('node_sync');
     }
 
+    public static function refreshGroups(array $groupIds): void
+    {
+        self::dispatch(0, 'refresh_groups', groupIds: $groupIds);
+    }
+
     public function handle(): void
     {
+        if ($this->action === 'refresh_groups') {
+            foreach ($this->groupIds as $groupId) {
+                NodeSyncService::notifyUsersUpdatedByGroup($groupId);
+            }
+            return;
+        }
+
         $user = User::find($this->userId);
 
         if ($this->action === 'updated' || $this->action === 'created') {

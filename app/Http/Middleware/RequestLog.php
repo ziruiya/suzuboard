@@ -83,6 +83,10 @@ class RequestLog
         if ($key !== null && $this->isSensitiveKey($key)) {
             return self::REDACTED;
         }
+        if (is_string($value) && strtolower($key ?? '') === 'config') {
+            $decoded = json_decode($value, true);
+            return is_array($decoded) ? $this->sanitize($decoded) : self::REDACTED;
+        }
         if (is_string($value) && $this->urlHasCredentials($value)) {
             return self::REDACTED;
         }

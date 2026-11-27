@@ -4,63 +4,62 @@ namespace App\Observers;
 
 use App\Models\Server;
 use App\Services\NodeSyncService;
+use App\Support\CommittedModelUpdates;
 
 class ServerObserver
 {
-    public bool $afterCommit = true;
+    private const CONFIG_FIELDS = [
+        'server_port', 'protocol_settings', 'type', 'route_ids', 'custom_outbounds', 'custom_routes', 'cert_config',
+    ];
+
+    public function __construct(private readonly CommittedModelUpdates $updates)
+    {
+    }
 
     public function created(Server $server): void
     {
-        $this->notifyMachineNodesChanged($server->machine_id);
+        $machineId = $server->machine_id;
+        if ($machineId) {
+            $server->getConnection()->afterCommit(fn () => NodeSyncService::notifyMachineNodesChanged($machineId));
+        }
     }
 
     public function updated(Server $server): void
     {
-        if ($server->wasChanged('group_ids')) {
-            NodeSyncService::notifyFullSync($server->id);
-        } elseif ($server->wasChanged([
-            'server_port',
-            'protocol_settings',
-            'type',
-            'route_ids',
-            'custom_outbounds',
-            'custom_routes',
-            'cert_config',
-        ])) {
-            NodeSyncService::notifyConfigUpdated($server->id);
+        $changed = array_intersect_key($server->getChanges(), array_flip([
+            'group_ids', 'machine_id', 'enabled', ...self::CONFIG_FIELDS,
+        ]));
+        if (!$changed) {
+            return;
         }
 
-        if ($server->wasChanged(['machine_id', 'enabled'])) {
-            $this->notifyMachineChange(
-                $server->machine_id,
-                $server->getOriginal('machine_id')
-            );
-        }
+        $this->updates->record(
+            $server,
+            ['machine_id' => $server->getOriginal('machine_id'), 'enabled' => $server->getOriginal('enabled')],
+            $changed,
+            function (Server $final, array $original, array $changed): void {
+                if (array_key_exists('group_ids', $changed)) {
+                    NodeSyncService::notifyFullSync($final->id);
+                } elseif (array_intersect_key($changed, array_flip(self::CONFIG_FIELDS))) {
+                    NodeSyncService::notifyConfigUpdated($final->id);
+                }
+
+                $oldMachineId = $original['machine_id'];
+                if ($oldMachineId !== $final->machine_id && $oldMachineId) {
+                    NodeSyncService::notifyMachineNodesChanged($oldMachineId);
+                }
+                if ($final->machine_id && ($oldMachineId !== $final->machine_id || $original['enabled'] !== $final->enabled)) {
+                    NodeSyncService::notifyMachineNodesChanged($final->machine_id);
+                }
+            },
+        );
     }
 
     public function deleted(Server $server): void
     {
-        $this->notifyMachineChange(null, $server->getOriginal('machine_id') ?: $server->machine_id);
-    }
-
-    private function notifyMachineChange(?int $newMachineId, ?int $oldMachineId): void
-    {
-        $notified = [];
-
-        if ($newMachineId) {
-            NodeSyncService::notifyMachineNodesChanged($newMachineId);
-            $notified[] = $newMachineId;
-        }
-
-        if ($oldMachineId && !in_array($oldMachineId, $notified, true)) {
-            NodeSyncService::notifyMachineNodesChanged($oldMachineId);
-        }
-    }
-
-    private function notifyMachineNodesChanged(?int $machineId): void
-    {
+        $machineId = $server->machine_id;
         if ($machineId) {
-            NodeSyncService::notifyMachineNodesChanged($machineId);
+            $server->getConnection()->afterCommit(fn () => NodeSyncService::notifyMachineNodesChanged($machineId));
         }
     }
 }

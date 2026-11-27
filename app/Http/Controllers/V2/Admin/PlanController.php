@@ -4,6 +4,7 @@ namespace App\Http\Controllers\V2\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\PlanSave;
+use App\Jobs\NodeUserSyncJob;
 use App\Models\Order;
 use App\Models\Plan;
 use App\Models\User;
@@ -46,12 +47,30 @@ class PlanController extends Controller
             DB::beginTransaction();
             try {
                 if ($request->input('force_update')) {
-                    User::where('plan_id', $plan->id)->update([
+                    $entitlements = [
                         'group_id' => $params['group_id'],
                         'transfer_enable' => $params['transfer_enable'] * 1073741824,
                         'speed_limit' => $params['speed_limit'],
                         'device_limit' => $params['device_limit'],
-                    ]);
+                    ];
+                    $groupIds = [];
+                    User::where('plan_id', $plan->id)
+                        ->select('id', 'group_id')
+                        ->lockForUpdate()
+                        ->chunkById(500, function ($users) use ($entitlements, &$groupIds) {
+                            foreach ($users as $user) {
+                                if ($user->group_id !== null) {
+                                    $groupIds[(int) $user->group_id] = true;
+                                }
+                            }
+                            if ($entitlements['group_id'] !== null) {
+                                $groupIds[(int) $entitlements['group_id']] = true;
+                            }
+                            User::whereKey($users->modelKeys())->update($entitlements);
+                        });
+                    if ($groupIds !== []) {
+                        DB::afterCommit(fn () => NodeUserSyncJob::refreshGroups(array_keys($groupIds)));
+                    }
                 }
                 $plan->update($params);
                 DB::commit();

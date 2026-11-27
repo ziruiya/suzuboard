@@ -17,6 +17,7 @@ use App\Services\UserService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
+use Laravel\Sanctum\PersonalAccessToken;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
@@ -221,7 +222,12 @@ class UserController extends Controller
     {
         $user = $request->user();
 
-        $url = $this->loginService->generateQuickLoginUrl($user, $request->input('redirect'));
+        $session = $user->currentAccessToken();
+        if (!$session instanceof PersonalAccessToken || !$session->exists) {
+            return $this->fail([401, __('Unauthenticated')]);
+        }
+
+        $url = $this->loginService->generateQuickLoginUrl($user, $request->input('redirect'), (int) $session->id);
         return $this->success($url);
     }
 }

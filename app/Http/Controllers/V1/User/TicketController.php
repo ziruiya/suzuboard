@@ -26,13 +26,12 @@ class TicketController extends Controller
         if ($request->input('id')) {
             $ticket = Ticket::where('id', $request->input('id'))
                 ->where('user_id', $request->user()->id)
-                ->first()
-                ->load('message');
+                ->with('message')
+                ->first();
             if (!$ticket) {
-                return $this->fail([400, __('Ticket does not exist')]);
+                return $this->fail([404, __('Ticket does not exist')]);
             }
-            $ticket['message'] = TicketMessage::where('ticket_id', $ticket->id)->get();
-            $ticket['message']->each(function ($message) use ($ticket) {
+            $ticket->message->each(function ($message) use ($ticket) {
                 $message['is_me'] = ($message['user_id'] == $ticket->user_id);
             });
             return $this->success(TicketResource::make($ticket)->additional(['message' => true]));

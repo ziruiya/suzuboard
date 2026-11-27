@@ -134,9 +134,9 @@ class LoginService
      * @param string $redirect 重定向路径
      * @return string|null 快速登录URL
      */
-    public function generateQuickLoginUrl(User $user, ?string $redirect = null, ?int $sessionId = null): ?string
+    public function generateQuickLoginUrl(User $user, ?string $redirect, int $sessionId): ?string
     {
-        if (!$user || !$user->exists) {
+        if (!$user->exists || $sessionId <= 0) {
             return null;
         }
 

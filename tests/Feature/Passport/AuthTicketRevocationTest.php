@@ -73,7 +73,7 @@ class AuthTicketRevocationTest extends TestCase
         ], $overrides));
     }
 
-    private function quickLoginCode(User $user, ?int $sessionId): string
+    private function quickLoginCode(User $user, int $sessionId): string
     {
         $url = (new LoginService())->generateQuickLoginUrl($user, 'dashboard', $sessionId);
         $this->assertNotNull($url);

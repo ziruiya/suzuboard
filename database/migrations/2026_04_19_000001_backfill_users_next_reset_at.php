@@ -2,7 +2,6 @@
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Support\Facades\Artisan;
-use Illuminate\Support\Facades\Schema;
 
 /**
  * One-shot backfill of users.next_reset_at for legacy installs.
@@ -14,11 +13,9 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration {
     public function up(): void
     {
-        if (!Schema::hasColumn('v2_user', 'next_reset_at')) {
-            return;
+        if (Artisan::call('reset:traffic', ['--fix-null' => true]) !== 0) {
+            throw new RuntimeException('User reset time backfill failed: ' . Artisan::output());
         }
-
-        Artisan::call('reset:traffic', ['--fix-null' => true]);
     }
 
     public function down(): void

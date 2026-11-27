@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\User;
 use App\Models\Plan;
 use App\Models\TrafficResetLog;
+use App\Support\Setting;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -76,6 +77,11 @@ class TrafficResetService
         $oldTotal = $oldUpload + $oldDownload;
 
         $nextResetTime = $this->calculateNextResetTime($locked);
+        if ($onlyIfDue && $nextResetTime === null) {
+          $locked->update(['next_reset_at' => null]);
+          $user->next_reset_at = null;
+          return false;
+        }
 
         $resetAt = time();
         $resetCount = ($locked->reset_count ?? 0) + 1;
@@ -138,20 +144,20 @@ class TrafficResetService
    */
   public function calculateNextResetTime(User $user): ?Carbon
   {
-    if (
-      !$user->plan
-      || $user->plan->reset_traffic_method === Plan::RESET_TRAFFIC_NEVER
-      || ($user->plan->reset_traffic_method === Plan::RESET_TRAFFIC_FOLLOW_SYSTEM
-        && (int) admin_setting('reset_traffic_method', Plan::RESET_TRAFFIC_MONTHLY) === Plan::RESET_TRAFFIC_NEVER)
-      || $user->expired_at === NULL
-    ) {
+    if (!$user->plan) {
       return null;
     }
 
     $resetMethod = $user->plan->reset_traffic_method;
-
     if ($resetMethod === Plan::RESET_TRAFFIC_FOLLOW_SYSTEM) {
+      if (!app(Setting::class)->isAvailable()) {
+        throw new \RuntimeException('Traffic reset policy unavailable');
+      }
       $resetMethod = (int) admin_setting('reset_traffic_method', Plan::RESET_TRAFFIC_MONTHLY);
+    }
+
+    if ($user->expired_at === null && $resetMethod !== Plan::RESET_TRAFFIC_MONTHLY) {
+      return null;
     }
 
     $now = Carbon::now(config('app.timezone'));
@@ -203,6 +209,10 @@ class TrafficResetService
    */
   private function getNextMonthlyReset(User $user, Carbon $from): Carbon
   {
+    if ($user->expired_at === null) {
+      return $this->getNextMonthFirstDay($from);
+    }
+
     $expiredAt = Carbon::createFromTimestamp($user->expired_at, config('app.timezone'));
     $resetDay = $expiredAt->day;
     $resetTime = [$expiredAt->hour, $expiredAt->minute, $expiredAt->second];
