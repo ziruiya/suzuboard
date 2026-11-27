@@ -501,4 +501,146 @@ class TrafficBatchInboxTest extends TestCase
         $this->assertSame(700, (int) StatUser::where('user_id', $user->id)->firstOrFail()->u);
         $this->assertSame(700, (int) StatServer::where('server_id', $server->id)->firstOrFail()->u);
     }
+    public function test_original_report_replay_uses_first_group_snapshot(): void
+    {
+        $server = $this->makeServer(['group_ids' => ['1']]);
+        $moving = $this->makeUser(['group_id' => 1]);
+        $staying = $this->makeUser(['group_id' => 1]);
+        $data = [$moving->id => [100, 20], $staying->id => [200, 40]];
+        $meta = $this->meta('group-replay');
+        $controller = new ServerController();
+
+        $this->assertSame(200, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+        $moving->updateQuietly(['group_id' => 2]);
+        $this->assertSame(200, $controller->report($this->reportRequest($server, array_reverse($data, true), $meta))->getStatusCode());
+        $this->assertSame(100, (int) $moving->fresh()->u);
+        $this->assertSame(200, (int) $staying->fresh()->u);
+        $row = $this->inboxRow(TrafficBatchGuard::keyForBatchId($server->id, $meta['batch_id'], 0));
+        $this->assertSame($data, json_decode($row->payload, true)['data']);
+
+        $data[$moving->id] = [101, 20];
+        $this->assertSame(409, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+    }
+
+    public function test_fully_filtered_first_report_still_reserves_original_identity(): void
+    {
+        $server = $this->makeServer(['group_ids' => ['1']]);
+        $user = $this->makeUser(['group_id' => 2]);
+        $meta = $this->meta('empty-filtered-batch');
+        $data = [$user->id => [100, 0]];
+        $controller = new ServerController();
+
+        $this->assertSame(200, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+        $user->updateQuietly(['group_id' => 1]);
+        $this->assertSame(200, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+        $this->assertSame(0, (int) $user->fresh()->u);
+        $this->assertDatabaseCount('suzu_traffic_batches', 1);
+        $this->assertSame(409, $controller->report($this->reportRequest($server, [$user->id => [200, 0]], $meta))->getStatusCode());
+    }
+
+    public function test_second_chunk_insert_failure_rolls_back_entire_receipt_and_retry_converges(): void
+    {
+        $server = $this->makeServer();
+        $first = $this->makeUser();
+        $last = $this->makeUser();
+        $data = [$first->id => [100, 20]] + array_fill_keys(range(10000, 10998), [0, 0]) + [$last->id => [144, 0]];
+        $meta = $this->meta('atomic-chunks');
+        $secondKey = TrafficBatchGuard::keyForBatchId($server->id, $meta['batch_id'], 1);
+        DB::unprepared("CREATE TRIGGER fail_second_receipt BEFORE INSERT ON suzu_traffic_batches
+            WHEN NEW.processor = 'inbox' AND NEW.batch_hash = '{$secondKey}'
+            BEGIN SELECT RAISE(ABORT, 'second chunk write failed'); END");
+
+        $controller = new ServerController();
+        $this->assertSame(500, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+        $this->assertDatabaseCount('suzu_traffic_batches', 0);
+        $this->assertSame(0, (int) $first->fresh()->u);
+        $this->assertSame(0, (int) $last->fresh()->u);
+        DB::unprepared('DROP TRIGGER fail_second_receipt');
+
+        foreach (range(1, 2) as $attempt) {
+            $this->assertSame(200, $controller->report($this->reportRequest($server, $data, $meta))->getStatusCode());
+            $this->assertSame(100, (int) $first->fresh()->u);
+            $this->assertSame(144, (int) $last->fresh()->u);
+        }
+        $this->assertSame(2, DB::table('suzu_traffic_batches')->where('processor', 'inbox')->where('status', 'processed')->count());
+        $this->assertSame(244, (int) StatServer::where('server_id', $server->id)->sum('u'));
+    }
+
+    public function test_no_id_content_dedup_warns_and_identified_samples_keep_distinct_identity(): void
+    {
+        $server = $this->makeServer();
+        $user = $this->makeUser();
+        $data = [$user->id => [100, 0]];
+        $service = new UserService();
+        $log = \Illuminate\Support\Facades\Log::spy();
+
+        $service->trafficFetch($server, 'vless', $data);
+        $service->trafficFetch($server, 'vless', $data);
+        $this->assertSame(100, (int) $user->fresh()->u);
+        $log->shouldHaveReceived('warning')->with('legacy traffic sample suppressed by content hash', [
+            'dedup_mode' => 'legacy_content_hash',
+            'server_id' => $server->id,
+            'batch_hash' => TrafficBatchGuard::hashFor($server->id, 'vless', $data),
+            'processor' => TrafficBatchGuard::PROCESSOR_FETCH,
+        ])->once();
+
+        $meta = $this->meta('sample-a');
+        $service->trafficFetch($server, 'vless', $data, $meta);
+        $service->trafficFetch($server, 'vless', $data, $meta);
+        $service->trafficFetch($server, 'vless', $data, $this->meta('sample-b'));
+        $this->assertSame(300, (int) $user->fresh()->u);
+        $log->shouldHaveReceived('warning')->with('legacy traffic sample suppressed by content hash', \Mockery::any())->times(3);
+    }
+
+    public function test_reconcile_isolates_invalid_payload_and_redrives_only_missing_processors(): void
+    {
+        $server = $this->makeServer();
+        $bad = TrafficBatchGuard::keyForBatchId($server->id, 'corrupt', 0);
+        $good = TrafficBatchGuard::keyForBatchId($server->id, 'valid', 0);
+        TrafficBatchGuard::receiveIdentified($bad, $server->id, null, '{');
+        TrafficBatchGuard::receiveIdentified($good, $server->id, null, json_encode([
+            'server' => ['id' => $server->id, 'rate' => 1],
+            'data' => [1 => [100, 20]], 'protocol' => 'vless', 'timestamp' => time(),
+        ]));
+        TrafficBatchGuard::claimIdentified($good, $server->id, TrafficBatchGuard::PROCESSOR_FETCH, null);
+        \Illuminate\Support\Facades\Queue::fake();
+
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(1);
+        $this->assertSame('unrecoverable', $this->inboxRow($bad)->status);
+        $this->assertGreaterThan(time(), $this->inboxRow($good)->retry_at);
+        \Illuminate\Support\Facades\Queue::assertNotPushed(TrafficFetchJob::class);
+        \Illuminate\Support\Facades\Queue::assertPushed(StatUserJob::class, 1);
+        \Illuminate\Support\Facades\Queue::assertPushed(StatServerJob::class, 1);
+
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(1);
+        \Illuminate\Support\Facades\Queue::assertPushed(StatUserJob::class, 1);
+    }
+
+    public function test_reconcile_defers_failed_dispatch_and_keeps_scanning(): void
+    {
+        $server = $this->makeServer();
+        $payload = json_encode([
+            'server' => ['id' => $server->id, 'rate' => 1],
+            'data' => [1 => [100, 20]], 'protocol' => 'vless', 'timestamp' => time(),
+        ]);
+        $keys = array_map(fn ($id) => TrafficBatchGuard::keyForBatchId($server->id, $id, 0), ['fails-once', 'continues']);
+        foreach ($keys as $key) {
+            TrafficBatchGuard::receiveIdentified($key, $server->id, null, $payload);
+        }
+        DB::unprepared("CREATE TRIGGER fail_first_processor BEFORE INSERT ON suzu_traffic_batches
+            WHEN NEW.processor = 'traffic_fetch' AND NEW.batch_hash = '{$keys[0]}'
+            BEGIN SELECT RAISE(ABORT, 'simulated accounting write failure'); END");
+
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(1);
+        $this->assertSame('received', $this->inboxRow($keys[0])->status);
+        $this->assertGreaterThan(time(), $this->inboxRow($keys[0])->retry_at);
+        $this->assertSame('processed', $this->inboxRow($keys[1])->status);
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame(1, $this->inboxRow($keys[0])->retry_count);
+        DB::unprepared('DROP TRIGGER fail_first_processor');
+        DB::table('suzu_traffic_batches')->where('batch_hash', $keys[0])->update(['retry_at' => time() - 1]);
+        $this->artisan('suzu:traffic-batch-reconcile', ['--older-than' => 0])->assertExitCode(0);
+        $this->assertSame('processed', $this->inboxRow($keys[0])->status);
+    }
+
 }

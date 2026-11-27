@@ -43,11 +43,16 @@ class PaymentController extends Controller
         }
     }
 
-    private function handle($tradeNo, $callbackNo, array $verify = [], $paymentId = null)
+    private function handle($tradeNo, $callbackNo, array $verify = [], $paymentId = null): bool
     {
         $order = Order::where('trade_no', $tradeNo)->first();
         if (!$order) {
-            return $this->fail([400202, 'order is not found']);
+            Log::warning('payment notify order not found', [
+                'trade_no' => $tradeNo,
+                'callback_no' => $callbackNo,
+                'payment_id' => $paymentId,
+            ]);
+            return false;
         }
         if ($order->status !== Order::STATUS_PENDING) {
             // SB-MONEY-015: a re-notification of the transaction that
@@ -119,17 +124,14 @@ class PaymentController extends Controller
             $matchedAttemptId = $matchedAttempt->id;
         }
         $orderService = new OrderService($order);
-        if (!$orderService->paid($callbackNo)) {
-            return false;
-        }
-        // SB-MONEY-002 (race): the order was PENDING at the first read
-        // but the cancellation committed before paid() took its lock, so
-        // paid() no-oped and the receipt would still be lost.
-        $freshOrder = Order::find($order->id);
-        if ($freshOrder && $freshOrder->status === Order::STATUS_CANCELLED) {
-            // Same acknowledgement rule as the cancelled path above:
-            // propagate the recording result instead of forcing true.
-            return $this->recordReceiptOnCancelledOrder($freshOrder, $callbackNo, $verify);
+        $result = $orderService->applyPayment($callbackNo);
+        if ($result !== OrderService::PAYMENT_APPLIED) {
+            return match ($result) {
+                OrderService::PAYMENT_REPLAY => true,
+                OrderService::PAYMENT_CANCELLED => $this->recordReceiptOnCancelledOrder($order, $callbackNo, $verify),
+                OrderService::PAYMENT_ALREADY_PAID => $this->recordReceiptOnPaidOrder($order, $callbackNo, $verify),
+                default => false,
+            };
         }
 
         // SB-MONEY-015: stamp the attempt this payment came through,
@@ -212,13 +214,12 @@ class PaymentController extends Controller
             ]);
             return false;
         }
-        // M-P2-01 (final branch): the recorded-receipt check runs
-        // BEFORE the currency early return below. A callback_no that
-        // is already on the books must pass the strict replay check
-        // whatever currency this notification claims — otherwise a
-        // same-number foreign-currency callback would be silently
-        // acknowledged here without ever being compared against the
-        // recorded CNY receipt.
+        return $this->recordAdditionalReceipt($order, $callbackNo, $verify, 'already-paid');
+    }
+
+    private function recordAdditionalReceipt(Order $order, $callbackNo, array $verify, string $state): bool
+    {
+        // Check recorded evidence before the currency policy for new receipts.
         $existing = \App\Models\OrderReceipt::where('callback_no', (string) $callbackNo)->first();
         if ($existing) {
             return $this->acknowledgeRecordedReceipt($existing, $order, $callbackNo, $verify);
@@ -231,13 +232,16 @@ class PaymentController extends Controller
             return true;
         }
         try {
-            \App\Models\OrderReceipt::create([
+            $receipt = DB::transaction(fn () => \App\Models\OrderReceipt::create([
                 'order_id' => $order->id,
                 'callback_no' => (string) $callbackNo,
                 'paid_amount_cents' => (int) $verify['paid_amount_cents'],
                 'paid_currency' => strtoupper((string) $verify['paid_currency']),
-                'note' => 'second receipt on already-paid order; recorded for manual reconciliation',
-            ]);
+                'note' => "additional receipt on {$state} order for manual reconciliation",
+            ]));
+            if (!$receipt->exists) {
+                throw new \RuntimeException('Additional payment receipt save was rejected');
+            }
         } catch (\Exception $e) {
             // A concurrent callback may have recorded the receipt
             // first (the callback_no unique key then rejects this
@@ -255,7 +259,8 @@ class PaymentController extends Controller
             ]);
             return false;
         }
-        Log::error('payment received for already-paid order; second receipt recorded for manual reconciliation', [
+        Log::warning('additional payment receipt recorded for manual reconciliation', [
+            'order_state' => $state,
             'trade_no' => $order->trade_no,
             'callback_no' => $callbackNo,
             'paid_amount_cents' => $verify['paid_amount_cents'],
@@ -313,22 +318,8 @@ class PaymentController extends Controller
      *    Nothing is written as received, and handle() propagates the
      *    failure so the gateway keeps retrying instead of the payment
      *    being confirmed here and lost with no trace in the books.
-     *  - false (SB-MONEY-002-C1): a DIFFERENT transaction arrives for
-     *    an order that already has a recorded receipt. That is a
-     *    second real payment, not a duplicate notification: the
-     *    recorded receipt stays untouched, the conflict is logged for
-     *    manual reconciliation, and the acknowledgement fails.
-     *
-     * SB-MONEY-002-C1-R1: the whole check-and-record sequence runs
-     * inside a transaction that re-reads the order row under a row
-     * lock (keyed by order id). Two callbacks for the same cancelled
-     * order can be in flight simultaneously, each holding a snapshot
-     * read before the other committed; deciding from the caller's
-     * snapshot let the second callback pass the C1 conflict check
-     * with its stale NULL and overwrite the first receipt. The
-     * locked re-read is the only state the decision may use, so on
-     * MySQL/InnoDB (SELECT ... FOR UPDATE) the losing callback waits
-     * for the winner's commit and then sees its recorded receipt.
+     * Additional verified payments use the unique receipt ledger.
+     * The first receipt is saved under the order row lock.
      */
     private function recordReceiptOnCancelledOrder(Order $order, $callbackNo, array $verify): bool
     {
@@ -385,6 +376,9 @@ class PaymentController extends Controller
             ]);
             return false;
         }
+        if ($order->callback_no && (string) $order->callback_no !== (string) $callbackNo) {
+            return $this->recordAdditionalReceipt($order, $callbackNo, $verify, 'cancelled');
+        }
         if (strtoupper((string) $verify['paid_currency']) !== 'CNY') {
             Log::warning('payment notify for cancelled order: currency mismatch, receipt not recorded', [
                 'trade_no' => $order->trade_no,
@@ -400,25 +394,6 @@ class PaymentController extends Controller
                 'expected_amount_cents' => $expectedAmount,
             ]);
             return true;
-        }
-        // SB-MONEY-002-C1: a second, DIFFERENT transaction arriving
-        // for an order that already has a recorded receipt is not a
-        // duplicate notification — it is another real payment the
-        // books know nothing about. Folding it into the first receipt
-        // (keeping the old callback_no and acknowledging success)
-        // would lose it exactly like the original 002 defect. Log the
-        // conflict for manual reconciliation and fail the
-        // acknowledgement; the recorded receipt stays untouched. (The
-        // same transaction re-notified takes the idempotent path
-        // below and is acknowledged.)
-        if ($order->callback_no && (string) $order->callback_no !== (string) $callbackNo) {
-            Log::error('payment notify for cancelled order: conflicting callback_no, second receipt not recorded', [
-                'trade_no' => $order->trade_no,
-                'recorded_callback_no' => $order->callback_no,
-                'callback_no' => $callbackNo,
-                'paid_amount_cents' => $verify['paid_amount_cents'],
-            ]);
-            return false;
         }
         $order->callback_no = $order->callback_no ?: $callbackNo;
         $order->paid_at = $order->paid_at ?: time();

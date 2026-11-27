@@ -249,17 +249,17 @@ class NodeSyncService
      * Publish in the same Redis operation as revision allocation, so concurrent
      * publishers reach the worker in revision order.
      */
-    public static function push(int $nodeId, string $event, array $data): void
+    public static function push(int $nodeId, string $event, array $data): bool
     {
         try {
             $key = self::revisionKey($nodeId, $event);
             if ($key === null) {
-                Redis::publish('node:push', json_encode([
+                $published = Redis::publish('node:push', json_encode([
                     'node_id' => $nodeId,
                     'event' => $event,
                     'data' => $data,
                 ], JSON_THROW_ON_ERROR));
-                return;
+                return (int) $published > 0;
             }
 
             unset($data['state_revision'], $data['base_revision']);
@@ -281,11 +281,13 @@ class NodeSyncService
             if ($published === false) {
                 throw new \RuntimeException('Redis rejected the revision update');
             }
+            return (int) $published > 0;
         } catch (\Throwable $e) {
             Log::warning("[NodePush] Redis publish failed: {$e->getMessage()}", [
                 'node_id' => $nodeId,
                 'event' => $event,
             ]);
+            return false;
         }
     }
 

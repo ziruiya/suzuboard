@@ -60,9 +60,10 @@ class NodeUserResync extends Command
                 continue;
             }
             $users = ServerService::getAvailableUsers($node)->toArray();
-            NodeSyncService::push($nodeId, 'sync.users', ['users' => $users]);
-            NodeSyncService::clearUsersResyncPending($nodeId);
-            $pushed++;
+            if (NodeSyncService::push($nodeId, 'sync.users', ['users' => $users])) {
+                NodeSyncService::clearUsersResyncPending($nodeId);
+                $pushed++;
+            }
         }
 
         $this->info("node-resync: {$pushed} node(s) re-pushed, " . count($nodeIds) . ' pending total');

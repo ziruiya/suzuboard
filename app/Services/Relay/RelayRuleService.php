@@ -136,7 +136,17 @@ class RelayRuleService
             }
             RelayPortClaim::where('rule_id', $rule->id)->delete();
             RelayAuditLog::record($machine->id, $rule->id, $actorType, $actorId, 'rule.delete', $rule->rule_code . ' ' . $rule->name);
-            $rule->delete(); // rule_code is never reused: codes derive from the row id
+            if ($rule->rule_code !== null) {
+                DB::table('suzu_relay_rule_tombstones')->insert([
+                    'machine_id' => $machine->id,
+                    'rule_code' => $rule->rule_code,
+                    'rule_id' => $rule->id,
+                    'deleted_at' => now()->timestamp,
+                ]);
+            }
+            if (!$rule->delete()) {
+                throw new \RuntimeException('Relay rule deletion failed');
+            }
             $this->config->publish($machine, $actorType, $actorId);
         });
     }

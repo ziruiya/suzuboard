@@ -6,6 +6,7 @@ use App\Models\RelayRule;
 use App\Models\RelayRuleStat;
 use App\Models\RelayTrafficBatch;
 use App\Models\ServerMachine;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -18,6 +19,7 @@ use Illuminate\Support\Facades\DB;
  */
 class RelayTrafficService
 {
+    public const DELETED_RULE_GRACE_SECONDS = 86400;
     /**
      * @param array $batches each: rule_code, boot_id, seq, period_start,
      *                        period_end, bytes_in, bytes_out, connections?
@@ -42,47 +44,76 @@ class RelayTrafficService
 
         foreach ($batches as $batch) {
             $ruleCode = (string) ($batch['rule_code'] ?? '');
-            $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $ruleCode)->first();
             $bootId = (string) ($batch['boot_id'] ?? '');
             $seq = (int) ($batch['seq'] ?? -1);
             $start = (int) ($batch['period_start'] ?? 0);
             $end = (int) ($batch['period_end'] ?? 0);
-            if (!$rule || $bootId === '' || $seq < 0 || $start <= 0 || $end <= $start) {
+            if ($bootId === '' || $seq < 0 || $start <= 0 || $end <= $start) {
                 $rejected++;
                 $rejectedBatches[] = [
                     'rule_code' => $ruleCode,
                     'boot_id' => $bootId,
                     'seq' => $seq,
-                    'reason' => !$rule ? 'unknown_rule' : 'invalid_batch',
+                    'reason' => 'invalid_batch',
                 ];
                 continue;
             }
             $bytesIn = max(0, (int) ($batch['bytes_in'] ?? 0));
             $bytesOut = max(0, (int) ($batch['bytes_out'] ?? 0));
 
-            $booked = DB::transaction(function () use ($machine, $rule, $bootId, $seq, $start, $end, $bytesIn, $bytesOut, $batch) {
+            $booked = DB::transaction(function () use ($machine, $ruleCode, $bootId, $seq, $start, $end, $bytesIn, $bytesOut, $batch) {
+                $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $ruleCode)
+                    ->lockForUpdate()->first();
+                $deletedAt = null;
+                if ($rule) {
+                    $ruleId = (int) $rule->id;
+                } else {
+                    $tombstone = DB::table('suzu_relay_rule_tombstones')
+                        ->where('machine_id', $machine->id)->where('rule_code', $ruleCode)
+                        ->where('deleted_at', '>=', now()->timestamp - self::DELETED_RULE_GRACE_SECONDS)
+                        ->lockForUpdate()->first();
+                    if (!$tombstone) {
+                        return null;
+                    }
+                    $ruleId = (int) $tombstone->rule_id;
+                    $deletedAt = (int) $tombstone->deleted_at;
+                }
+
+                $identity = ['machine_id' => $machine->id, 'rule_id' => $ruleId, 'boot_id' => $bootId, 'seq' => $seq];
                 try {
-                    RelayTrafficBatch::create([
-                        'batch_id' => $machine->id . ':' . $rule->id . ':' . $bootId . ':' . $seq,
-                        'machine_id' => $machine->id,
-                        'rule_id' => $rule->id,
-                        'boot_id' => $bootId,
-                        'seq' => $seq,
+                    // A savepoint keeps the outer transaction readable
+                    // after a unique violation, including on PostgreSQL.
+                    $receipt = DB::transaction(fn () => RelayTrafficBatch::create($identity + [
+                        'batch_id' => $machine->id . ':' . $ruleId . ':' . $bootId . ':' . $seq,
                         'period_start' => $start,
                         'period_end' => $end,
                         'bytes_in' => $bytesIn,
                         'bytes_out' => $bytesOut,
                         'connections' => max(0, (int) ($batch['connections'] ?? 0)),
+                        'rule_deleted_at' => $deletedAt,
                         'created_at' => now(),
-                    ]);
-                } catch (\Illuminate\Database\QueryException $e) {
-                    return false; // duplicate: unique key rejected the replay
+                    ]));
+                } catch (UniqueConstraintViolationException $e) {
+                    if (RelayTrafficBatch::where($identity)->lockForUpdate()->first(['id'])) {
+                        return false;
+                    }
+                    throw $e;
                 }
-                $this->bookIntoStats($rule->id, $start, $end, $bytesIn, $bytesOut);
+                if (!$receipt->exists) {
+                    throw new \RuntimeException('Relay traffic receipt save was rejected');
+                }
+                $this->bookIntoStats($ruleId, $start, $end, $bytesIn, $bytesOut);
                 return true;
             });
 
-            $booked ? $accepted++ : $duplicates++;
+            if ($booked === null) {
+                $rejected++;
+                $rejectedBatches[] = [
+                    'rule_code' => $ruleCode, 'boot_id' => $bootId, 'seq' => $seq, 'reason' => 'unknown_rule',
+                ];
+            } else {
+                $booked ? $accepted++ : $duplicates++;
+            }
         }
 
         return [

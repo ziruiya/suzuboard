@@ -337,52 +337,27 @@ class MoneyBatch1FixTest extends TestCase
 
     // --------- SB-MONEY-002-C1 (GPT incremental re-review) ---------
 
-    public function test_second_receipt_with_different_transaction_conflicts_and_fails(): void
+    public function test_second_cancelled_order_receipt_is_booked_once(): void
     {
         $gateway = $this->makeEpayGateway();
-        $user = $this->makeUser();
-        $plan = $this->makePlan();
-        $order = $this->makeOrder($user, $plan);
+        $order = $this->makeOrder($this->makeUser(), $this->makePlan());
         $this->assertTrue((new OrderService($order))->cancel());
 
-        // First late payment: recorded on the cancelled order.
-        $first = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-C1-FIRST'));
-        $first->assertStatus(200);
-        $afterFirst = Order::findOrFail($order->id);
-        $this->assertSame('EPAY-C1-FIRST', $afterFirst->callback_no);
-        $this->assertNotNull($afterFirst->paid_at);
+        $url = "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}";
+        $this->call('POST', $url, $this->epayCallback($order, '29.00', 'EPAY-C1-FIRST'))->assertOk();
+        $paidAt = $order->fresh()->paid_at;
+        $second = $this->epayCallback($order, '29.00', 'EPAY-C1-SECOND');
+        $this->call('POST', $url, $second)->assertOk();
+        $this->call('POST', $url, $second)->assertOk();
 
-        // Collect log entries from here on so the conflict record
-        // can be asserted directly.
-        $logged = [];
-        \Illuminate\Support\Facades\Event::listen(
-            \Illuminate\Log\Events\MessageLogged::class,
-            function ($event) use (&$logged) {
-                $logged[] = $event;
-            }
-        );
-
-        // A second, DIFFERENT transaction for the same cancelled
-        // order is another real payment, not a duplicate
-        // notification: it must not be folded into the first receipt
-        // and acknowledged as if it were the same money.
-        $second = $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-C1-SECOND'));
-        $second->assertStatus(400);
-
-        // The recorded receipt is untouched.
-        $afterSecond = Order::findOrFail($order->id);
-        $this->assertSame(Order::STATUS_CANCELLED, $afterSecond->status);
-        $this->assertSame('EPAY-C1-FIRST', $afterSecond->callback_no);
-        $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
-
-        // And the conflict is on record for manual reconciliation,
-        // carrying both transaction numbers and the amount.
-        $conflict = collect($logged)->first(fn ($event) => $event->level === 'error'
-            && str_contains($event->message, 'conflicting callback_no'));
-        $this->assertNotNull($conflict, 'expected an error log entry for the conflicting callback_no');
-        $this->assertSame('EPAY-C1-FIRST', $conflict->context['recorded_callback_no'] ?? null);
-        $this->assertSame('EPAY-C1-SECOND', $conflict->context['callback_no'] ?? null);
-        $this->assertSame(2900, (int) ($conflict->context['paid_amount_cents'] ?? 0));
+        $order->refresh();
+        $this->assertSame(Order::STATUS_CANCELLED, $order->status);
+        $this->assertSame('EPAY-C1-FIRST', $order->callback_no);
+        $this->assertSame($paidAt, $order->paid_at);
+        $this->assertDatabaseHas('suzu_order_receipts', [
+            'order_id' => $order->id, 'callback_no' => 'EPAY-C1-SECOND', 'paid_amount_cents' => 2900,
+        ]);
+        $this->assertDatabaseCount('suzu_order_receipts', 1);
     }
 
     public function test_receipt_save_returning_false_fails_the_callback_acknowledgement(): void
@@ -452,34 +427,10 @@ class MoneyBatch1FixTest extends TestCase
         // memory it still claims there is no receipt.
         $this->assertNull($staleSnapshot->callback_no);
 
-        $logged = [];
-        \Illuminate\Support\Facades\Event::listen(
-            \Illuminate\Log\Events\MessageLogged::class,
-            function ($event) use (&$logged) {
-                $logged[] = $event;
-            }
-        );
-
-        // TX-002 now runs with its stale snapshot. What this test
-        // proves: the accept/reject decision is taken from the
-        // transaction's locked re-read of the committed row, NOT
-        // from the caller's snapshot — the function sees TX-001,
-        // treats TX-002 as the C1 conflict and refuses it. Under
-        // the pre-R1 code the stale NULL passed the conflict check,
-        // TX-002 overwrote TX-001 and this call returned true.
-        //
-        // What it does NOT prove: true two-connection lock
-        // contention. This harness runs on per-connection in-memory
-        // SQLite (a second connection would see a different, empty
-        // database) and SQLite's grammar drops the FOR UPDATE
-        // clause, so the row lock itself cannot be exercised here.
-        // In production (MySQL/InnoDB) SELECT ... FOR UPDATE is
-        // what serializes the two callbacks so the loser blocks
-        // until the winner commits and then re-reads its row —
-        // that lock is the final guarantee; this test pins the
-        // decision logic that runs once the lock is held.
+        // TX-002 continues from its stale snapshot after TX-001 commits.
         $second = $method->invoke($controller, $staleSnapshot, 'EPAY-RACE-2', $verify);
-        $this->assertFalse($second);
+        $this->assertTrue($second);
+        $this->assertTrue($method->invoke($controller, $staleSnapshot, 'EPAY-RACE-2', $verify));
 
         // The first receipt survives untouched.
         $afterSecond = Order::findOrFail($order->id);
@@ -487,12 +438,8 @@ class MoneyBatch1FixTest extends TestCase
         $this->assertSame('EPAY-RACE-1', $afterSecond->callback_no);
         $this->assertSame($afterFirst->paid_at, $afterSecond->paid_at);
 
-        // And the conflict is on record for manual reconciliation.
-        $conflict = collect($logged)->first(fn ($event) => $event->level === 'error'
-            && str_contains($event->message, 'conflicting callback_no'));
-        $this->assertNotNull($conflict, 'expected an error log entry for the conflicting callback_no');
-        $this->assertSame('EPAY-RACE-1', $conflict->context['recorded_callback_no'] ?? null);
-        $this->assertSame('EPAY-RACE-2', $conflict->context['callback_no'] ?? null);
+        $this->assertDatabaseHas('suzu_order_receipts', ['order_id' => $order->id, 'callback_no' => 'EPAY-RACE-2']);
+        $this->assertDatabaseCount('suzu_order_receipts', 1);
     }
 
     // ---------------- SB-MONEY-004 ----------------

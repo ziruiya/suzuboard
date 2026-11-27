@@ -14,6 +14,9 @@ use App\Services\TrafficResetService;
 use App\Models\TrafficResetLog;
 use App\Utils\Helper;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Exceptions\TrafficBatchConflictException;
 
 class UserService
 {
@@ -122,99 +125,93 @@ class UserService
      *   agents that speak the persistent batch-id protocol:
      *   ['batch_id' => string, 'collected_from' => int, 'collected_to' => int].
      *   Null for legacy agents: the panel keeps the AUD-022 content-hash
-     *   fallback, so old agents never lose accounting over this upgrade.
+     *   fallback, which can suppress identical independent samples.
      */
     public function trafficFetch(Server $server, string $protocol, array $data, ?array $batchMeta = null)
     {
-        $serverModel = $server;
-        $server->rate = $server->getCurrentRate();
-        $server = $server->toArray();
-
-        list($server, $protocol, $data) = HookManager::filter('traffic.process.before', [$server, $protocol, $data]);
-        // Compatible with legacy hook
-        list($server, $protocol, $data) = HookManager::filter('traffic.before_process', [$server, $protocol, $data]);
-
-        // SB-TA-003: every accounting entry point funnels through here
-        // (UniProxy push, V2 report, Tidalab controllers), so validate
-        // once, centrally: bounded non-negative integer deltas, and —
-        // when the node declares permission groups — only users that
-        // belong to one of the node's groups may be charged.
-        $data = $this->validateTrafficData($serverModel, is_array($data) ? $data : []);
-        if (empty($data)) {
+        $batchId = $batchMeta['batch_id'] ?? null;
+        $timestamp = strtotime(date('Y-m-d'));
+        if (!is_string($batchId) || $batchId === '') {
+            // Compatibility only. Remove this fallback and its V1 callers
+            // after legacy senders are retired and dedup warnings are reviewed.
+            [$server, $protocol, $data] = $this->prepareTraffic($server, $protocol, $data);
+            foreach (array_chunk($data, 1000, true) as $chunk) {
+                $hash = TrafficBatchGuard::hashFor((int) $server['id'], $protocol, $chunk);
+                TrafficFetchJob::dispatch($server, $chunk, $protocol, $timestamp, $hash);
+                StatUserJob::dispatch($server, $chunk, $protocol, 'd', $hash, null, null, $timestamp);
+                StatServerJob::dispatch($server, $chunk, $protocol, 'd', $hash, null, null, $timestamp);
+            }
             return;
         }
 
-        $batchId = null;
-        $collectedFrom = null;
-        $collectedTo = null;
-        if ($batchMeta !== null && isset($batchMeta['batch_id']) && is_string($batchMeta['batch_id']) && $batchMeta['batch_id'] !== '') {
-            $batchId = substr($batchMeta['batch_id'], 0, 64);
-            $collectedFrom = isset($batchMeta['collected_from']) ? (int) $batchMeta['collected_from'] : null;
-            $collectedTo = isset($batchMeta['collected_to']) ? (int) $batchMeta['collected_to'] : null;
-        }
+        $batchId = substr($batchId, 0, 64);
+        $serverId = (int) $server->id;
+        $from = isset($batchMeta['collected_from']) ? (int) $batchMeta['collected_from'] : null;
+        $to = isset($batchMeta['collected_to']) ? (int) $batchMeta['collected_to'] : null;
+        $receiptHash = TrafficBatchGuard::keyForBatchId($serverId, $batchId, -1);
+        $original = $data;
+        ksort($original, SORT_STRING);
+        $digest = hash('sha256', json_encode([$original, $from, $to], JSON_THROW_ON_ERROR));
 
-        $timestamp = strtotime(date('Y-m-d'));
-        collect($data)->chunk(1000)->each(function ($chunk, $seq) use ($timestamp, $server, $protocol, $batchId, $collectedFrom, $collectedTo) {
-            $chunkData = $chunk->toArray();
-            $contentHash = TrafficBatchGuard::hashFor((int) ($server['id'] ?? 0), $protocol, $chunkData);
-            // SB-TA-001/002: identified batches dedup on (node, batch id,
-            // chunk seq); the content hash rides along so a same-id
-            // different-content replay is refused as a conflict.
-            // Legacy batches keep the AUD-022 content-hash key.
-            $batchHash = $batchId !== null
-                ? TrafficBatchGuard::keyForBatchId((int) ($server['id'] ?? 0), $batchId, (int) $seq)
-                : $contentHash;
+        // Reserve the batch identity first. The reservation and every chunk
+        // commit together, before any processor can book traffic.
+        $jobs = DB::transaction(function () use ($server, $serverId, $protocol, $data, $batchId, $receiptHash, $digest, $from, $to, $timestamp) {
+            if (!TrafficBatchGuard::reserveReceipt($receiptHash, $serverId, $batchId, $digest)) {
+                return [];
+            }
 
-            if ($batchId !== null) {
-                // SB-TA-B01: durable receipt BEFORE any job is
-                // dispatched. HTTP 200 for an identified batch means
-                // "durably received" (payload + fingerprint + status
-                // committed to the inbox), not "booked" — see
-                // TrafficBatchGuard::receiveIdentified() for the full
-                // protocol definition. A persistence failure throws
-                // and the report endpoint answers an HTTP error, so
-                // the agent keeps the batch; a same-id different-
-                // content re-send is refused synchronously here.
-                $payload = json_encode([
+            [$server, $protocol, $data] = $this->prepareTraffic($server, $protocol, $data);
+            $jobs = [];
+            $chunks = array_chunk($data, 1000, true);
+            foreach ($chunks as $seq => $chunk) {
+                $key = TrafficBatchGuard::keyForBatchId($serverId, $batchId, $seq);
+                $contentHash = TrafficBatchGuard::hashFor($serverId, $protocol, $chunk);
+                $payload = [
                     'protocol' => $protocol,
                     'timestamp' => $timestamp,
-                    'server' => [
-                        'id' => (int) ($server['id'] ?? 0),
-                        'rate' => $server['rate'] ?? 1,
-                        'type' => $server['type'] ?? null,
-                    ],
-                    'data' => $chunkData,
-                    'collected_from' => $collectedFrom,
-                    'collected_to' => $collectedTo,
-                ]);
-                $receipt = TrafficBatchGuard::receiveIdentified(
-                    $batchHash,
-                    (int) ($server['id'] ?? 0),
-                    $contentHash,
-                    $payload
-                );
-                if ($receipt === TrafficBatchGuard::RECEIPT_CONFLICT) {
-                    \Illuminate\Support\Facades\Log::error('traffic batch conflict at receipt: same batch id, different content', [
-                        'server_id' => (int) ($server['id'] ?? 0),
-                        'batch_id' => $batchId,
-                    ]);
-                    throw new \App\Exceptions\TrafficBatchConflictException((int) ($server['id'] ?? 0), $batchId);
+                    'server' => ['id' => $serverId, 'rate' => $server['rate'] ?? 1, 'type' => $server['type'] ?? null],
+                    'data' => $chunk,
+                    'collected_from' => $from,
+                    'collected_to' => $to,
+                    'batch_id' => $batchId,
+                ];
+                $result = TrafficBatchGuard::receiveIdentified($key, $serverId, $contentHash, json_encode($payload, JSON_THROW_ON_ERROR), $receiptHash);
+                if ($result === TrafficBatchGuard::RECEIPT_CONFLICT) {
+                    throw new TrafficBatchConflictException($serverId, $batchId);
                 }
-                if ($receipt === TrafficBatchGuard::RECEIPT_REPLAY) {
-                    // The durable receipt already stands. Do not
-                    // re-dispatch: processors that completed are
-                    // claimed, and a batch whose jobs were lost is
-                    // re-driven by suzu:traffic-batch-reconcile.
-                    return;
+                if ($result === TrafficBatchGuard::RECEIPT_OK) {
+                    $jobs[] = [$key, $contentHash, $payload];
                 }
             }
 
-            TrafficFetchJob::dispatch($server, $chunkData, $protocol, $timestamp, $batchHash, $batchId, $contentHash, $collectedFrom, $collectedTo);
-            // SB-TA-007: both stat jobs bucket by this same receipt
-            // timestamp instead of their own execution clocks.
-            StatUserJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash, $timestamp);
-            StatServerJob::dispatch($server, $chunkData, $protocol, 'd', $batchHash, $batchId, $contentHash, $timestamp);
+            // Pre-upgrade inbox rows have no raw digest. Adopt only a
+            // matching prefix, and refuse a retry that omits a stored chunk.
+            $nextKey = TrafficBatchGuard::keyForBatchId($serverId, $batchId, count($chunks));
+            if (DB::table('suzu_traffic_batches')->where('batch_hash', $nextKey)->exists()) {
+                throw new TrafficBatchConflictException($serverId, $batchId);
+            }
+            return $jobs;
         });
+
+        foreach ($jobs as [$key, $contentHash, $payload]) {
+            try {
+                TrafficBatchGuard::dispatchMissingProcessors($key, $contentHash, $payload);
+            } catch (\Throwable $e) {
+                Log::error('traffic batch dispatch failed after durable receipt', [
+                    'batch_id' => $batchId, 'batch_hash' => $key, 'exception' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    private function prepareTraffic(Server $server, string $protocol, array $data): array
+    {
+        $server->rate = $server->getCurrentRate();
+        $snapshot = $server->toArray();
+        [$snapshot, $protocol, $data] = HookManager::filter('traffic.process.before', [$snapshot, $protocol, $data]);
+        [$snapshot, $protocol, $data] = HookManager::filter('traffic.before_process', [$snapshot, $protocol, $data]);
+
+        return [$snapshot, $protocol, $this->validateTrafficData($server, is_array($data) ? $data : [])];
     }
 
     /**

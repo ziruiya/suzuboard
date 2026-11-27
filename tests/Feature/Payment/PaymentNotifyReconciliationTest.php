@@ -141,13 +141,13 @@ class PaymentNotifyReconciliationTest extends TestCase
         ]);
     }
 
-    private function epayCallback(Order $order, string $money): array
+    private function epayCallback(Order $order, string $money, string $transaction = 'EPAY-TX-9'): array
     {
         $params = [
             'pid' => '1001',
             'type' => 'alipay',
             'out_trade_no' => $order->trade_no,
-            'trade_no' => 'EPAY-TX-9',
+            'trade_no' => $transaction,
             'name' => $order->trade_no,
             'money' => $money,
             'trade_status' => 'TRADE_SUCCESS',
@@ -191,6 +191,92 @@ class PaymentNotifyReconciliationTest extends TestCase
         $completed = Order::findOrFail($order->id);
         $this->assertSame(Order::STATUS_COMPLETED, $completed->status);
         $this->assertSame('EPAY-TX-9', $completed->callback_no);
+    }
+
+    public static function callbackStates(): iterable
+    {
+        foreach (['pending' => Order::STATUS_PENDING, 'paid' => Order::STATUS_COMPLETED, 'cancelled' => Order::STATUS_CANCELLED] as $state => $status) {
+            foreach (['first', 'concurrent', 'replay'] as $arrival) {
+                yield "{$state}-{$arrival}" => [$status, $arrival];
+            }
+        }
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('callbackStates')]
+    public function test_epay_receipts_and_entitlements_by_order_state(int $status, string $arrival): void
+    {
+        $gateway = $this->makeEpayGateway();
+        $user = $this->makeUser();
+        $order = $this->makeOrder($user, $this->makePlan(), [
+            'status' => $status,
+            'callback_no' => $status === Order::STATUS_COMPLETED ? 'EPAY-PREVIOUS' : null,
+        ]);
+        $url = "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}";
+        $originalExpiry = $user->expired_at;
+        $opens = 0;
+        \App\Services\Plugin\HookManager::register('order.open.before', function () use (&$opens) {
+            $opens++;
+        });
+
+        $innerRan = false;
+        if ($arrival === 'concurrent') {
+            // Pause the outer callback on its initial order read. Run
+            // the inner callback to completion before the outer locks.
+            Order::retrieved(function (Order $snapshot) use ($order, $url, $status, &$innerRan) {
+                if ($snapshot->id !== $order->id || $innerRan) {
+                    return;
+                }
+                $innerRan = true;
+                $this->assertSame($status, $snapshot->status);
+                $this->call('POST', $url, $this->epayCallback($order, '29.00', 'EPAY-INNER'))
+                    ->assertOk()->assertContent('success');
+            });
+        }
+
+        $callback = $this->epayCallback($order, '29.00', 'EPAY-OUTER');
+        $this->call('POST', $url, $callback)->assertOk()->assertContent('success');
+        $expiry = $user->fresh()->expired_at;
+        if ($arrival !== 'first') {
+            $this->call('POST', $url, $callback)->assertOk()->assertContent('success');
+        }
+        if ($arrival === 'concurrent') {
+            $this->assertTrue($innerRan);
+            $this->call('POST', $url, $this->epayCallback($order, '29.00', 'EPAY-INNER'))
+                ->assertOk()->assertContent('success');
+        }
+
+        $order->refresh();
+        $this->assertSame($status === Order::STATUS_CANCELLED ? $status : Order::STATUS_COMPLETED, $order->status);
+        $this->assertSame($status === Order::STATUS_PENDING ? 1 : 0, $opens);
+        $this->assertSame($expiry, $user->fresh()->expired_at);
+        if ($status === Order::STATUS_PENDING) {
+            $this->assertGreaterThan($originalExpiry, $expiry);
+        } else {
+            $this->assertSame($originalExpiry, $expiry);
+        }
+        $first = $status === Order::STATUS_COMPLETED ? 'EPAY-PREVIOUS' : ($innerRan ? 'EPAY-INNER' : 'EPAY-OUTER');
+        $this->assertSame($first, $order->callback_no);
+        $extras = array_values(array_diff($innerRan ? ['EPAY-INNER', 'EPAY-OUTER'] : ['EPAY-OUTER'], [$first]));
+        $this->assertDatabaseCount('suzu_order_receipts', count($extras));
+        foreach ($extras as $transaction) {
+            $this->assertDatabaseHas('suzu_order_receipts', [
+                'order_id' => $order->id, 'callback_no' => $transaction, 'paid_amount_cents' => 2900, 'paid_currency' => 'CNY',
+            ]);
+        }
+    }
+
+    public function test_verified_epay_callback_for_missing_order_fails_and_logs_transaction(): void
+    {
+        $gateway = $this->makeEpayGateway();
+        $order = new Order(['trade_no' => 'MISSING-ORDER']);
+        \Illuminate\Support\Facades\Log::spy();
+
+        $this->call('POST', "/api/v1/guest/payment/notify/EPay/{$gateway->uuid}", $this->epayCallback($order, '29.00', 'EPAY-ORPHAN'))
+            ->assertStatus(400);
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('warning')
+            ->with('payment notify order not found', [
+                'trade_no' => 'MISSING-ORDER', 'callback_no' => 'EPAY-ORPHAN', 'payment_id' => $gateway->id,
+            ])->once();
     }
 
     public function test_handle_rejects_foreign_currency_report(): void

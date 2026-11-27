@@ -660,4 +660,81 @@ class TrafficP2FixTest extends TestCase
         $this->assertArrayNotHasKey('reason', $log->metadata);
     }
 
+    public static function nodePublishFailures(): iterable
+    {
+        yield 'offline' => [false, null];
+        yield 'redis exception' => [true, false];
+        yield 'no subscribers' => [true, 0];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('nodePublishFailures')]
+    public function test_over_quota_defers_failed_notification(bool $online, int|false|null $published): void
+    {
+        $user = $this->makeUser(['group_id' => 1, 'u' => 100, 'transfer_enable' => 100]);
+        $server = $this->makeServer(['group_ids' => ['1']]);
+        TrafficPendingCheck::recordForUsers([$user->id]);
+        if ($online) {
+            \Illuminate\Support\Facades\Cache::put("node_ws_alive:{$server->id}", true);
+        }
+        Redis::shouldReceive('scard')->with('traffic:pending_check')->andReturn(0);
+        Redis::shouldReceive('sadd')->with('node:users_resync_pending', $server->id)->once()->andReturn(1);
+        $publish = Redis::shouldReceive('eval');
+        if ($published === null) {
+            $publish->never();
+        } elseif ($published === false) {
+            $publish->once()->andThrow(new \RuntimeException('Redis publish failure'));
+        } else {
+            $publish->once()->andReturn($published);
+        }
+
+        $this->artisan('check:traffic-exceeded')
+            ->expectsOutput('Checked 1 users, notified 0 nodes for 1 exceeded users. Deferred 1 checks.')
+            ->assertExitCode(0);
+        $this->assertDatabaseHas('suzu_traffic_pending_checks', ['user_id' => $user->id, 'version' => 1]);
+    }
+
+    public function test_over_quota_consumes_after_successful_publish(): void
+    {
+        $user = $this->makeUser(['group_id' => 1, 'u' => 100, 'transfer_enable' => 100]);
+        $server = $this->makeServer(['group_ids' => ['1']]);
+        TrafficPendingCheck::recordForUsers([$user->id]);
+        \Illuminate\Support\Facades\Cache::put("node_ws_alive:{$server->id}", true);
+        Redis::shouldReceive('scard')->andReturn(0);
+        Redis::shouldReceive('sadd')->with('node:users_resync_pending', $server->id)->once()->andReturn(1);
+        Redis::shouldReceive('eval')->once()->andReturn(1);
+
+        $this->artisan('check:traffic-exceeded')
+            ->expectsOutput('Checked 1 users, notified 1 nodes for 1 exceeded users. Deferred 0 checks.')
+            ->assertExitCode(0);
+        $this->assertDatabaseMissing('suzu_traffic_pending_checks', ['user_id' => $user->id]);
+    }
+
+    public function test_overlapping_consumers_cannot_delete_reinserted_same_version(): void
+    {
+        $user = $this->makeUser();
+        TrafficPendingCheck::recordForUsers([$user->id]);
+        $first = TrafficPendingCheck::nextChunk();
+        $second = TrafficPendingCheck::nextChunk();
+        $this->assertSame(1, TrafficPendingCheck::deleteConsumed($second));
+
+        TrafficPendingCheck::recordForUsers([$user->id]);
+        [$replacement] = TrafficPendingCheck::nextChunk();
+        $this->assertSame($first[0]->version, $replacement->version);
+        $this->assertNotSame($first[0]->id, $replacement->id);
+        $this->assertSame(0, TrafficPendingCheck::deleteConsumed($first));
+        $this->assertDatabaseHas('suzu_traffic_pending_checks', ['id' => $replacement->id, 'version' => 1]);
+    }
+
+    public function test_over_quota_consumer_resumes_after_its_per_run_budget(): void
+    {
+        Redis::shouldReceive('scard')->with('traffic:pending_check')->andReturn(0);
+        TrafficPendingCheck::recordForUsers(range(10000, 15000));
+
+        $this->artisan('check:traffic-exceeded')->assertExitCode(0);
+        $this->assertDatabaseCount('suzu_traffic_pending_checks', 1);
+        $this->assertDatabaseHas('suzu_traffic_pending_checks', ['user_id' => 15000]);
+        $this->artisan('check:traffic-exceeded')->assertExitCode(0);
+        $this->assertDatabaseCount('suzu_traffic_pending_checks', 0);
+    }
+
 }

@@ -540,16 +540,31 @@ class OrderService
         }
     }
 
-    public function paid(string $callbackNo)
+    public const PAYMENT_APPLIED = 'applied';
+    public const PAYMENT_REPLAY = 'replay';
+    public const PAYMENT_ALREADY_PAID = 'already_paid';
+    public const PAYMENT_CANCELLED = 'cancelled';
+    public const PAYMENT_FAILED = 'failed';
+
+    public function paid(string $callbackNo): bool
+    {
+        return $this->applyPayment($callbackNo) !== self::PAYMENT_FAILED;
+    }
+
+    public function applyPayment(string $callbackNo): string
     {
         try {
-            [$order, $shouldDispatch] = DB::transaction(function () use ($callbackNo) {
+            [$order, $result] = DB::transaction(function () use ($callbackNo) {
                 $order = $this->lockCurrentOrder();
                 if (!$order) {
                     throw new \RuntimeException('Order not found.');
                 }
                 if ((int) $order->status !== Order::STATUS_PENDING) {
-                    return [$order, false];
+                    return [$order, match (true) {
+                        (int) $order->status === Order::STATUS_CANCELLED => self::PAYMENT_CANCELLED,
+                        (string) $order->callback_no === $callbackNo => self::PAYMENT_REPLAY,
+                        default => self::PAYMENT_ALREADY_PAID,
+                    }];
                 }
 
                 $order->status = Order::STATUS_PROCESSING;
@@ -559,19 +574,19 @@ class OrderService
                     throw new \RuntimeException('Failed to save order status.');
                 }
 
-                return [$order, true];
+                return [$order, self::PAYMENT_APPLIED];
             });
 
             $this->order = $order;
 
-            if ($shouldDispatch) {
+            if ($result === self::PAYMENT_APPLIED) {
                 OrderHandleJob::dispatchSync($order->trade_no);
             }
         } catch (\Exception $e) {
             Log::error($e);
-            return false;
+            return self::PAYMENT_FAILED;
         }
-        return true;
+        return $result;
     }
 
     public function cancel(): bool

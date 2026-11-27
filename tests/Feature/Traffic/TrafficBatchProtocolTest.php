@@ -357,7 +357,7 @@ class TrafficBatchProtocolTest extends TestCase
         // attribution read of last_reset_at, and the first u/d update.
         $claimIdx = $attributionIdx = $updateIdx = null;
         foreach ($queries as $i => $sql) {
-            if ($claimIdx === null && str_contains($sql, 'insert into "suzu_traffic_batches"')) {
+            if ($claimIdx === null && str_contains($sql, 'insert or ignore into "suzu_traffic_batches"')) {
                 $claimIdx = $i;
             }
             if ($attributionIdx === null && str_contains($sql, '"v2_user"') && str_contains($sql, 'last_reset_at') && str_starts_with($sql, 'select')) {

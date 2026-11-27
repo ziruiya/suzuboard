@@ -2,19 +2,17 @@
 
 namespace App\Services;
 
+use App\Exceptions\TrafficBatchConflictException;
+use App\Jobs\StatServerJob;
+use App\Jobs\StatUserJob;
+use App\Jobs\TrafficFetchJob;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
- * SB-AUD-022: exactly-once guard for node traffic batches.
- *
- * The UniProxy push payload has no batch identifier, so the panel
- * derives one from the batch content (node + protocol + the canonical
- * per-user deltas). Each processor claims the batch in
- * suzu_traffic_batches inside the same transaction as its writes:
- * the first claim processes, any replay (agent retry after an
- * ambiguous timeout, queue redelivery, job retry after a partial
- * failure) sees the marker and skips. If processing fails, the marker
- * rolls back with the writes and a retry can process the batch again.
+ * Transactional accounting claims and durable receipts for identified batches.
+ * The compatibility path has only a content hash, which can also match an
+ * independent sample. Retire it once remaining no-ID senders are removed.
  */
 class TrafficBatchGuard
 {
@@ -32,8 +30,10 @@ class TrafficBatchGuard
     // report time and carries the validated payload plus a processing
     // status; the per-processor claim rows stay payload-free.
     public const PROCESSOR_INBOX = 'inbox';
+    public const PROCESSOR_RECEIPT = 'batch_receipt';
     public const STATUS_RECEIVED = 'received';
     public const STATUS_PROCESSED = 'processed';
+    public const STATUS_UNRECOVERABLE = 'unrecoverable';
 
     // SB-TA-B01: outcomes of a synchronous inbox receipt.
     public const RECEIPT_OK = 'received';
@@ -123,7 +123,16 @@ class TrafficBatchGuard
             return true;
         }
         if ($batchId === null) {
-            return self::claim($batchKey, $serverId, $processor);
+            $claimed = self::claim($batchKey, $serverId, $processor);
+            if (!$claimed) {
+                Log::warning('legacy traffic sample suppressed by content hash', [
+                    'dedup_mode' => 'legacy_content_hash',
+                    'server_id' => $serverId,
+                    'batch_hash' => $batchKey,
+                    'processor' => $processor,
+                ]);
+            }
+            return $claimed;
         }
         $status = self::claimIdentified($batchKey, $serverId, $processor, $contentHash);
         if ($status === self::CLAIM_CONFLICT) {
@@ -188,6 +197,34 @@ class TrafficBatchGuard
         return self::CLAIM_REPLAY;
     }
 
+    public static function reserveReceipt(string $receiptHash, int $serverId, string $batchId, string $digest): bool
+    {
+        $table = DB::table('suzu_traffic_batches');
+        $inserted = $table->insertOrIgnore([
+            'batch_hash' => $receiptHash,
+            'server_id' => $serverId,
+            'processor' => self::PROCESSOR_RECEIPT,
+            'content_hash' => $digest,
+            'payload' => json_encode(['batch_id' => $batchId], JSON_THROW_ON_ERROR),
+            'created_at' => time(),
+        ]);
+        if ($inserted === 1) {
+            return true;
+        }
+
+        $stored = $table->where('batch_hash', $receiptHash)
+            ->where('processor', self::PROCESSOR_RECEIPT)
+            ->lockForUpdate()
+            ->value('content_hash');
+        if ($stored === null) {
+            throw new \RuntimeException('traffic batch receipt reservation missing after ignored insert');
+        }
+        if (!hash_equals($stored, $digest)) {
+            throw new TrafficBatchConflictException($serverId, $batchId);
+        }
+        return false;
+    }
+
     /**
      * SB-TA-B01 protocol definition — durable receipt.
      *
@@ -226,7 +263,7 @@ class TrafficBatchGuard
      * Returns RECEIPT_OK / RECEIPT_REPLAY / RECEIPT_CONFLICT. Throws on
      * any persistence failure that is not a uniqueness replay.
      */
-    public static function receiveIdentified(string $batchKey, int $serverId, ?string $contentHash, string $payload): string
+    public static function receiveIdentified(string $batchKey, int $serverId, ?string $contentHash, string $payload, ?string $receiptHash = null): string
     {
         // SB-TA-005: conflict-tolerant insert (see claim()). A genuine
         // persistence failure still throws out of insertOrIgnore and
@@ -238,6 +275,7 @@ class TrafficBatchGuard
             'processor' => self::PROCESSOR_INBOX,
             'content_hash' => $contentHash,
             'payload' => $payload,
+            'receipt_hash' => $receiptHash,
             'status' => self::STATUS_RECEIVED,
             'created_at' => time(),
         ]);
@@ -258,7 +296,39 @@ class TrafficBatchGuard
         if ($stored !== null && $contentHash !== null && !hash_equals((string) $stored, $contentHash)) {
             return self::RECEIPT_CONFLICT;
         }
+        if ($receiptHash !== null && $existing->receipt_hash === null) {
+            DB::table('suzu_traffic_batches')->where('id', $existing->id)->update(['receipt_hash' => $receiptHash]);
+        }
         return self::RECEIPT_REPLAY;
+    }
+
+    public static function dispatchMissingProcessors(string $key, ?string $contentHash, array $payload): void
+    {
+        $completed = self::completedProcessors($key);
+        $server = $payload['server'];
+        $data = $payload['data'];
+        $protocol = $payload['protocol'];
+        $timestamp = $payload['timestamp'];
+        $batchId = $payload['batch_id'] ?? $key; // Older inbox rows only carry the derived key.
+
+        if (!in_array(self::PROCESSOR_FETCH, $completed, true)) {
+            TrafficFetchJob::dispatch($server, $data, $protocol, $timestamp, $key, $batchId, $contentHash, $payload['collected_from'] ?? null, $payload['collected_to'] ?? null);
+        }
+        if (!in_array(self::PROCESSOR_STAT_USER, $completed, true)) {
+            StatUserJob::dispatch($server, $data, $protocol, 'd', $key, $batchId, $contentHash, $timestamp);
+        }
+        if (!in_array(self::PROCESSOR_STAT_SERVER, $completed, true)) {
+            StatServerJob::dispatch($server, $data, $protocol, 'd', $key, $batchId, $contentHash, $timestamp);
+        }
+    }
+
+    private static function completedProcessors(string $key): array
+    {
+        return DB::table('suzu_traffic_batches')
+            ->where('batch_hash', $key)
+            ->whereIn('processor', [self::PROCESSOR_FETCH, self::PROCESSOR_STAT_USER, self::PROCESSOR_STAT_SERVER])
+            ->pluck('processor')
+            ->all();
     }
 
     /**
@@ -282,12 +352,7 @@ class TrafficBatchGuard
             return true;
         }
 
-        $claimed = DB::table('suzu_traffic_batches')
-            ->where('batch_hash', $batchKey)
-            ->whereIn('processor', [self::PROCESSOR_FETCH, self::PROCESSOR_STAT_USER, self::PROCESSOR_STAT_SERVER])
-            ->distinct()
-            ->count('processor');
-        if ($claimed < 3) {
+        if (count(self::completedProcessors($batchKey)) < 3) {
             return false;
         }
 

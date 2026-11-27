@@ -232,10 +232,10 @@ class ServerService
     {
         $data = array_filter($traffic, fn($item) =>
             is_array($item) && count($item) === 2
-            && is_numeric($item[0]) && is_numeric($item[1])
+            && is_numeric($item[0] ?? null) && is_numeric($item[1] ?? null)
         );
 
-        if (empty($data)) {
+        if (empty($data) && $batchMeta === null) {
             return;
         }
 
@@ -248,7 +248,7 @@ class ServerService
         // SB-TA-003 validation (bounds + group authorization) runs
         // centrally inside trafficFetch; the batch envelope
         // (SB-TA-001/002/004) is forwarded untouched.
-        (new UserService())->trafficFetch($node, $node->type, $data, $batchMeta);
+        (new UserService())->trafficFetch($node, $node->type, $batchMeta === null ? $data : $traffic, $batchMeta);
     }
 
     /**

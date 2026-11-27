@@ -120,6 +120,19 @@ class ResetLog extends Command
                     }, 'protected_families');
                 });
             }
+            if (\Illuminate\Support\Facades\Schema::hasColumn('suzu_traffic_batches', 'receipt_hash')) {
+                // Retain the full batch receipt while any of its chunks
+                // still needs recovery or manual inspection.
+                $prune->whereNotIn('batch_hash', function ($query) {
+                    $query->select('receipt_hash')->fromSub(function ($sub) {
+                        $sub->from('suzu_traffic_batches')
+                            ->select('receipt_hash')
+                            ->whereNotNull('receipt_hash')
+                            ->where('processor', \App\Services\TrafficBatchGuard::PROCESSOR_INBOX)
+                            ->where('status', '<>', \App\Services\TrafficBatchGuard::STATUS_PROCESSED);
+                    }, 'protected_receipts');
+                });
+            }
             $prune->delete();
         }
     }

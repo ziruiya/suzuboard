@@ -2,115 +2,92 @@
 
 namespace App\Console\Commands;
 
-use App\Jobs\StatServerJob;
-use App\Jobs\StatUserJob;
-use App\Jobs\TrafficFetchJob;
 use App\Services\TrafficBatchGuard;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 
-/**
- * SB-TA-B01: recovery path for the durable traffic-batch inbox.
- *
- * HTTP 200 on the report endpoint means "durably received", not
- * "booked" (see TrafficBatchGuard::receiveIdentified). Booking is
- * driven by the three accounting jobs; if they are lost — retries
- * exhausted, queue failure, worker killed between receipt and
- * dispatch — the inbox row stays in 'received' status WITH its
- * payload, and this command re-drives it. Re-driving is idempotent:
- * processors that already booked the batch hold claim rows and skip,
- * the missing ones process it exactly once.
- *
- * A row is only re-driven after it has been 'received' for
- * --older-than seconds, so batches whose jobs are merely queued or
- * in flight are left alone. An unprocessed inbox row AND all claim
- * rows of its batch family are exempt from the reset:log 48-hour
- * prune (SB-TA-B01-R1 / R1-C1), so a batch stranded by an outage
- * longer than that window is still recoverable here — with its
- * claims intact, so recovery never double-books; only processed
- * inbox rows and the claim markers of finished families are pruned
- * by age.
- *
- * Scheduled in the console kernel next to the other suzu:* jobs.
- */
 class TrafficBatchReconcile extends Command
 {
     protected $signature = 'suzu:traffic-batch-reconcile {--older-than=300 : Seconds a received batch may age before it is re-driven}';
 
-    protected $description = 'Re-drive durably received traffic batches whose accounting jobs never completed (SB-TA-B01)';
+    protected $description = 'Re-drive durably received traffic batches whose accounting jobs never completed';
 
     public function handle(): int
     {
-        if (!Schema::hasTable('suzu_traffic_batches')
-            || !Schema::hasColumn('suzu_traffic_batches', 'payload')
-            || !Schema::hasColumn('suzu_traffic_batches', 'status')) {
-            $this->info('traffic batch reconcile: inbox columns not present (migration 000010 not applied), nothing to do');
+        if (!Schema::hasTable('suzu_traffic_batches') || !Schema::hasColumn('suzu_traffic_batches', 'retry_at')) {
+            $this->info('traffic batch reconcile: retry schedule migration is pending');
             return self::SUCCESS;
         }
 
-        $olderThan = max(0, (int) $this->option('older-than'));
-        $cutoff = time() - $olderThan;
-
-        $rows = DB::table('suzu_traffic_batches')
-            ->where('processor', TrafficBatchGuard::PROCESSOR_INBOX)
-            ->where('status', TrafficBatchGuard::STATUS_RECEIVED)
+        $now = time();
+        $cutoff = $now - max(0, (int) $this->option('older-than'));
+        $inbox = DB::table('suzu_traffic_batches')->where('processor', TrafficBatchGuard::PROCESSOR_INBOX);
+        $pending = (clone $inbox)->where('status', TrafficBatchGuard::STATUS_RECEIVED);
+        $rows = (clone $pending)
             ->where('created_at', '<=', $cutoff)
+            ->where(fn ($query) => $query->whereNull('retry_at')->orWhere('retry_at', '<=', $now))
+            ->orderByRaw('COALESCE(retry_at, created_at)')
             ->orderBy('id')
             ->limit(500)
             ->get();
 
-        $summary = ['scanned' => 0, 'already_complete' => 0, 'redriven' => 0, 'errors' => 0];
-
+        $summary = ['scanned' => $rows->count(), 'already_complete' => 0, 'redriven' => 0, 'errors' => 0, 'newly_isolated' => 0];
         foreach ($rows as $row) {
-            $summary['scanned']++;
+            $current = (clone $pending)->where('id', $row->id);
+            try {
+                if (TrafficBatchGuard::noteBatchProcessed($row->batch_hash, (int) $row->server_id)) {
+                    $summary['already_complete']++;
+                    continue;
+                }
 
-            // A crash between the last processor's claim commit and
-            // its inbox update leaves a fully booked batch marked
-            // 'received'; completing the bookkeeping is enough.
-            if (TrafficBatchGuard::noteBatchProcessed($row->batch_hash, (int) $row->server_id)) {
-                $summary['already_complete']++;
-                continue;
-            }
+                $payload = json_decode((string) $row->payload, true);
+                if (!$this->validPayload($payload)) {
+                    $summary['newly_isolated'] += $current->update(['status' => TrafficBatchGuard::STATUS_UNRECOVERABLE]);
+                    Log::error('traffic batch reconcile: isolated undecodable inbox payload', [
+                        'batch_hash' => $row->batch_hash, 'server_id' => $row->server_id,
+                    ]);
+                    continue;
+                }
 
-            $payload = json_decode((string) ($row->payload ?? ''), true);
-            if (!is_array($payload) || !isset($payload['data'], $payload['protocol'], $payload['timestamp'])) {
-                Log::error('traffic batch reconcile: inbox payload undecodable, leaving row for manual inspection', [
-                    'batch_hash' => $row->batch_hash,
-                    'server_id' => (int) $row->server_id,
+                // Reserve the retry window before enqueueing. Competing
+                // runs seeing the same snapshot cannot both take this row.
+                $attempt = (int) $row->retry_count;
+                $delay = min(21600, 300 * (2 ** min($attempt, 7)));
+                $reserved = $current->where('retry_count', $attempt)->update([
+                    'retry_at' => $now + $delay,
+                    'retry_count' => $attempt + 1,
                 ]);
+                if ($reserved === 1) {
+                    TrafficBatchGuard::dispatchMissingProcessors($row->batch_hash, $row->content_hash, $payload);
+                    $summary['redriven']++;
+                }
+            } catch (\Throwable $e) {
                 $summary['errors']++;
-                continue;
+                Log::error('traffic batch reconcile: retry failed', [
+                    'batch_hash' => $row->batch_hash, 'exception' => $e->getMessage(),
+                ]);
             }
-
-            $server = [
-                'id' => (int) ($payload['server']['id'] ?? $row->server_id),
-                'rate' => $payload['server']['rate'] ?? 1,
-                'type' => $payload['server']['type'] ?? null,
-            ];
-            $data = $payload['data'];
-            $protocol = (string) $payload['protocol'];
-            $timestamp = (int) $payload['timestamp'];
-            $contentHash = $row->content_hash !== null ? (string) $row->content_hash : null;
-            // The batch id itself is not stored on the inbox row (the
-            // claim key is derived from it); the jobs only need a
-            // non-null batch id to engage the identified-batch claim
-            // path, and the key they claim under is the row's
-            // batch_hash, so the derived key stays identical.
-            $batchId = $row->batch_hash;
-
-            TrafficFetchJob::dispatch($server, $data, $protocol, $timestamp, $row->batch_hash, $batchId, $contentHash, $payload['collected_from'] ?? null, $payload['collected_to'] ?? null);
-            // SB-TA-007: a re-driven batch keeps its ORIGINAL receipt
-            // timestamp as the stat bucket, so a batch received before
-            // midnight and recovered after it still lands in the
-            // receipt day's stats.
-            StatUserJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash, $timestamp);
-            StatServerJob::dispatch($server, $data, $protocol, 'd', $row->batch_hash, $batchId, $contentHash, $timestamp);
-            $summary['redriven']++;
         }
 
+        $summary['backlog'] = $pending->count();
+        $summary['unrecoverable'] = (clone $inbox)->where('status', TrafficBatchGuard::STATUS_UNRECOVERABLE)->count();
         $this->info('traffic batch reconcile: ' . json_encode($summary));
-        return self::SUCCESS;
+        return $summary['errors'] || $summary['unrecoverable'] ? self::FAILURE : self::SUCCESS;
+    }
+
+    private function validPayload(mixed $payload): bool
+    {
+        return is_array($payload)
+            && is_array($payload['data'] ?? null)
+            && is_string($payload['protocol'] ?? null)
+            && is_int($payload['timestamp'] ?? null)
+            && is_array($payload['server'] ?? null)
+            && isset($payload['server']['id'], $payload['server']['rate'])
+            && is_numeric($payload['server']['rate'])
+            && is_int($payload['collected_from'] ?? 0)
+            && is_int($payload['collected_to'] ?? 0)
+            && is_string($payload['batch_id'] ?? '');
     }
 }

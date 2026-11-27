@@ -7,6 +7,7 @@ use App\Models\TrafficPendingCheck;
 use App\Models\User;
 use App\Services\NodeSyncService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Redis;
 
 class CheckTrafficExceeded extends Command
@@ -16,62 +17,63 @@ class CheckTrafficExceeded extends Command
 
     public function handle()
     {
-        // SB-TA-006: pending checks are durable rows written by
-        // TrafficFetchJob inside the quota transaction. Consume them
-        // chunk-wise: process first, delete afterwards — a crash in
-        // between only causes an idempotent re-check next run (the
-        // node push below is a remove-delta, safe to repeat).
-        // TA-006-R1: chunks are read as (user_id, version) pairs and
-        // deletion is conditional on the version being unchanged —
-        // a user re-booked by a producer while this check was running
-        // keeps the row (with its newer version) for the next round
-        // instead of having the fresh event erased unseen.
+        $this->drainLegacyChecks();
+
         $totalChecked = 0;
         $totalNotified = 0;
         $totalExceeded = 0;
+        $totalDeferred = 0;
+        $cursorKey = 'traffic:pending_check_cursor';
+        $cursor = (int) Cache::get($cursorKey, 0);
 
-        while (true) {
-            $pending = TrafficPendingCheck::nextChunk(1000);
-            if (empty($pending)) {
+        // Bound a run and resume after its last row so offline nodes do
+        // not keep newer events outside the scan window indefinitely.
+        for ($page = 0; $page < 5; $page++) {
+            $pending = TrafficPendingCheck::nextChunk(1000, $cursor);
+            if (!$pending) {
+                $cursor = 0;
                 break;
             }
-            $pendingUserIds = array_map(fn($row) => $row->user_id, $pending);
-
-            [$notified, $exceeded] = $this->checkUsers($pendingUserIds);
-            $totalChecked += count($pendingUserIds);
+            $cursor = end($pending)->id;
+            $userIds = array_map(fn ($row) => $row->user_id, $pending);
+            [$notified, $exceeded, $deferred] = $this->checkUsers($userIds);
+            $totalChecked += count($userIds);
             $totalNotified += $notified;
             $totalExceeded += $exceeded;
+            $totalDeferred += count($deferred);
 
-            TrafficPendingCheck::deleteConsumed($pending);
+            TrafficPendingCheck::deleteConsumed(array_filter($pending, fn ($row) => !isset($deferred[$row->user_id])));
+            if (count($pending) < 1000) {
+                $cursor = 0;
+                break;
+            }
         }
+        Cache::put($cursorKey, $cursor, 3600);
 
-        // Legacy drain: ids written to the Redis set by the pre-TA-006
-        // producer may still be queued at cutover. Best-effort only —
-        // a Redis failure must never block the durable path above.
+        if ($totalChecked > 0) {
+            $this->info("Checked {$totalChecked} users, notified {$totalNotified} nodes for {$totalExceeded} exceeded users. Deferred {$totalDeferred} checks.");
+        }
+    }
+
+    private function drainLegacyChecks(): void
+    {
         try {
-            $count = Redis::scard('traffic:pending_check');
-            if ($count > 0) {
-                $legacyIds = array_map('intval', Redis::spop('traffic:pending_check', $count));
-                if (!empty($legacyIds)) {
-                    [$notified, $exceeded] = $this->checkUsers($legacyIds);
-                    $totalChecked += count($legacyIds);
-                    $totalNotified += $notified;
-                    $totalExceeded += $exceeded;
+            if (Redis::scard('traffic:pending_check') > 0) {
+                $ids = (array) Redis::srandmember('traffic:pending_check', 1000);
+                if ($ids) {
+                    TrafficPendingCheck::recordForUsers($ids);
+                    Redis::srem('traffic:pending_check', ...$ids);
                 }
             }
         } catch (\Throwable $e) {
             $this->warn('Legacy Redis pending-check drain failed: ' . $e->getMessage());
-        }
-
-        if ($totalChecked > 0) {
-            $this->info("Checked {$totalChecked} users, notified {$totalNotified} nodes for {$totalExceeded} exceeded users.");
         }
     }
 
     /**
      * Run the over-quota check for one set of users and push remove
      * deltas for the exceeded ones. Returns [notifiedCount,
-     * exceededCount].
+     * exceededCount, deferredUserIds].
      */
     private function checkUsers(array $pendingUserIds): array
     {
@@ -84,11 +86,12 @@ class CheckTrafficExceeded extends Command
             ->get();
 
         if ($exceededUsers->isEmpty()) {
-            return [0, 0];
+            return [0, 0, []];
         }
 
         $groupedUsers = $exceededUsers->groupBy('group_id');
         $notifiedCount = 0;
+        $deferred = [];
 
         foreach ($groupedUsers as $groupId => $users) {
             if (!$groupId) {
@@ -99,18 +102,19 @@ class CheckTrafficExceeded extends Command
             $servers = Server::whereJsonContains('group_ids', (string) $groupId)->get();
 
             foreach ($servers as $server) {
-                if (!NodeSyncService::isNodeOnline($server->id)) {
-                    continue;
+                NodeSyncService::markUsersResyncPending($server->id);
+                if (NodeSyncService::isNodeOnline($server->id)
+                    && NodeSyncService::push($server->id, 'sync.user.delta', [
+                        'action' => 'remove',
+                        'users' => array_map(fn ($id) => ['id' => $id], $userIdsInGroup),
+                    ])) {
+                    $notifiedCount++;
+                } else {
+                    $deferred += array_fill_keys($userIdsInGroup, true);
                 }
-
-                NodeSyncService::push($server->id, 'sync.user.delta', [
-                    'action' => 'remove',
-                    'users' => array_map(fn($id) => ['id' => $id], $userIdsInGroup),
-                ]);
-                $notifiedCount++;
             }
         }
 
-        return [$notifiedCount, $exceededUsers->count()];
+        return [$notifiedCount, $exceededUsers->count(), $deferred];
     }
 }

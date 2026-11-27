@@ -87,19 +87,20 @@ class TrafficPendingCheck extends Model
     }
 
     /**
-     * Read the next chunk of pending events as (user_id, version)
-     * pairs, oldest first. The version is the consumer's claim on
+     * Read the next chunk of pending events with their row IDs and versions, oldest first. The version is the consumer's claim on
      * exactly the events it is about to check.
      *
-     * @return array<int, object{user_id:int, version:int}>
+     * @return array<int, object{id:int, user_id:int, version:int}>
      */
-    public static function nextChunk(int $limit = 1000): array
+    public static function nextChunk(int $limit = 1000, int $afterId = 0): array
     {
         return static::query()
+            ->where('id', '>', $afterId)
             ->orderBy('id')
             ->limit($limit)
-            ->get(['user_id', 'version'])
+            ->get(['id', 'user_id', 'version'])
             ->map(fn($row) => (object) [
+                'id' => (int) $row->id,
                 'user_id' => (int) $row->user_id,
                 'version' => (int) $row->version,
             ])
@@ -112,19 +113,19 @@ class TrafficPendingCheck extends Model
      * newer, still-unchecked event and must survive for the next
      * round. Returns the number of rows actually deleted.
      *
-     * @param array<int, object{user_id:int, version:int}> $consumed
+     * @param array<int, object{id:int, user_id:int, version:int}> $consumed
      */
     public static function deleteConsumed(array $consumed): int
     {
         $byVersion = [];
         foreach ($consumed as $row) {
-            $byVersion[(int) $row->version][] = (int) $row->user_id;
+            $byVersion[(int) $row->version][] = (int) $row->id;
         }
         $deleted = 0;
-        foreach ($byVersion as $version => $userIds) {
+        foreach ($byVersion as $version => $ids) {
             $deleted += static::query()
                 ->where('version', $version)
-                ->whereIn('user_id', $userIds)
+                ->whereIn('id', $ids)
                 ->delete();
         }
         return $deleted;
