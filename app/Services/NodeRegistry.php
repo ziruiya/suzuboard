@@ -78,14 +78,7 @@ class NodeRegistry
             $data['node_id'] = $nodeId;
         }
 
-        $payload = json_encode([
-            'event' => $event,
-            'data' => $data,
-            'timestamp' => time(),
-        ]);
-
-        $conn->send($payload);
-        return true;
+        return self::sendConnection($conn, $event, $data, $nodeId);
     }
 
     /**
@@ -121,14 +114,34 @@ class NodeRegistry
             return false;
         }
 
-        $payload = json_encode([
+        return self::sendConnection($conn, $event, $data);
+    }
+
+    private static function sendConnection(TcpConnection $conn, string $event, array $data, ?int $nodeId = null): bool
+    {
+        $revision = $data['state_revision'] ?? null;
+        $domain = NodeSyncService::revisionDomain($event);
+        $revisionKey = $nodeId !== null && $domain !== null ? "{$nodeId}:{$domain}" : null;
+        // A queued pub/sub message can predate the initial snapshot.
+        $superseded = $revisionKey !== null && is_int($revision)
+            && $revision <= ($conn->stateRevisions[$revisionKey] ?? -1);
+        $payload = $superseded ? false : json_encode([
             'event' => $event,
             'data' => $data,
             'timestamp' => time(),
         ]);
 
-        $conn->send($payload);
-        return true;
+        if (!MachineAuthEpoch::allows($conn) || $payload === false) {
+            return false;
+        }
+
+        $result = $conn->send($payload);
+        if ($result !== false && $revisionKey !== null && is_int($revision)) {
+            $conn->stateRevisions[$revisionKey] = $revision;
+        }
+
+        // Workerman returns null while bytes are buffered. Only true confirms a write.
+        return $result === true;
     }
 
     /**

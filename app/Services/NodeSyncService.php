@@ -190,17 +190,67 @@ class NodeSyncService
         self::pushMachine($machineId, 'sync.nodes', ['nodes' => $nodeList]);
     }
 
+    public static function revisionDomain(string $event): ?string
+    {
+        return match ($event) {
+            'sync.config' => 'config',
+            'sync.users', 'sync.user.delta' => 'users',
+            default => null,
+        };
+    }
+
+    private static function revisionKey(int $nodeId, string $event): ?string
+    {
+        $domain = self::revisionDomain($event);
+        return $domain === null ? null : "node:state_revision:{$nodeId}:{$domain}";
+    }
+
+    public static function currentRevision(int $nodeId, string $event): int
+    {
+        $key = self::revisionKey($nodeId, $event);
+        if ($key === null) {
+            throw new \InvalidArgumentException("No revision domain for {$event}");
+        }
+
+        return (int) Redis::get($key);
+    }
+
     /**
-     * Publish a push command to Redis — picked up by the Workerman WS server
+     * Publish in the same Redis operation as revision allocation, so concurrent
+     * publishers reach the worker in revision order.
      */
     public static function push(int $nodeId, string $event, array $data): void
     {
         try {
-            Redis::publish('node:push', json_encode([
-                'node_id' => $nodeId,
-                'event' => $event,
-                'data' => $data,
-            ]));
+            $key = self::revisionKey($nodeId, $event);
+            if ($key === null) {
+                Redis::publish('node:push', json_encode([
+                    'node_id' => $nodeId,
+                    'event' => $event,
+                    'data' => $data,
+                ], JSON_THROW_ON_ERROR));
+                return;
+            }
+
+            unset($data['state_revision'], $data['base_revision']);
+            $header = json_encode(['node_id' => $nodeId, 'event' => $event], JSON_THROW_ON_ERROR);
+            // Encode the original fields in PHP, preserving empty arrays and large integers.
+            $fields = json_encode((object) $data, JSON_THROW_ON_ERROR);
+            $published = Redis::eval(<<<'LUA'
+                local previous = redis.call('GET', KEYS[1]) or '0'
+                redis.call('INCR', KEYS[1])
+                local revision = redis.call('GET', KEYS[1])
+                local fields = '"state_revision":' .. revision
+                if ARGV[4] == '1' then
+                    fields = fields .. ',"base_revision":' .. previous
+                end
+                local suffix = ARGV[3] == '{}' and '}' or ',' .. string.sub(ARGV[3], 2)
+                return redis.call('PUBLISH', ARGV[1], ARGV[2] .. fields .. suffix .. '}')
+                LUA, 1, $key, config('database.redis.options.prefix', '') . 'node:push',
+                substr($header, 0, -1) . ',"data":{', $fields, $event === 'sync.user.delta' ? '1' : '0');
+            if ($published === false) {
+                throw new \RuntimeException('Redis rejected the revision update');
+            }
         } catch (\Throwable $e) {
             Log::warning("[NodePush] Redis publish failed: {$e->getMessage()}", [
                 'node_id' => $nodeId,
@@ -219,7 +269,7 @@ class NodeSyncService
                 'machine_id' => $machineId,
                 'event' => $event,
                 'data' => $data,
-            ]));
+            ], JSON_THROW_ON_ERROR));
         } catch (\Throwable $e) {
             Log::warning("[NodePush] Redis machine publish failed: {$e->getMessage()}", [
                 'machine_id' => $machineId,

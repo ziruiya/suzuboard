@@ -13,6 +13,7 @@ use App\Models\ServerMachine;
 use App\Models\User;
 use App\Services\Enterprise\EnterpriseGroupMembershipService;
 use App\Services\Enterprise\EnterpriseInventoryService;
+use App\Services\MachineAuthEpoch;
 use App\Services\ServerService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -489,9 +490,10 @@ class MachineFulfillmentService
         if ($step === 'token_and_grants_revoked') {
             $machine = $f->machine_id ? ServerMachine::find($f->machine_id) : null;
             if ($machine) {
-                $machine->token = ServerMachine::generateToken();
-                $machine->is_active = false;
-                $machine->save();
+                MachineAuthEpoch::update($machine->id, [
+                    'token' => ServerMachine::generateToken(),
+                    'is_active' => false,
+                ]);
             }
             Server::whereIn('id', $f->nodeIds())->update(['enabled' => false, 'show' => false]);
             if ($f->group_id) {
@@ -581,9 +583,10 @@ class MachineFulfillmentService
                 if ($locked->machine_id) {
                     $machine = ServerMachine::find($locked->machine_id);
                     if ($machine) {
-                        $machine->token = ServerMachine::generateToken();
-                        $machine->is_active = false;
-                        $machine->save();
+                        MachineAuthEpoch::update($machine->id, [
+                            'token' => ServerMachine::generateToken(),
+                            'is_active' => false,
+                        ]);
                     }
                     Server::whereIn('id', $locked->nodeIds())->update(['enabled' => false, 'show' => false]);
                     if ($locked->group_id) {

@@ -3,12 +3,13 @@
 namespace App\WebSocket;
 
 use App\Models\Server;
+use App\Services\DevicePushDelivery;
 use App\Services\DeviceStateService;
 use App\Services\NodeRegistry;
+use App\Services\NodeSyncService;
 use App\Services\ServerService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Redis;
 use Workerman\Connection\TcpConnection;
 
 class NodeEventHandlers
@@ -73,8 +74,8 @@ class NodeEventHandlers
             $service->setDevices($userId, $nodeId, $ips);
         }
 
-        // Mark for push
-        Redis::sadd('device:push_pending_nodes', $nodeId);
+        // A report confirms the previous write and queues the next snapshot.
+        DevicePushDelivery::queue($nodeId, reported: true);
 
         Log::debug("[WS] Node#{$nodeId} synced " . count($newDevices) . " users, removed " . count($removedUsers));
     }
@@ -84,62 +85,63 @@ class NodeEventHandlers
      */
     public static function handleDeviceRequest(TcpConnection $conn, int $nodeId, array $data = []): void
     {
-        $node = Server::find($nodeId);
-        if (!$node) return;
-
-        $users = ServerService::getAvailableUsers($node);
-        $userIds = $users->pluck('id')->toArray();
-
-        $service = app(DeviceStateService::class);
-        $devices = $service->getUsersDevices($userIds);
-
-        NodeRegistry::send($nodeId, 'sync.devices', [
-            'users' => $devices,
-        ]);
-
-        Log::debug("[WS] Node#{$nodeId} requested devices, sent " . count($devices) . " users");
+        DevicePushDelivery::queue($nodeId);
+        self::pushDeviceStateToNode($nodeId, app(DeviceStateService::class));
     }
 
     /**
-     * Push device state to node
+     * Push the latest pending device snapshot.
      */
     public static function pushDeviceStateToNode(int $nodeId, DeviceStateService $service): void
     {
-        $node = Server::find($nodeId);
-        if (!$node) return;
+        $sent = DevicePushDelivery::attempt($nodeId, function () use ($nodeId, $service) {
+            $node = Server::find($nodeId);
+            if (!$node) {
+                return false;
+            }
 
-        $users = ServerService::getAvailableUsers($node);
-        $userIds = $users->pluck('id')->toArray();
-        $devices = $service->getUsersDevices($userIds);
+            $userIds = ServerService::getAvailableUsers($node)->pluck('id')->toArray();
+            return NodeRegistry::send($nodeId, 'sync.devices', [
+                'users' => $service->getUsersDevices($userIds),
+            ]);
+        });
 
-        NodeRegistry::send($nodeId, 'sync.devices', [
-            'users' => $devices
-        ]);
-
-        Log::debug("[WS] Pushed device state to node#{$nodeId}: " . count($devices) . " users");
+        Log::debug("[WS] Device sync to node#{$nodeId}", ['written' => $sent]);
     }
 
     /**
-     * Push full config + users to newly connected node
+     * Push full config + users to newly connected node.
      */
-    public static function pushFullSync(TcpConnection $conn, Server $node): void
+    public static function pushFullSync(Server $node): void
     {
         $nodeId = (int) $node->id;
 
-        // Push config
-        $config = ServerService::buildNodeConfig($node);
-        NodeRegistry::send($nodeId, 'sync.config', [
-            'config' => $config,
-        ]);
+        try {
+            DevicePushDelivery::retryUnconfirmed($nodeId);
+            $configRevision = NodeSyncService::currentRevision($nodeId, 'sync.config');
+            $configSent = NodeRegistry::send($nodeId, 'sync.config', [
+                'config' => ServerService::buildNodeConfig($node),
+                'state_revision' => $configRevision,
+            ]);
 
-        // Push users
-        $users = ServerService::getAvailableUsers($node)->toArray();
-        NodeRegistry::send($nodeId, 'sync.users', [
-            'users' => $users,
-        ]);
+            $usersRevision = NodeSyncService::currentRevision($nodeId, 'sync.users');
+            $users = ServerService::getAvailableUsers($node)->toArray();
+            $usersSent = NodeRegistry::send($nodeId, 'sync.users', [
+                'users' => $users,
+                'state_revision' => $usersRevision,
+            ]);
 
-        Log::info("[WS] Full sync pushed to node#{$nodeId}", [
-            'users' => count($users),
-        ]);
+            if (!$usersSent) {
+                NodeSyncService::markUsersResyncPending($nodeId);
+            }
+
+            Log::info("[WS] Initial sync to node#{$nodeId}", [
+                'config_written' => $configSent,
+                'users_written' => $usersSent,
+                'users' => count($users),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning("[WS] Initial sync failed for node#{$nodeId}", ['error' => $e->getMessage()]);
+        }
     }
 }

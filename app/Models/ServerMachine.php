@@ -13,6 +13,7 @@ use Illuminate\Support\Str;
  * @property string $name 机器名称
  * @property string $token 认证 Token
  * @property string|null $notes 备注
+ * @property int $auth_epoch WS authorization generation
  * @property bool $is_active 是否启用
  * @property string $role 机器角色 landing|relay（二选一，权威字段）
  * @property string|null $public_address 机器公网落地地址（IP 或主机名）
@@ -27,10 +28,11 @@ class ServerMachine extends Model
 {
     protected $table = 'v2_server_machine';
 
-    protected $guarded = ['id'];
+    protected $guarded = ['id', 'auth_epoch'];
 
     protected $casts = [
         'is_active' => 'boolean',
+        'auth_epoch' => 'integer',
         'last_seen_at' => 'integer',
         'load_status' => 'array',
         'relay_enabled' => 'boolean',
@@ -42,7 +44,7 @@ class ServerMachine extends Model
         'updated_at' => 'timestamp',
     ];
 
-    protected $hidden = ['token'];
+    protected $hidden = ['token', 'auth_epoch'];
 
     public function servers(): HasMany
     {

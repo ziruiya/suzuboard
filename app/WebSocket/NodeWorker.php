@@ -4,12 +4,13 @@ namespace App\WebSocket;
 
 use App\Models\Server;
 use App\Models\ServerMachine;
+use App\Services\DevicePushDelivery;
 use App\Services\DeviceStateService;
+use App\Services\MachineAuthEpoch;
 use App\Services\NodeRegistry;
 use App\Services\ServerService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Redis;
 use Workerman\Connection\TcpConnection;
 use Workerman\Timer;
 use Workerman\Worker;
@@ -88,7 +89,9 @@ class NodeWorker
                     $oid = spl_object_id($conn);
                     if (!isset($seen[$oid])) {
                         $seen[$oid] = true;
-                        $conn->send(json_encode(['event' => 'ping']));
+                        if (MachineAuthEpoch::allows($conn)) {
+                            $conn->send(json_encode(['event' => 'ping']));
+                        }
                     }
                 }
             }
@@ -99,23 +102,23 @@ class NodeWorker
                     $oid = spl_object_id($conn);
                     if (!isset($seen[$oid])) {
                         $seen[$oid] = true;
-                        $conn->send(json_encode(['event' => 'ping']));
+                        if (MachineAuthEpoch::allows($conn)) {
+                            $conn->send(json_encode(['event' => 'ping']));
+                        }
                     }
                 }
             }
         });
 
         Timer::add(10, function () {
-            $pendingNodeIds = Redis::spop('device:push_pending_nodes', 100);
-            if (empty($pendingNodeIds)) {
-                return;
-            }
-
             $service = app(DeviceStateService::class);
-            foreach ($pendingNodeIds as $nodeId) {
-                $nodeId = (int) $nodeId;
-                if (NodeRegistry::get($nodeId) !== null) {
-                    NodeEventHandlers::pushDeviceStateToNode($nodeId, $service);
+            foreach (NodeRegistry::getConnectedNodeIds() as $nodeId) {
+                try {
+                    if (DevicePushDelivery::isPending($nodeId)) {
+                        NodeEventHandlers::pushDeviceStateToNode($nodeId, $service);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning("[WS] Device sync failed for node#{$nodeId}", ['error' => $e->getMessage()]);
                 }
             }
         });
@@ -193,12 +196,13 @@ class NodeWorker
             'total' => NodeRegistry::count(),
         ]);
 
-        $conn->send(json_encode([
-            'event' => 'auth.success',
-            'data' => ['node_id' => $nodeId],
-        ]));
-
-        NodeEventHandlers::pushFullSync($conn, $node);
+        $conn->onWebSocketConnected = function (TcpConnection $conn) use ($nodeId, $node) {
+            $conn->send(json_encode([
+                'event' => 'auth.success',
+                'data' => ['node_id' => $nodeId],
+            ]));
+            NodeEventHandlers::pushFullSync($node);
+        };
     }
 
     /**
@@ -209,7 +213,7 @@ class NodeWorker
         $machineId = (int) ($params['machine_id'] ?? 0);
         $token = $params['token'] ?? '';
 
-        $machine = ServerMachine::where('id', $machineId)
+        $machine = ServerMachine::query()->useWritePdo()->where('id', $machineId)
             ->where('token', $token)
             ->first();
 
@@ -218,6 +222,13 @@ class NodeWorker
                 'event' => 'error',
                 'data' => ['message' => 'invalid machine credentials'],
             ]));
+            return;
+        }
+
+        $conn->machineId = $machineId;
+        $conn->machineAuthEpoch = $machine->auth_epoch;
+        $conn->machineNodeIds = [];
+        if (!MachineAuthEpoch::allows($conn)) {
             return;
         }
 
@@ -237,7 +248,6 @@ class NodeWorker
         }
 
         // 连接上记录所属机器和节点列表
-        $conn->machineId = $machineId;
         $conn->machineNodeIds = $nodeIds;
 
         Log::debug("[WS] Machine#{$machineId} connected, nodes: " . implode(',', $nodeIds), [
@@ -246,18 +256,23 @@ class NodeWorker
             'machines' => NodeRegistry::machineCount(),
         ]);
 
-        $conn->send(json_encode([
-            'event' => 'auth.success',
-            'data' => [
-                'machine_id' => $machineId,
-                'node_ids' => $nodeIds,
-            ],
-        ]));
+        $conn->onWebSocketConnected = function (TcpConnection $conn) use ($machineId, $nodeIds, $nodes) {
+            if (!MachineAuthEpoch::allows($conn)) {
+                return;
+            }
 
-        // 为每个节点推送完整同步
-        foreach ($nodes as $node) {
-            NodeEventHandlers::pushFullSync($conn, $node);
-        }
+            $conn->send(json_encode([
+                'event' => 'auth.success',
+                'data' => [
+                    'machine_id' => $machineId,
+                    'node_ids' => $nodeIds,
+                ],
+            ]));
+
+            foreach ($nodes as $node) {
+                NodeEventHandlers::pushFullSync($node);
+            }
+        };
     }
 
     public function onMessage(TcpConnection $conn, $data): void
@@ -270,7 +285,11 @@ class NodeWorker
         $event = $msg['event'] ?? '';
 
         // 机器连接：从消息中读取 node_id 来分派到具体节点
-        if (!empty($conn->machineNodeIds)) {
+        if (isset($conn->machineId)) {
+            if (!MachineAuthEpoch::allows($conn)) {
+                return;
+            }
+
             if ($event === 'pong') {
                 foreach ($conn->machineNodeIds as $nid) {
                     Cache::put("node_ws_alive:{$nid}", true, 86400);
@@ -302,20 +321,20 @@ class NodeWorker
         $service = app(DeviceStateService::class);
 
         // 机器模式：清理所有关联节点
-        if (!empty($conn->machineNodeIds)) {
-            $machineId = $conn->machineId ?? 'unknown';
+        if (isset($conn->machineId)) {
+            $machineId = $conn->machineId;
+            NodeRegistry::removeMachine($machineId, $conn);
             foreach ($conn->machineNodeIds as $nodeId) {
                 NodeRegistry::remove($nodeId, $conn);
+            }
+
+            foreach ($conn->machineNodeIds as $nodeId) {
                 Cache::forget("node_ws_alive:{$nodeId}");
 
                 $affectedUserIds = $service->clearAllNodeDevices($nodeId);
                 foreach ($affectedUserIds as $userId) {
                     $service->notifyUpdate($userId);
                 }
-            }
-
-            if (!empty($conn->machineId)) {
-                NodeRegistry::removeMachine((int) $conn->machineId, $conn);
             }
 
             Log::debug("[WS] Machine#{$machineId} disconnected", [
@@ -366,42 +385,53 @@ class NodeWorker
         $channel = $prefix . 'node:push';
 
         $redis->subscribe([$channel], function ($chan, $message) {
-            $payload = json_decode($message, true);
-            if (!is_array($payload)) {
-                return;
-            }
-
-            $event = $payload['event'] ?? '';
-            $data = $payload['data'] ?? [];
-
-            // Machine-level events (e.g., sync.nodes)
-            $machineId = $payload['machine_id'] ?? null;
-            if ($machineId && $event) {
-                // Update server-side registry when node membership changes
-                if ($event === 'sync.nodes') {
-                    $nodeIds = array_map('intval', array_column($data['nodes'] ?? [], 'id'));
-                    NodeRegistry::refreshMachineNodes((int) $machineId, $nodeIds);
-                }
-
-                $sent = NodeRegistry::sendMachine((int) $machineId, $event, $data);
-                if ($sent) {
-                    Log::debug("[WS] Pushed {$event} to machine#{$machineId}");
-                }
-                return;
-            }
-
-            // Per-node events
-            $nodeId = $payload['node_id'] ?? null;
-            if (!$nodeId || !$event) {
-                return;
-            }
-
-            $sent = NodeRegistry::send((int) $nodeId, $event, $data);
-            if ($sent) {
-                Log::debug("[WS] Pushed {$event} to node#{$nodeId}");
-            }
+            $this->onRedisPush($message);
         });
 
         Log::info("[WS] Subscribed to Redis channel: {$channel}");
+    }
+
+    public function onRedisPush(string $message): void
+    {
+        $payload = json_decode($message, true);
+        if (!is_array($payload)) {
+            return;
+        }
+
+        $event = $payload['event'] ?? '';
+        $data = $payload['data'] ?? [];
+        $machineId = (int) ($payload['machine_id'] ?? 0);
+        if ($machineId && $event) {
+            $conn = NodeRegistry::getMachine($machineId);
+            if (!$conn) {
+                return;
+            }
+
+            if ($event === MachineAuthEpoch::REVOKED_EVENT) {
+                if (is_int($data['auth_epoch'] ?? null)) {
+                    MachineAuthEpoch::revoke($conn, $data['auth_epoch']);
+                }
+                return;
+            }
+
+            if ($event === 'sync.nodes') {
+                if (!MachineAuthEpoch::allows($conn)) {
+                    return;
+                }
+                $nodeIds = array_map('intval', array_column($data['nodes'] ?? [], 'id'));
+                NodeRegistry::refreshMachineNodes($machineId, $nodeIds);
+            }
+
+            $sent = NodeRegistry::sendMachine($machineId, $event, $data);
+            Log::debug("[WS] {$event} to machine#{$machineId}", ['written' => $sent]);
+            return;
+        }
+
+        $nodeId = (int) ($payload['node_id'] ?? 0);
+        if ($nodeId && $event && NodeRegistry::get($nodeId)) {
+            // Registry checks the epoch immediately before writing to the socket.
+            $sent = NodeRegistry::send($nodeId, $event, $data);
+            Log::debug("[WS] {$event} to node#{$nodeId}", ['written' => $sent]);
+        }
     }
 }

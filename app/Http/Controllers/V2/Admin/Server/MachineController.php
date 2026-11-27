@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Server;
 use App\Models\ServerMachine;
 use App\Models\ServerMachineLoadHistory;
+use App\Services\MachineAuthEpoch;
 use App\Services\NodeSyncService;
 use App\Services\Relay\MachineRoleService;
 use App\Services\Relay\RelayValidationException;
@@ -55,7 +56,6 @@ class MachineController extends Controller
         ]);
 
         if (!empty($params['id'])) {
-            $machine = ServerMachine::find($params['id']);
             $update = ['name' => $params['name']];
             if (array_key_exists('notes', $params)) {
                 $update['notes'] = $params['notes'];
@@ -63,7 +63,7 @@ class MachineController extends Controller
             if (array_key_exists('is_active', $params)) {
                 $update['is_active'] = $params['is_active'];
             }
-            $machine->update($update);
+            $machine = MachineAuthEpoch::update((int) $params['id'], $update);
             if (array_key_exists('public_address', $params)) {
                 try {
                     // R11: follower republish outcomes are surfaced, not
@@ -130,9 +130,8 @@ class MachineController extends Controller
             'id' => 'required|integer|exists:v2_server_machine,id',
         ]);
 
-        $machine = ServerMachine::find($params['id']);
         $token = ServerMachine::generateToken();
-        $machine->update(['token' => $token]);
+        MachineAuthEpoch::update((int) $params['id'], ['token' => $token]);
 
         return $this->success(['token' => $token]);
     }

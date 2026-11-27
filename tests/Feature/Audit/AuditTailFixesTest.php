@@ -24,7 +24,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
-use Mockery;
 use Tests\Feature\Enterprise\EnterpriseTestCase;
 
 /**
@@ -222,7 +221,7 @@ class AuditTailFixesTest extends EnterpriseTestCase
         Redis::shouldReceive('sadd')
             ->once()
             ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY, $server->id);
-        Redis::shouldReceive('publish')->never();
+        Redis::shouldReceive('eval')->never();
 
         // Node is offline (no node_ws_alive cache): the instant push is
         // skipped, but the resync mark must still be recorded.
@@ -250,12 +249,16 @@ class AuditTailFixesTest extends EnterpriseTestCase
             ->once()
             ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY)
             ->andReturn([$server->id]);
-        Redis::shouldReceive('publish')
+        Redis::shouldReceive('eval')
             ->once()
-            ->with('node:push', Mockery::on(function ($payload) use (&$published) {
-                $published[] = json_decode($payload, true);
-                return true;
-            }));
+            ->withArgs(function ($script, $keys, $key, $channel, $header, $data, $delta) use (&$published, $server) {
+                $published[] = json_decode($header . substr($data, 1) . '}', true, flags: JSON_THROW_ON_ERROR);
+                return $keys === 1
+                    && $key === "node:state_revision:{$server->id}:users"
+                    && $channel === config('database.redis.options.prefix') . 'node:push'
+                    && $delta === '0';
+            })
+            ->andReturn(1);
         Redis::shouldReceive('srem')
             ->once()
             ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY, $server->id);
