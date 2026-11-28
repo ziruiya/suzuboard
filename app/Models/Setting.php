@@ -2,16 +2,28 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 
 class Setting extends Model
 {
+    public const NODE_REVISION_GROUP = 'internal_node_revision';
+
     protected $table = 'v2_settings';
     protected $guarded = [];
     protected $casts = [
         'name' => 'string',
         'value' => 'string',
     ];
+
+    protected static function booted(): void
+    {
+        static::addGlobalScope('public_settings', function (Builder $query): void {
+            $group = $query->qualifyColumn('group');
+            $query->where(fn (Builder $settings) => $settings
+                ->whereNull($group)->orWhere($group, '<>', self::NODE_REVISION_GROUP));
+        });
+    }
 
     /**
      * 获取实际内容值

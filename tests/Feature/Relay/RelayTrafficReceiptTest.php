@@ -8,6 +8,7 @@ use App\Services\Relay\RelayRuleService;
 use App\Services\Relay\RelayTrafficService;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 class RelayTrafficReceiptTest extends RelayTestCase
@@ -82,6 +83,57 @@ class RelayTrafficReceiptTest extends RelayTestCase
         $this->assertSame(1, $service->ingest($machine, [$batch])['accepted']);
         $this->assertSame(1, $service->ingest($machine, [$batch])['duplicates']);
         $this->assertDatabaseCount('suzu_relay_traffic_batches', 1);
+    }
+
+    public function test_same_batch_conflicts_are_counted_without_changing_receipt_or_booking(): void
+    {
+        [$machine, $rule] = $this->makeRule();
+        $batch = $this->batch($rule->rule_code) + ['metadata' => ['b' => 2, 'a' => 1]];
+        $service = app(RelayTrafficService::class);
+
+        $this->assertSame(1, $service->ingest($machine, [$batch])['accepted']);
+        $stored = DB::table('suzu_relay_traffic_batches')->first();
+        $reordered = array_reverse(array_replace($batch, ['metadata' => ['a' => 1, 'b' => 2]]), true);
+        $this->assertSame(1, $service->ingest($machine, [$reordered])['duplicates']);
+        $this->assertDatabaseCount('suzu_relay_traffic_conflicts', 0);
+
+        Log::spy();
+        $altered = array_replace($batch, ['bytes_in' => 999]);
+        $this->assertSame(1, $service->ingest($machine, [$altered])['duplicates']);
+        $conflict = DB::table('suzu_relay_traffic_conflicts')->first();
+        $this->assertSame(1, $conflict->count);
+        $this->assertSame($stored->payload_digest, $conflict->first_digest);
+        $this->assertNotSame($conflict->first_digest, $conflict->conflicting_digest);
+        $this->assertSame($stored->batch_id, $conflict->batch_id);
+        $this->assertSame($machine->id, $conflict->machine_id);
+        $this->assertSame($rule->id, $conflict->rule_id);
+        $this->assertNotNull($conflict->created_at);
+
+        $this->travel(3)->seconds();
+        $this->assertSame(1, $service->ingest($machine, [$altered])['duplicates']);
+        $this->assertDatabaseCount('suzu_relay_traffic_conflicts', 1);
+        $this->assertDatabaseHas('suzu_relay_traffic_conflicts', ['id' => $conflict->id, 'count' => 2, 'updated_at' => now()]);
+        $this->assertDatabaseCount('suzu_relay_traffic_batches', 1);
+        $this->assertEquals($stored, DB::table('suzu_relay_traffic_batches')->first());
+        $this->assertSame(144, (int) DB::table('suzu_relay_rule_stats')->where('record_type', 'd')->sum('u'));
+        Log::shouldHaveReceived('warning')->with('relay_traffic_batch_conflict', \Mockery::subset([
+            'batch_id' => $stored->batch_id, 'conflicting_digest' => $conflict->conflicting_digest,
+        ]))->twice();
+    }
+
+    public function test_legacy_receipt_reconstructs_original_metering_digest(): void
+    {
+        [$machine, $rule] = $this->makeRule();
+        $batch = $this->batch($rule->rule_code);
+        $service = app(RelayTrafficService::class);
+        $this->assertSame(1, $service->ingest($machine, [$batch])['accepted']);
+        DB::table('suzu_relay_traffic_batches')->update(['payload_digest' => null]);
+
+        $this->assertSame(1, $service->ingest($machine, [$batch + ['old_extension' => 'unrecorded']])['duplicates']);
+        $this->assertDatabaseCount('suzu_relay_traffic_conflicts', 0);
+        $this->assertSame(1, $service->ingest($machine, [array_replace($batch, ['connections' => 1])])['duplicates']);
+        $this->assertDatabaseCount('suzu_relay_traffic_conflicts', 1);
+        $this->assertDatabaseHas('suzu_relay_traffic_batches', ['payload_digest' => null, 'connections' => 0]);
     }
 
     /** @return array{ServerMachine, RelayRule} */

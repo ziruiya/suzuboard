@@ -22,29 +22,65 @@ class DeviceStateService
     }
 
     /**
-     * 批量设置设备
-     * 用于 HTTP /alive 和 WebSocket report.devices
+     * Only alive_complete: true authorizes replacement of the entire node's
+     * snapshot. Legacy reports refresh the reported IPs until their normal TTL.
      */
-    public function setDevices(int $userId, int $nodeId, array $ips): void
+    public function reportDevices(int $nodeId, array $report, bool $complete): void
     {
-        $key = self::PREFIX . $userId;
-        $timestamp = time();
-
-        $this->removeNodeDevices($nodeId, $userId);
-
-        // Normalize: strip port suffix and deduplicate
-        $ips = array_values(array_unique(array_map([self::class, 'normalizeIP'], $ips)));
-
-        if (!empty($ips)) {
-            $fields = [];
-            foreach ($ips as $ip) {
-                $fields["{$nodeId}:{$ip}"] = $timestamp;
+        $devices = [];
+        foreach ($report as $userId => $ips) {
+            if (!ctype_digit((string) $userId) || !is_array($ips)
+                || count(array_filter($ips, 'is_string')) !== count($ips)) {
+                // A malformed snapshot must never authorize deletions.
+                $complete = false;
+                continue;
             }
-            Redis::hMset($key, $fields);
-            Redis::expire($key, self::TTL);
+            $devices[(int) $userId] = array_values(array_unique(array_map([self::class, 'normalizeIP'], $ips)));
         }
 
-        $this->notifyUpdate($userId);
+        if (!$complete && !$devices) {
+            return;
+        }
+
+        $prefix = config('database.redis.options.prefix', '') . self::PREFIX;
+        // Serialize complete and legacy writes in Redis. Fields for other
+        // nodes in the shared per-user hashes are preserved.
+        $affected = Redis::eval(<<<'LUA'
+            local prefix = ARGV[1]
+            local node = ARGV[2] .. ':'
+            local devices = cjson.decode(ARGV[3])
+            local affected = {}
+            if ARGV[4] == '1' then
+                for _, key in ipairs(redis.call('KEYS', prefix .. '*')) do
+                    for _, field in ipairs(redis.call('HKEYS', key)) do
+                        if string.sub(field, 1, #node) == node then
+                            redis.call('HDEL', key, field)
+                            affected[string.sub(key, #prefix + 1)] = true
+                        end
+                    end
+                end
+            end
+            for uid, ips in pairs(devices) do
+                local key = prefix .. uid
+                for _, ip in ipairs(ips) do
+                    redis.call('HSET', key, node .. ip, ARGV[5])
+                end
+                if #ips > 0 then
+                    redis.call('EXPIRE', key, ARGV[6])
+                end
+                affected[uid] = true
+            end
+            local result = {}
+            for uid, _ in pairs(affected) do
+                table.insert(result, uid)
+            end
+            return result
+            LUA, 0, $prefix, (string) $nodeId, json_encode((object) $devices, JSON_THROW_ON_ERROR),
+            $complete ? '1' : '0', (string) time(), (string) self::TTL);
+
+        foreach ($affected as $userId) {
+            $this->notifyUpdate((int) $userId);
+        }
     }
 
     /**

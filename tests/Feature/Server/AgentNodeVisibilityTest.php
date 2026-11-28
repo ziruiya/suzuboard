@@ -6,6 +6,8 @@ use App\Models\Server;
 use App\Models\SuzuNodeProfile;
 use App\Models\User;
 use App\Services\ServerService;
+use Illuminate\Support\Facades\Redis;
+use Tests\Support\NodeRedisFake;
 use Tests\Feature\Enterprise\EnterpriseTestCase;
 
 /**
@@ -40,6 +42,7 @@ class AgentNodeVisibilityTest extends EnterpriseTestCase
     protected function setUp(): void
     {
         parent::setUp();
+        Redis::swap(new NodeRedisFake());
 
         config()->set('app.key', 'base64:' . base64_encode(str_repeat('a', 32)));
         // App\Support\Setting hardcodes Cache::store('redis'); the test

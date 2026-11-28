@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Server;
 use Workerman\Connection\TcpConnection;
 
 /**
@@ -122,26 +123,79 @@ class NodeRegistry
         $revision = $data['state_revision'] ?? null;
         $domain = NodeSyncService::revisionDomain($event);
         $revisionKey = $nodeId !== null && $domain !== null ? "{$nodeId}:{$domain}" : null;
-        // A queued pub/sub message can predate the initial snapshot.
-        $superseded = $revisionKey !== null && is_int($revision)
-            && $revision <= ($conn->stateRevisions[$revisionKey] ?? -1);
-        $payload = $superseded ? false : json_encode([
-            'event' => $event,
-            'data' => $data,
-            'timestamp' => time(),
-        ]);
+        if (!MachineAuthEpoch::allows($conn)) {
+            return false;
+        }
 
-        if (!MachineAuthEpoch::allows($conn) || $payload === false) {
+        if ($revisionKey !== null && is_int($revision)) {
+            // A dropped sync.nodes message can leave a stale machine mapping.
+            if (isset($conn->machineId) && !Server::query()->useWritePdo()
+                ->whereKey($nodeId)->where('machine_id', $conn->machineId)->where('enabled', true)->exists()) {
+                return false;
+            }
+
+            $confirmed = $conn->stateRevisions[$revisionKey] ?? null;
+            if ($confirmed !== null && $revision <= $confirmed) {
+                if ($revision === $confirmed) {
+                    // Repair a lost Redis watermark using the confirmed write
+                    // on this connection, without sending a duplicate frame.
+                    NodeSyncService::confirmDelivery($nodeId, $domain, $revision);
+                }
+                return false;
+            }
+            if ($revision <= ($conn->bufferedStateRevisions[$revisionKey]['revision'] ?? -1)) {
+                return false;
+            }
+            if ($event === 'sync.user.delta' && ($confirmed === null || ($data['base_revision'] ?? null) !== $confirmed)) {
+                return false;
+            }
+        }
+
+        $payload = json_encode(['event' => $event, 'data' => $data, 'timestamp' => time()]);
+        if ($payload === false) {
             return false;
         }
 
         $result = $conn->send($payload);
-        if ($result === true && $revisionKey !== null && is_int($revision)) {
-            $conn->stateRevisions[$revisionKey] = $revision;
+        if ($revisionKey !== null && is_int($revision)) {
+            if ($result === true) {
+                self::confirm($conn, $revisionKey, $nodeId, $domain, $revision);
+            } elseif ($result === null && $conn->getSendBufferQueueSize() > 0) {
+                self::confirmOnDrain($conn, $revisionKey, $nodeId, $domain, $revision);
+            }
         }
 
-        // Workerman returns null while bytes are buffered. Only true confirms a write.
         return $result === true;
+    }
+
+    private static function confirm(TcpConnection $conn, string $key, int $nodeId, string $domain, int $revision): void
+    {
+        if (self::get($nodeId) === $conn && $revision > ($conn->stateRevisions[$key] ?? -1)) {
+            $conn->stateRevisions[$key] = $revision;
+            NodeSyncService::confirmDelivery($nodeId, $domain, $revision);
+        }
+    }
+
+    private static function confirmOnDrain(TcpConnection $conn, string $key, int $nodeId, string $domain, int $revision): void
+    {
+        if (!isset($conn->bufferedStateRevisions)) {
+            $previousHandler = $conn->onBufferDrain;
+            $conn->onBufferDrain = static function (TcpConnection $drained) use ($previousHandler): void {
+                $batch = $drained->bufferedStateRevisions;
+                unset($drained->bufferedStateRevisions);
+                $drained->onBufferDrain = $previousHandler;
+                foreach ($batch as $key => $entry) {
+                    self::confirm($drained, $key, $entry['nodeId'], $entry['domain'], $entry['revision']);
+                }
+                if ($previousHandler) {
+                    $previousHandler($drained);
+                }
+            };
+        }
+
+        // A drain confirms everything currently queued, so retain only the
+        // most recent revision for each node and domain.
+        $conn->bufferedStateRevisions[$key] = compact('nodeId', 'domain', 'revision');
     }
 
     /**

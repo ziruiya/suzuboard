@@ -22,6 +22,7 @@ use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
+use Tests\Support\NodeRedisFake;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Tests\Feature\Enterprise\EnterpriseTestCase;
@@ -214,21 +215,20 @@ class AuditTailFixesTest extends EnterpriseTestCase
     // -----------------------------------------------------------------
     // AUD-035: missed deltas are marked and reconciled from the DB
     // -----------------------------------------------------------------
-    public function test_notify_user_removed_marks_node_for_resync_even_when_offline(): void
+    public function test_offline_notification_records_authoritative_user_revision(): void
     {
         $server = $this->makePlainServer([(string) $this->ordinaryGroup->id]);
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
 
-        Redis::shouldReceive('sadd')
-            ->once()
-            ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY, $server->id);
-        Redis::shouldReceive('eval')->never();
-
-        // Node is offline (no node_ws_alive cache): the instant push is
-        // skipped, but the resync mark must still be recorded.
         NodeSyncService::notifyUserRemovedFromGroup(999001, $this->ordinaryGroup->id);
+
+        $this->assertSame(1, NodeSyncService::currentRevision($server->id, 'sync.users'));
+        $this->assertSame([], $redis->published);
+        $this->assertFalse($redis->hget('node:state_delivered:users', $server->id));
     }
 
-    public function test_node_resync_repushes_full_user_list_from_db_and_clears_mark(): void
+    public function test_node_resync_repushes_only_available_users_and_publish_does_not_confirm(): void
     {
         $server = $this->makePlainServer([(string) $this->ordinaryGroup->id]);
         $live = $this->makeUser([
@@ -244,37 +244,16 @@ class AuditTailFixesTest extends EnterpriseTestCase
         ]);
         Cache::put("node_ws_alive:{$server->id}", true);
 
-        $published = [];
-        Redis::shouldReceive('smembers')
-            ->once()
-            ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY)
-            ->andReturn([$server->id]);
-        Redis::shouldReceive('eval')
-            ->once()
-            ->withArgs(function ($script, $keys, $key, $channel, $header, $data, $delta) use (&$published, $server) {
-                $published[] = json_decode($header . substr($data, 1) . '}', true, flags: JSON_THROW_ON_ERROR);
-                return $keys === 1
-                    && $key === "node:state_revision:{$server->id}:users"
-                    && $channel === config('database.redis.options.prefix') . 'node:push'
-                    && $delta === '0';
-            })
-            ->andReturn(1);
-        Redis::shouldReceive('srem')
-            ->once()
-            ->with(NodeSyncService::USERS_RESYNC_PENDING_KEY, $server->id);
-
-        Redis::shouldReceive('hgetall')
-            ->once()
-            ->with(NodeSyncService::CONFIG_RESYNC_PENDING_KEY)
-            ->andReturn([]);
-
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
         $this->artisan('suzu:node-resync')->assertExitCode(0);
 
-        $this->assertCount(1, $published);
-        $this->assertSame('sync.users', $published[0]['event']);
-        $ids = collect($published[0]['data']['users'])->pluck('id')->all();
+        $published = array_map(fn ($message) => json_decode($message, true, flags: JSON_THROW_ON_ERROR), $redis->published);
+        $this->assertSame(['sync.config', 'sync.users'], array_column($published, 'event'));
+        $ids = array_column($published[1]['data']['users'], 'id');
         $this->assertContains($live->id, $ids);
         $this->assertNotContains($banned->id, $ids);
+        $this->assertFalse($redis->hget('node:state_delivered:users', $server->id));
     }
 
     public function test_shadowrocket_applies_version_floor_and_version_independent_whitelist(): void

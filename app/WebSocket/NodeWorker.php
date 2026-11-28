@@ -414,15 +414,29 @@ class NodeWorker
                 return;
             }
 
+            $added = [];
             if ($event === 'sync.nodes') {
                 if (!MachineAuthEpoch::allows($conn)) {
                     return;
                 }
                 $nodeIds = array_map('intval', array_column($data['nodes'] ?? [], 'id'));
+                $added = array_diff($nodeIds, $conn->machineNodeIds ?? []);
+                foreach (array_diff($conn->machineNodeIds ?? [], $nodeIds) as $removedId) {
+                    unset(
+                        $conn->stateRevisions["{$removedId}:config"], $conn->stateRevisions["{$removedId}:users"],
+                        $conn->bufferedStateRevisions["{$removedId}:config"], $conn->bufferedStateRevisions["{$removedId}:users"],
+                    );
+                    Cache::forget("node_ws_alive:{$removedId}");
+                }
                 NodeRegistry::refreshMachineNodes($machineId, $nodeIds);
             }
 
             $sent = NodeRegistry::sendMachine($machineId, $event, $data);
+            foreach ($added as $nodeId) {
+                Cache::put("node_ws_alive:{$nodeId}", true, 86400);
+                NodeEventHandlers::pushSnapshot($nodeId, 'sync.config');
+                NodeEventHandlers::pushSnapshot($nodeId, 'sync.users');
+            }
             Log::debug("[WS] {$event} to machine#{$machineId}", ['written' => $sent]);
             return;
         }
@@ -431,8 +445,9 @@ class NodeWorker
         if ($nodeId && $event && NodeRegistry::get($nodeId)) {
             // Registry checks the epoch immediately before writing to the socket.
             $sent = NodeRegistry::send($nodeId, $event, $data);
-            if ($event === 'sync.config' && is_int($data['state_revision'] ?? null)) {
-                NodeEventHandlers::recordConfigWriteResult($nodeId, $data['state_revision'], $sent);
+            if (!$sent && $event === 'sync.user.delta'
+                && ($data['state_revision'] ?? 0) > (NodeRegistry::get($nodeId)->stateRevisions["{$nodeId}:users"] ?? -1)) {
+                NodeEventHandlers::pushSnapshot($nodeId, 'sync.users');
             }
             Log::debug("[WS] {$event} to node#{$nodeId}", ['written' => $sent]);
         }

@@ -102,12 +102,9 @@ class CheckTrafficExceeded extends Command
             $servers = Server::whereJsonContains('group_ids', (string) $groupId)->get();
 
             foreach ($servers as $server) {
-                NodeSyncService::markUsersResyncPending($server->id);
-                if (NodeSyncService::isNodeOnline($server->id)
-                    && NodeSyncService::push($server->id, 'sync.user.delta', [
-                        'action' => 'remove',
-                        'users' => array_map(fn ($id) => ['id' => $id], $userIdsInGroup),
-                    ])) {
+                if (NodeSyncService::push($server->id, 'sync.user.delta', [
+                    'users' => array_map(fn ($id) => ['id' => $id], $userIdsInGroup),
+                ])) {
                     $notifiedCount++;
                 } else {
                     $deferred += array_fill_keys($userIdsInGroup, true);

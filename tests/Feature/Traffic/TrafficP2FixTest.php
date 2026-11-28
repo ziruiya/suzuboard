@@ -677,10 +677,11 @@ class TrafficP2FixTest extends TestCase
             \Illuminate\Support\Facades\Cache::put("node_ws_alive:{$server->id}", true);
         }
         Redis::shouldReceive('scard')->with('traffic:pending_check')->andReturn(0);
-        Redis::shouldReceive('sadd')->with('node:users_resync_pending', $server->id)->once()->andReturn(1);
+        Redis::shouldReceive('get')->with("node:state_revision:{$server->id}:users")->andReturn(false);
+        Redis::shouldReceive('setex')->once();
         $publish = Redis::shouldReceive('eval');
         if ($published === null) {
-            $publish->never();
+            $publish->once()->withArgs(fn (...$args) => end($args) === '')->andReturn(0);
         } elseif ($published === false) {
             $publish->once()->andThrow(new \RuntimeException('Redis publish failure'));
         } else {
@@ -700,7 +701,8 @@ class TrafficP2FixTest extends TestCase
         TrafficPendingCheck::recordForUsers([$user->id]);
         \Illuminate\Support\Facades\Cache::put("node_ws_alive:{$server->id}", true);
         Redis::shouldReceive('scard')->andReturn(0);
-        Redis::shouldReceive('sadd')->with('node:users_resync_pending', $server->id)->once()->andReturn(1);
+        Redis::shouldReceive('get')->with("node:state_revision:{$server->id}:users")->andReturn(false);
+        Redis::shouldReceive('setex')->once();
         Redis::shouldReceive('eval')->once()->andReturn(1);
 
         $this->artisan('check:traffic-exceeded')

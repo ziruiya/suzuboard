@@ -6,13 +6,15 @@ use App\Services\DevicePushDelivery;
 use App\Services\DeviceStateService;
 use App\Services\NodeRegistry;
 use App\Services\NodeSyncService;
-use App\Services\ServerService;
+use App\Models\User;
 use App\WebSocket\NodeEventHandlers;
 use App\WebSocket\NodeWorker;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Mockery;
+use Tests\Support\NodeRedisFake;
 use Workerman\Connection\TcpConnection;
 
 class NodeWebSocketDeliveryTest extends MachineTestCase
@@ -54,14 +56,9 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
     public function test_initial_sync_uses_current_revisions_and_suppresses_older_queued_events(): void
     {
         $nodeId = $this->vipServer->id;
-        Redis::shouldReceive('eval')->once()
-            ->with(Mockery::type('string'), 2, 'device:push_pending_nodes', "device:push_delivery:{$nodeId}", $nodeId, Mockery::type('int'))
-            ->andReturn(null);
-        Redis::shouldReceive('eval')->once()
-            ->with(Mockery::type('string'), 1, NodeSyncService::CONFIG_RESYNC_PENDING_KEY, (string) $nodeId, '2', '1')
-            ->andReturn(1);
-        Redis::shouldReceive('get')->with("node:state_revision:{$nodeId}:config")->once()->andReturn('2');
-        Redis::shouldReceive('get')->with("node:state_revision:{$nodeId}:users")->once()->andReturn('5');
+        $redis = new NodeRedisFake();
+        $redis->values = ["node:state_revision:{$nodeId}:config" => '2', "node:state_revision:{$nodeId}:users" => '5'];
+        Redis::swap($redis);
         $conn = Mockery::mock(TcpConnection::class);
         $frames = [];
         $conn->shouldReceive('send')->twice()->andReturnUsing(function (string $payload) use (&$frames) {
@@ -73,8 +70,8 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
         NodeEventHandlers::pushFullSync($this->vipServer);
 
         $this->assertSame(['sync.config', 'sync.users'], array_column($frames, 'event'));
-        $this->assertSame(2, $frames[0]['data']['state_revision']);
-        $this->assertSame(5, $frames[1]['data']['state_revision']);
+        $this->assertSame(3, $frames[0]['data']['state_revision']);
+        $this->assertSame(6, $frames[1]['data']['state_revision']);
         $this->assertArrayHasKey('config', $frames[0]['data']);
         $this->assertArrayHasKey('users', $frames[1]['data']);
         $this->assertFalse(NodeRegistry::send($nodeId, 'sync.user.delta', [
@@ -95,7 +92,9 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
     {
         $nodeId = $this->vipServer->id;
         $conn = Mockery::mock(TcpConnection::class);
+        Redis::swap(new NodeRedisFake());
         $conn->shouldReceive('send')->twice()->andReturn($unconfirmed, true);
+        $conn->shouldReceive('getSendBufferQueueSize')->andReturn(0);
         NodeRegistry::add($nodeId, $conn);
 
         $data = ['config' => [], 'state_revision' => 7];
@@ -108,86 +107,186 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
         $this->assertSame(7, $conn->stateRevisions[$key]);
     }
 
-    public function test_failed_initial_config_write_is_recorded_and_cleared_on_reconnect(): void
+    public function test_buffered_snapshots_confirm_only_after_socket_drain(): void
     {
-        $this->useDedicatedRedis();
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
         $nodeId = $this->vipServer->id;
-        $key = NodeSyncService::CONFIG_RESYNC_PENDING_KEY;
-        NodeSyncService::push($nodeId, 'sync.config', ['config' => []]);
-
         $conn = Mockery::mock(TcpConnection::class);
-        $conn->shouldReceive('send')->twice()->andReturn(null, true);
+        $conn->shouldReceive('send')->twice()->andReturnNull();
+        $conn->shouldReceive('getSendBufferQueueSize')->twice()->andReturn(4096);
+        NodeRegistry::add($nodeId, $conn);
+
+        $this->assertFalse(NodeRegistry::send($nodeId, 'sync.config', ['config' => [], 'state_revision' => 2]));
+        $this->assertFalse(NodeRegistry::send($nodeId, 'sync.users', ['users' => [], 'state_revision' => 3]));
+        $this->assertFalse(NodeRegistry::send($nodeId, 'sync.config', ['config' => [], 'state_revision' => 1]));
+        $this->assertFalse($redis->hget('node:state_delivered:config', $nodeId));
+        $this->assertFalse($redis->hget('node:state_delivered:users', $nodeId));
+
+        ($conn->onBufferDrain)($conn);
+        $this->assertSame('2', $redis->hget('node:state_delivered:config', $nodeId));
+        $this->assertSame('3', $redis->hget('node:state_delivered:users', $nodeId));
+    }
+
+    public function test_dropped_publish_and_socket_failure_reconcile_both_domains(): void
+    {
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        Cache::put("node_ws_alive:{$nodeId}", true);
+        $frames = [];
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('getSendBufferQueueSize')->andReturn(0);
+        $conn->shouldReceive('send')->times(6)->andReturnUsing(function (string $payload) use (&$frames) {
+            $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+            return count($frames) !== 3 && count($frames) !== 4 ? true : null;
+        });
         NodeRegistry::add($nodeId, $conn);
         NodeEventHandlers::pushFullSync($this->vipServer);
 
-        $this->assertSame('1', Redis::hget($key, $nodeId));
+        $this->vipServer->updateQuietly(['server_port' => 445]);
+        $this->makeAvailableUser();
+        NodeSyncService::notifyFullSync($nodeId);
+        $this->assertCount(2, $redis->published);
+        $redis->published = []; // Redis reports subscribers, but the Worker never sees the messages.
 
-        NodeRegistry::remove($nodeId, $conn);
-        $reconnected = Mockery::mock(TcpConnection::class);
+        $worker = new NodeWorker('127.0.0.1', 0);
+        $this->artisan('suzu:node-resync')->assertExitCode(0);
+        $this->assertCount(2, $redis->published);
+        foreach ($redis->published as $message) {
+            $worker->onRedisPush($message);
+        }
+        foreach (['config', 'users'] as $domain) {
+            $this->assertSame('1', $redis->hget("node:state_delivered:{$domain}", $nodeId));
+        }
+        $this->assertSame('2', $redis->hget(NodeSyncService::CONFIG_RESYNC_PENDING_KEY, $nodeId));
+
+        $redis->published = [];
+        $this->artisan('suzu:node-resync')->assertExitCode(0);
+        $this->assertCount(2, $redis->published);
+        foreach ($redis->published as $message) {
+            $worker->onRedisPush($message);
+        }
+        foreach (['config', 'users'] as $domain) {
+            $this->assertSame('2', $redis->hget("node:state_delivered:{$domain}", $nodeId));
+        }
+        $this->assertFalse($redis->hget(NodeSyncService::CONFIG_RESYNC_PENDING_KEY, $nodeId));
+        $this->assertSame([1, 1, 2, 2, 2, 2], array_column(array_column($frames, 'data'), 'state_revision'));
+
+        $redis->published = [];
+        $this->artisan('suzu:node-resync')->assertExitCode(0);
+        $this->assertSame([], $redis->published);
+    }
+
+    public function test_periodic_scan_recovers_changes_with_no_usable_notification(): void
+    {
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        Cache::put("node_ws_alive:{$nodeId}", true);
+
+        $conn = Mockery::mock(TcpConnection::class);
         $frames = [];
-        $reconnected->shouldReceive('send')->twice()->andReturnUsing(function (string $payload) use (&$frames) {
+        $conn->shouldReceive('send')->times(4)->andReturnUsing(function (string $payload) use (&$frames) {
             $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
             return true;
         });
-        NodeRegistry::add($nodeId, $reconnected);
-        NodeEventHandlers::pushFullSync($this->vipServer->fresh());
+        NodeRegistry::add($nodeId, $conn);
+        NodeEventHandlers::pushFullSync($this->vipServer);
+        $frames = [];
+        $worker = new NodeWorker('127.0.0.1', 0);
+        $redis->subscribers = 0;
+        $this->vipServer->updateQuietly(['server_port' => 452]);
+        $user = $this->makeAvailableUser();
+        NodeSyncService::notifyFullSync($nodeId);
+        $this->assertSame([], $redis->published);
 
-        $this->assertSame(['sync.config', 'sync.users'], array_column($frames, 'event'));
-        $this->assertSame(1, $frames[0]['data']['state_revision']);
-        $this->assertEquals(ServerService::buildNodeConfig($this->vipServer), $frames[0]['data']['config']);
-        $this->assertFalse(Redis::hexists($key, $nodeId));
+        // Simulate a crash after the later commit, before its notifier ran.
+        DB::transaction(function () use ($user) {
+            $this->vipServer->updateQuietly(['server_port' => 453]);
+            $user->updateQuietly(['speed_limit' => 25]);
+        });
+        $redis->subscribers = 1;
+        $this->artisan('suzu:node-resync')->assertExitCode(0);
+        $this->assertCount(2, $redis->published);
+        $this->assertSame('1', $redis->hget('node:state_delivered:config', $nodeId));
+        $this->assertSame('1', $redis->hget('node:state_delivered:users', $nodeId));
+
+        // The Worker is listening again. Dispatch this cycle's snapshots.
+        foreach ($redis->published as $message) {
+            $worker->onRedisPush($message);
+        }
+        $this->assertSame(453, $frames[0]['data']['config']['server_port']);
+        $this->assertSame(25, $frames[1]['data']['users'][0]['speed_limit']);
+        $this->assertSame('3', $redis->hget('node:state_delivered:config', $nodeId));
+        $this->assertSame('3', $redis->hget('node:state_delivered:users', $nodeId));
     }
 
-    public function test_worker_config_failure_survives_periodic_publish_until_socket_write(): void
+    public function test_delta_with_missing_base_is_replaced_by_full_snapshot(): void
     {
-        $socket = $this->useDedicatedRedis();
-        $channel = config('database.redis.options.prefix') . 'node:push';
-        $subscriber = stream_socket_client('unix://' . $socket, timeout: 2);
-        stream_set_timeout($subscriber, 2);
-        fwrite($subscriber, "SUBSCRIBE {$channel}\r\n");
-        $this->assertSame(['subscribe', $channel, 1], $this->readPubSubFrame($subscriber));
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        Cache::put("node_ws_alive:{$nodeId}", true);
 
-        try {
-            $nodeId = $this->vipServer->id;
-            $key = NodeSyncService::CONFIG_RESYNC_PENDING_KEY;
-            Cache::put("node_ws_alive:{$nodeId}", true);
+        $frames = [];
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('send')->times(3)->andReturnUsing(function (string $payload) use (&$frames) {
+            $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+            return true;
+        });
+        NodeRegistry::add($nodeId, $conn);
+        NodeEventHandlers::pushFullSync($this->vipServer);
 
-            $worker = new NodeWorker('127.0.0.1', 0);
-            $conn = Mockery::mock(TcpConnection::class);
-            $frames = [];
-            $conn->shouldReceive('send')->times(3)->andReturnUsing(function (string $payload) use (&$frames) {
-                $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
-                return count($frames) === 3;
-            });
-            NodeRegistry::add($nodeId, $conn);
+        $user = $this->makeAvailableUser();
+        NodeSyncService::notifyUserChanged($user);
+        $user->updateQuietly(['speed_limit' => 43]);
+        NodeSyncService::notifyUserChanged($user);
 
-            NodeSyncService::push($nodeId, 'sync.config', ['config' => []]);
-            [, , $first] = $this->readPubSubFrame($subscriber);
-            $worker->onRedisPush($first);
-            $this->assertSame('1', Redis::hget($key, $nodeId));
+        $this->assertCount(2, $redis->published);
+        $second = json_decode($redis->published[1], true, flags: JSON_THROW_ON_ERROR);
+        $this->assertSame('sync.user.delta', $second['event']);
+        $this->assertSame(2, $second['data']['base_revision']);
+        (new NodeWorker('127.0.0.1', 0))->onRedisPush($redis->published[1]);
+        $this->assertSame(['sync.config', 'sync.users', 'sync.users'], array_column($frames, 'event'));
+        $this->assertSame(43, $frames[2]['data']['users'][0]['speed_limit']);
+        $this->assertSame('3', $redis->hget('node:state_delivered:users', $nodeId));
+    }
 
-            $this->artisan('suzu:node-resync')->assertExitCode(0);
-            $this->assertSame('1', Redis::hget($key, $nodeId));
-            [, , $retry] = $this->readPubSubFrame($subscriber);
-            $worker->onRedisPush($retry);
-            $this->assertSame('2', Redis::hget($key, $nodeId));
+    public function test_worker_offline_changes_and_redis_flush_converge_on_reconnect(): void
+    {
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        NodeSyncService::notifyFullSync($nodeId);
+        $this->vipServer->updateQuietly(['server_port' => 446]);
+        $user = $this->makeAvailableUser();
+        NodeSyncService::notifyFullSync($nodeId);
+        $this->vipServer->updateQuietly(['server_port' => 447]);
+        $user->updateQuietly(['speed_limit' => 99]);
+        NodeSyncService::notifyFullSync($nodeId);
 
-            $this->artisan('suzu:node-resync')->assertExitCode(0);
-            $this->assertSame('2', Redis::hget($key, $nodeId));
-            [, , $recovered] = $this->readPubSubFrame($subscriber);
-            $worker->onRedisPush($recovered);
+        $this->assertSame([], $redis->published);
+        $this->assertFalse($redis->hget('node:state_delivered:config', $nodeId));
+        $this->assertFalse($redis->hget('node:state_delivered:users', $nodeId));
+        $redis = new NodeRedisFake(); // Lose every volatile key.
+        Redis::swap($redis);
 
-            $this->assertSame(['sync.config', 'sync.config', 'sync.config'], array_column($frames, 'event'));
-            $this->assertSame([1, 2, 3], array_column(array_column($frames, 'data'), 'state_revision'));
-            $this->assertEquals(ServerService::buildNodeConfig($this->vipServer), $frames[2]['data']['config']);
-            $this->assertFalse(Redis::hexists($key, $nodeId));
-
-            $worker->onRedisPush($retry);
-            $this->assertFalse(Redis::hexists($key, $nodeId));
-            $this->artisan('suzu:node-resync')->assertExitCode(0);
-            $this->assertSame(3, NodeSyncService::currentRevision($nodeId, 'sync.config'));
-        } finally {
-            fclose($subscriber);
+        $frames = [];
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('send')->twice()->andReturnUsing(function (string $payload) use (&$frames) {
+            $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+            return true;
+        });
+        NodeRegistry::add($nodeId, $conn);
+        NodeEventHandlers::pushFullSync($this->vipServer);
+        $this->assertSame(['sync.config', 'sync.users'], array_column($frames, 'event'));
+        $this->assertSame([3, 3], array_column(array_column($frames, 'data'), 'state_revision'));
+        $this->assertSame(447, $frames[0]['data']['config']['server_port']);
+        $this->assertSame(99, $frames[1]['data']['users'][0]['speed_limit']);
+        foreach (['config', 'users'] as $domain) {
+            $this->assertSame('3', $redis->get("node:state_revision:{$nodeId}:{$domain}"));
+            $this->assertSame('3', $redis->hget("node:state_delivered:{$domain}", $nodeId));
         }
     }
 
@@ -232,45 +331,114 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
         $this->assertDelivery($nodeId, 'pending', 2, true);
     }
 
-    public function test_publish_keeps_revisions_in_order_with_independent_domains(): void
+    public function test_rest_and_socket_share_committed_revisions_and_delta_base(): void
     {
-        $socket = $this->useDedicatedRedis();
-        $channel = config('database.redis.options.prefix') . 'node:push';
-        $subscriber = stream_socket_client('unix://' . $socket, timeout: 2);
-        stream_set_timeout($subscriber, 2);
-        fwrite($subscriber, "SUBSCRIBE {$channel}\r\n");
-        $this->assertSame(['subscribe', $channel, 1], $this->readPubSubFrame($subscriber));
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        Cache::put("node_ws_alive:{$nodeId}", true);
+        $worker = new NodeWorker('127.0.0.1', 0);
+        $frames = [];
+        $conn = Mockery::mock(TcpConnection::class);
+        $conn->shouldReceive('send')->times(4)->andReturnUsing(function (string $payload) use (&$frames) {
+            $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+            return true;
+        });
+        NodeRegistry::add($nodeId, $conn);
+        NodeEventHandlers::pushFullSync($this->vipServer);
 
+        $this->assertSame($this->pull('config')['state_revision'], $frames[0]['data']['state_revision']);
+        $this->assertSame($this->pull('user')['state_revision'], $frames[1]['data']['state_revision']);
+
+        DB::beginTransaction();
+        $this->vipServer->updateQuietly(['server_port' => 448]);
+        $rolledBack = $this->makeAvailableUser();
+        NodeSyncService::notifyConfigUpdated($nodeId);
+        NodeSyncService::notifyUserChanged($rolledBack);
+        $this->assertSame([], $redis->published);
+        $this->assertSame('1', $redis->get("node:state_revision:{$nodeId}:config"));
+        $this->assertSame('1', $redis->get("node:state_revision:{$nodeId}:users"));
         try {
-            $nodeId = $this->vipServer->id;
-            NodeSyncService::push($nodeId, 'sync.users', ['users' => []]);
-            NodeSyncService::push($nodeId, 'sync.config', ['config' => ['server_port' => 443]]);
-            NodeSyncService::push($nodeId, 'sync.user.delta', ['action' => 'remove', 'users' => [['id' => 17]]]);
-            NodeSyncService::push($nodeId, 'sync.config', ['config' => ['server_port' => 444]]);
-            NodeSyncService::push($nodeId, 'sync.user.delta', ['action' => 'add', 'users' => [['id' => 19]]]);
-
-            $frames = [];
-            for ($i = 0; $i < 5; $i++) {
-                [$type, $receivedChannel, $payload] = $this->readPubSubFrame($subscriber);
-                $this->assertSame('message', $type);
-                $this->assertSame($channel, $receivedChannel);
-                $frames[] = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
-            }
-            $this->assertSame(['sync.users', 'sync.config', 'sync.user.delta', 'sync.config', 'sync.user.delta'], array_column($frames, 'event'));
-            $this->assertSame(array_fill(0, 5, $nodeId), array_column($frames, 'node_id'));
-            $data = array_column($frames, 'data');
-            $this->assertSame([1, 1, 2, 2, 3], array_column($data, 'state_revision'));
-            $this->assertSame($data[0]['state_revision'], $data[2]['base_revision']);
-            $this->assertSame($data[2]['state_revision'], $data[4]['base_revision']);
-            $this->assertSame([], $data[0]['users']);
-            $this->assertSame('remove', $data[2]['action']);
-            $this->assertSame([['id' => 17]], $data[2]['users']);
-            $this->assertSame(2, NodeSyncService::currentRevision($nodeId, 'sync.config'));
-            $this->assertSame(3, NodeSyncService::currentRevision($nodeId, 'sync.users'));
-            $this->assertSame(0, NodeSyncService::currentRevision($nodeId + 1, 'sync.users'));
+            NodeSyncService::snapshot($nodeId, 'sync.config');
+            $this->fail('An active write transaction must not expose a snapshot');
+        } catch (\LogicException $e) {
+            $this->assertStringContainsString('committed database view', $e->getMessage());
         } finally {
-            fclose($subscriber);
+            DB::rollBack();
         }
+        $this->assertSame([], $redis->published);
+        $this->assertSame(1, $this->pull('config')['state_revision']);
+        $this->assertSame(1, $this->pull('user')['state_revision']);
+
+        DB::transaction(function () use ($nodeId, $redis) {
+            $this->vipServer->updateQuietly(['server_port' => 449]);
+            $user = $this->makeAvailableUser();
+            NodeSyncService::notifyConfigUpdated($nodeId);
+            NodeSyncService::notifyUserChanged($user);
+            $this->assertSame([], $redis->published);
+        });
+        foreach ($redis->published as $message) {
+            $worker->onRedisPush($message);
+        }
+
+        $config = $this->pull('config');
+        $users = $this->pull('user');
+        $this->assertSame(['sync.config', 'sync.users', 'sync.config', 'sync.user.delta'], array_column($frames, 'event'));
+        $this->assertSame(2, $config['state_revision']);
+        $this->assertSame($config['state_revision'], $frames[2]['data']['state_revision']);
+        $this->assertSame($config['server_port'], $frames[2]['data']['config']['server_port']);
+        $this->assertSame(2, $users['state_revision']);
+        $this->assertSame($users['state_revision'], $frames[3]['data']['state_revision']);
+        $this->assertSame($frames[1]['data']['state_revision'], $frames[3]['data']['base_revision']);
+        $this->assertSame($users['users'], $frames[3]['data']['users']);
+    }
+
+    public function test_overlapping_post_commit_publishers_cannot_reorder_revisions(): void
+    {
+        $redis = new NodeRedisFake();
+        Redis::swap($redis);
+        $nodeId = $this->vipServer->id;
+        Cache::put("node_ws_alive:{$nodeId}", true);
+        $first = $this->pull('config');
+
+        $redis->beforePublish = function () use ($nodeId) {
+            $intermediate = $this->pull('config');
+            $this->assertSame(2, $intermediate['state_revision']);
+            $this->assertSame(450, $intermediate['server_port']);
+            DB::transaction(function () use ($nodeId) {
+                $this->vipServer->updateQuietly(['server_port' => 451]);
+                NodeSyncService::notifyConfigUpdated($nodeId);
+            });
+        };
+
+        DB::transaction(function () use ($nodeId) {
+            $this->vipServer->updateQuietly(['server_port' => 450]);
+            NodeSyncService::notifyConfigUpdated($nodeId);
+        });
+
+        $this->assertCount(1, $redis->published);
+        $latest = json_decode($redis->published[0], true, flags: JSON_THROW_ON_ERROR)['data'];
+        $this->assertSame($first['state_revision'] + 2, $latest['state_revision']);
+        $this->assertSame(451, $latest['config']['server_port']);
+        $this->assertSame($latest['state_revision'], $this->pull('config')['state_revision']);
+    }
+
+    private function makeAvailableUser(): User
+    {
+        return User::withoutEvents(fn () => $this->makeUser([
+            'group_id' => $this->vipGroup->id,
+            'transfer_enable' => 100000,
+            'expired_at' => time() + 3600,
+        ]));
+    }
+
+    private function pull(string $path): array
+    {
+        return $this->getJson("/api/v2/server/{$path}?" . http_build_query([
+            'machine_id' => $this->vipMachine->id,
+            'node_id' => $this->vipServer->id,
+            'token' => $this->vipMachine->token,
+        ]))->assertOk()->json();
     }
 
     private function useDedicatedRedis(): string
@@ -304,22 +472,4 @@ class NodeWebSocketDeliveryTest extends MachineTestCase
         $this->assertGreaterThan(0, $delivery['updated_at']);
     }
 
-    private function readPubSubFrame($stream): array
-    {
-        $this->assertSame("*3\r\n", fgets($stream));
-        $frame = [];
-        for ($i = 0; $i < 3; $i++) {
-            $header = fgets($stream);
-            $this->assertIsString($header);
-            if ($header[0] === ':') {
-                $frame[] = (int) substr($header, 1);
-            } else {
-                $this->assertSame('$', $header[0]);
-                $length = (int) substr($header, 1);
-                $bytes = stream_get_contents($stream, $length + 2);
-                $frame[] = substr($bytes, 0, $length);
-            }
-        }
-        return $frame;
-    }
 }

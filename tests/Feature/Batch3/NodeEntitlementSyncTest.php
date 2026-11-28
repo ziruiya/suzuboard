@@ -6,6 +6,7 @@ use App\Models\Plan;
 use App\Models\Server;
 use App\Models\ServerMachine;
 use App\Models\User;
+use App\Services\NodeSyncService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -13,28 +14,35 @@ use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
 use Laravel\Sanctum\Sanctum;
+use Tests\Support\NodeRedisFake;
 use Tests\TestCase;
 
 class NodeEntitlementSyncTest extends TestCase
 {
     use RefreshDatabase;
 
-    private array $events = [];
+    private NodeRedisFake $redis;
 
     protected function setUp(): void
     {
         parent::setUp();
-        Redis::shouldReceive('sadd')->andReturn(1);
-        Redis::shouldReceive('eval')->andReturnUsing(function ($script, $keys, $key, $channel, $header, $fields) {
-            $event = json_decode($header . substr($fields, 1) . '}', true, flags: JSON_THROW_ON_ERROR);
-            $this->events[$event['node_id']][] = [$event['event'], $event['data']];
-            return 1;
-        });
-        Redis::shouldReceive('publish')->andReturnUsing(function ($channel, $payload) {
+        $this->redis = new NodeRedisFake();
+        Redis::swap($this->redis);
+    }
+
+    private function events(): array
+    {
+        $events = [];
+        foreach ($this->redis->published as $payload) {
             $event = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
-            $this->events[] = $event['machine_id'];
-            return 1;
-        });
+            if (isset($event['machine_id'])) {
+                $events[] = $event['machine_id'];
+            } else {
+                $events[$event['node_id']][] = [$event['event'], $event['data']];
+            }
+        }
+
+        return $events;
     }
 
     private function member(array $attributes): User
@@ -77,26 +85,28 @@ class NodeEntitlementSyncTest extends TestCase
     {
         [$old, $middle, $new] = [$this->node(11), $this->node(12), $this->node(13)];
         $user = $this->member(['group_id' => 11, 'plan_id' => $this->plan()->id]);
+        NodeSyncService::snapshot($old->id, 'sync.users');
+        NodeSyncService::snapshot($new->id, 'sync.users');
 
         DB::transaction(function () use ($user) {
             $user->update(['group_id' => 12]);
             DB::transaction(fn () => $user->update(['group_id' => 13]));
             $user->update(['speed_limit' => 50]);
-            $this->assertSame([], $this->events);
+            $this->assertSame([], $this->events());
         });
 
-        $this->assertSame(['sync.user.delta', ['action' => 'remove', 'users' => [['id' => $user->id]]]],
-            $this->events[$old->id][0]);
-        $this->assertArrayNotHasKey($middle->id, $this->events);
-        $this->assertCount(1, $this->events[$new->id]);
-        $this->assertCount(1, $this->events[$old->id]);
-        $this->assertSame('add', $this->events[$new->id][0][1]['action']);
-        $this->assertSame(50, $this->events[$new->id][0][1]['users'][0]['speed_limit']);
+        $this->assertSame(['sync.user.delta', ['action' => 'remove', 'users' => [['id' => $user->id]], 'base_revision' => 1, 'state_revision' => 2]],
+            $this->events()[$old->id][0]);
+        $this->assertArrayNotHasKey($middle->id, $this->events());
+        $this->assertCount(1, $this->events()[$new->id]);
+        $this->assertCount(1, $this->events()[$old->id]);
+        $this->assertSame('add', $this->events()[$new->id][0][1]['action']);
+        $this->assertSame(50, $this->events()[$new->id][0][1]['users'][0]['speed_limit']);
 
-        $this->events = [];
+        $this->redis->published = [];
         DB::transaction(fn () => $user->update(['group_id' => null]));
-        $this->assertSame([$new->id => [['sync.user.delta', ['action' => 'remove', 'users' => [['id' => $user->id]]]]]],
-            $this->events);
+        $this->assertSame([$new->id => [['sync.user.delta', ['action' => 'remove', 'users' => [['id' => $user->id]], 'base_revision' => 2, 'state_revision' => 3]]]],
+            $this->events());
     }
 
     public function test_rolled_back_user_changes_do_not_notify(): void
@@ -109,7 +119,7 @@ class NodeEntitlementSyncTest extends TestCase
         $user->update(['group_id' => 12]);
         DB::rollBack();
 
-        $this->assertSame([], $this->events);
+        $this->assertSame([], $this->events());
         $this->assertSame(11, $user->fresh()->group_id);
     }
 
@@ -126,13 +136,13 @@ class NodeEntitlementSyncTest extends TestCase
         DB::transaction(function () use ($node, $middle, $new) {
             $node->update(['machine_id' => $middle]);
             $node->update(['machine_id' => $new]);
-            $this->assertSame([], $this->events);
+            $this->assertSame([], $this->events());
         });
-        $this->assertSame([$old, $new], $this->events);
+        $this->assertSame([$old, $new], $this->events());
 
-        $this->events = [];
+        $this->redis->published = [];
         DB::transaction(fn () => $node->update(['machine_id' => null]));
-        $this->assertSame([$new], $this->events);
+        $this->assertSame([$new], $this->events());
     }
 
     public function test_plan_force_update_refreshes_both_groups_and_handles_quota_only_changes(): void
@@ -152,14 +162,14 @@ class NodeEntitlementSyncTest extends TestCase
             'group_id' => 12, 'transfer_enable' => 1, 'speed_limit' => 60, 'device_limit' => 3,
         ];
         $this->postJson('/' . $route->uri(), $payload)->assertOk();
-        $this->assertSame([['sync.users', ['users' => []]]], $this->events[$old->id]);
-        $this->assertSame([['sync.users', ['users' => []]]], $this->events[$new->id]);
+        $this->assertSame([['sync.users', ['users' => [], 'state_revision' => 1]]], $this->events()[$old->id]);
+        $this->assertSame([['sync.users', ['users' => [], 'state_revision' => 1]]], $this->events()[$new->id]);
 
-        $this->events = [];
+        $this->redis->published = [];
         $payload['transfer_enable'] = 2;
         $this->postJson('/' . $route->uri(), $payload)->assertOk();
         $this->assertSame([$new->id => [['sync.users', ['users' => [[
             'id' => $user->id, 'uuid' => $user->uuid, 'speed_limit' => 60, 'device_limit' => 3,
-        ]]]]]], $this->events);
+        ]], 'state_revision' => 2]]]], $this->events());
     }
 }

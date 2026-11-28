@@ -44,40 +44,14 @@ class NodeEventHandlers
      */
     public static function handleDeviceReport(TcpConnection $conn, int $nodeId, array $data): void
     {
-        $service = app(DeviceStateService::class);
-
-        if (isset($data['devices']) && is_array($data['devices'])) {
-            $data = $data['devices'];
-        }
-
-        // Get old data
-        $oldDevices = $service->getNodeDevices($nodeId);
-
-        // Calculate diff
-        $removedUsers = array_diff_key($oldDevices, $data);
-        $newDevices = [];
-
-        foreach ($data as $userId => $ips) {
-            if (is_numeric($userId) && is_array($ips)) {
-                $newDevices[(int) $userId] = $ips;
-            }
-        }
-
-        // Handle removed users
-        foreach ($removedUsers as $userId => $ips) {
-            $service->removeNodeDevices($nodeId, $userId);
-            $service->notifyUpdate($userId);
-        }
-
-        // Handle new/updated users
-        foreach ($newDevices as $userId => $ips) {
-            $service->setDevices($userId, $nodeId, $ips);
+        $complete = ($data['alive_complete'] ?? false) === true;
+        $devices = $data['devices'] ?? array_diff_key($data, ['node_id' => true, 'alive_complete' => true]);
+        if (is_array($devices)) {
+            ServerService::processAlive($nodeId, $devices, $complete);
         }
 
         // A report confirms the previous write and queues the next snapshot.
         DevicePushDelivery::queue($nodeId, reported: true);
-
-        Log::debug("[WS] Node#{$nodeId} synced " . count($newDevices) . " users, removed " . count($removedUsers));
     }
 
     /**
@@ -109,52 +83,29 @@ class NodeEventHandlers
         Log::debug("[WS] Device sync to node#{$nodeId}", ['written' => $sent]);
     }
 
-    public static function recordConfigWriteResult(int $nodeId, int $revision, bool $written): void
-    {
-        $conn = NodeRegistry::get($nodeId);
-        if (!$written && $revision <= ($conn->stateRevisions["{$nodeId}:config"] ?? -1)) {
-            // The registry already confirmed this revision or a newer snapshot.
-            return;
-        }
-
-        NodeSyncService::updateConfigResyncPending($nodeId, $revision, $written);
-    }
-
-    /**
-     * Push full config + users to newly connected node.
-     */
+    /** A new connection has no confirmed baseline, so check both domains. */
     public static function pushFullSync(Server $node): void
     {
         $nodeId = (int) $node->id;
-
         try {
             DevicePushDelivery::retryUnconfirmed($nodeId);
-            $configRevision = NodeSyncService::currentRevision($nodeId, 'sync.config');
-            $configSent = NodeRegistry::send($nodeId, 'sync.config', [
-                'config' => ServerService::buildNodeConfig($node),
-                'state_revision' => $configRevision,
-            ]);
-
-            self::recordConfigWriteResult($nodeId, $configRevision, $configSent);
-
-            $usersRevision = NodeSyncService::currentRevision($nodeId, 'sync.users');
-            $users = ServerService::getAvailableUsers($node)->toArray();
-            $usersSent = NodeRegistry::send($nodeId, 'sync.users', [
-                'users' => $users,
-                'state_revision' => $usersRevision,
-            ]);
-
-            if (!$usersSent) {
-                NodeSyncService::markUsersResyncPending($nodeId);
-            }
-
-            Log::info("[WS] Initial sync to node#{$nodeId}", [
-                'config_written' => $configSent,
-                'users_written' => $usersSent,
-                'users' => count($users),
-            ]);
         } catch (\Throwable $e) {
-            Log::warning("[WS] Initial sync failed for node#{$nodeId}", ['error' => $e->getMessage()]);
+            Log::warning('[WS] Device delivery retry failed', ['node_id' => $nodeId, 'error' => $e->getMessage()]);
+        }
+
+        foreach (['sync.config', 'sync.users'] as $event) {
+            self::pushSnapshot($nodeId, $event);
+        }
+    }
+
+    public static function pushSnapshot(int $nodeId, string $event): void
+    {
+        try {
+            if ($data = NodeSyncService::snapshot($nodeId, $event)) {
+                NodeRegistry::send($nodeId, $event, $data);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('[WS] Node snapshot failed', ['node_id' => $nodeId, 'event' => $event, 'error' => $e->getMessage()]);
         }
     }
 }

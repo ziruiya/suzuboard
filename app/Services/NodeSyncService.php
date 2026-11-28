@@ -6,218 +6,70 @@ use App\Models\Server;
 use App\Models\ServerMachine;
 use App\Models\User;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
 
 class NodeSyncService
 {
-    /**
-     * AUD-035: Redis set of node ids whose agent-side user list may be
-     * stale. The pub/sub pushes below are fire-and-forget: a delta issued
-     * while a node is offline (or while the publish itself fails) is
-     * lost. Every user-affecting notify therefore also records the node
-     * here, and the `suzu:node-resync` command (every minute) re-pushes
-     * the full user list — built from the database, the source of truth —
-     * to any marked node that is online, then clears the mark. The
-     * instant push behaviour is unchanged; this is only the safety net
-     * behind it (node reconnects already trigger a full sync as well).
-     */
-    public const USERS_RESYNC_PENDING_KEY = 'node:users_resync_pending';
     public const CONFIG_RESYNC_PENDING_KEY = 'node:config_resync_pending';
+    private const USERS_PENDING_KEY = 'node:users_revision_pending';
 
-    public static function updateConfigResyncPending(int $nodeId, int $revision, bool $clear): void
-    {
-        try {
-            $updated = Redis::eval(<<<'LUA'
-                local pending = redis.call('HGET', KEYS[1], ARGV[1])
-                local revision = ARGV[2]
-                -- Compare decimal strings to preserve the full Redis integer range.
-                local newer = pending and (#pending > #revision or (#pending == #revision and pending > revision))
-                if not newer then
-                    if ARGV[3] == '1' then
-                        redis.call('HDEL', KEYS[1], ARGV[1])
-                    else
-                        redis.call('HSET', KEYS[1], ARGV[1], revision)
-                    end
-                end
-                return 1
-                LUA, 1, self::CONFIG_RESYNC_PENDING_KEY, (string) $nodeId, (string) $revision, $clear ? '1' : '0');
-            if ($updated === false) {
-                throw new \RuntimeException('Redis rejected the config resync update');
-            }
-        } catch (\Throwable $e) {
-            Log::warning("[NodePush] Redis config resync update failed: {$e->getMessage()}", [
-                'node_id' => $nodeId,
-                'state_revision' => $revision,
-                'clear' => $clear,
-            ]);
-        }
-    }
-
-    public static function markUsersResyncPending(int $nodeId): void
-    {
-        try {
-            Redis::sadd(self::USERS_RESYNC_PENDING_KEY, $nodeId);
-        } catch (\Throwable $e) {
-            Log::warning("[NodePush] Redis resync mark failed: {$e->getMessage()}", [
-                'node_id' => $nodeId,
-            ]);
-        }
-    }
-
-    public static function clearUsersResyncPending(int $nodeId): void
-    {
-        try {
-            Redis::srem(self::USERS_RESYNC_PENDING_KEY, $nodeId);
-        } catch (\Throwable $e) {
-            Log::warning("[NodePush] Redis resync clear failed: {$e->getMessage()}", [
-                'node_id' => $nodeId,
-            ]);
-        }
-    }
-
-    /**
-     * Check if node has active WS connection
-     */
     public static function isNodeOnline(int $nodeId): bool
     {
         return (bool) Cache::get("node_ws_alive:{$nodeId}");
     }
 
-    /**
-     * Push node config update
-     */
     public static function notifyConfigUpdated(int $nodeId): void
     {
-        if (!self::isNodeOnline($nodeId))
-            return;
-
-        $node = Server::find($nodeId);
-        if (!$node)
-            return;
-
-        // 机器口径：推送只发往该节点已注册的连接（库存节点只可能由所属
-        // 机器注册），库存节点的配置热更新必须能推达。
-        if (!ServerService::isMachineDeliverable($node))
-            return;
-
-        self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
+        self::push($nodeId, 'sync.config');
     }
 
-    /**
-     * Push all users to all nodes in the group
-     */
     public static function notifyUsersUpdatedByGroup(int $groupId): void
     {
-        $servers = Server::whereJsonContains('group_ids', (string) $groupId)
-            ->get();
-
-        foreach ($servers as $server) {
-            self::markUsersResyncPending($server->id);
-            if (!self::isNodeOnline($server->id))
-                continue;
-
-            $users = ServerService::getAvailableUsers($server)->toArray();
-            self::push($server->id, 'sync.users', ['users' => $users]);
-        }
+        self::notifyGroup($groupId, 'sync.users');
     }
 
-    /**
-     * Push user changes (add/remove) to affected nodes
-     */
     public static function notifyUserChanged(User $user): void
     {
-        if (!$user->group_id)
-            return;
-
-        $servers = Server::whereJsonContains('group_ids', (string) $user->group_id)->get();
-        foreach ($servers as $server) {
-            self::markUsersResyncPending($server->id);
-            if (!self::isNodeOnline($server->id))
-                continue;
-
-            if ($user->isAvailable()) {
-                self::push($server->id, 'sync.user.delta', [
-                    'action' => 'add',
-                    'users' => [
-                        [
-                            'id' => $user->id,
-                            'uuid' => $user->uuid,
-                            'speed_limit' => $user->speed_limit,
-                            'device_limit' => $user->device_limit,
-                        ]
-                    ],
-                ]);
-            } else {
-                self::push($server->id, 'sync.user.delta', [
-                    'action' => 'remove',
-                    'users' => [['id' => $user->id]],
-                ]);
-            }
+        if ($user->group_id) {
+            self::notifyGroup($user->group_id, 'sync.user.delta', [$user->id]);
         }
     }
 
-    /**
-     * Push user removal from a specific group's nodes
-     */
     public static function notifyUserRemovedFromGroup(int $userId, int $groupId): void
     {
-        $servers = Server::whereJsonContains('group_ids', (string) $groupId)
-            ->get();
-
-        foreach ($servers as $server) {
-            self::markUsersResyncPending($server->id);
-            if (!self::isNodeOnline($server->id))
-                continue;
-
-            self::push($server->id, 'sync.user.delta', [
-                'action' => 'remove',
-                'users' => [['id' => $userId]],
-            ]);
-        }
+        self::notifyGroup($groupId, 'sync.user.delta', [$userId]);
     }
 
-    /**
-     * Full sync: push config + users to a node
-     */
+    private static function notifyGroup(int $groupId, string $event, array $userIds = []): void
+    {
+        DB::afterCommit(function () use ($groupId, $event, $userIds) {
+            foreach (Server::whereJsonContains('group_ids', (string) $groupId)
+                ->orWhereJsonContains('group_ids', $groupId)->get(['id']) as $server) {
+                self::push($server->id, $event, ['users' => array_map(fn ($id) => ['id' => $id], $userIds)]);
+            }
+        });
+    }
+
     public static function notifyFullSync(int $nodeId): void
     {
-        if (!self::isNodeOnline($nodeId))
-            return;
-
-        $node = Server::find($nodeId);
-        if (!$node)
-            return;
-
-        if (!ServerService::isMachineDeliverable($node))
-            return;
-
-        self::push($nodeId, 'sync.config', ['config' => ServerService::buildNodeConfig($node)]);
-
-        $users = ServerService::getAvailableUsers($node)->toArray();
-        self::push($nodeId, 'sync.users', ['users' => $users]);
+        self::push($nodeId, 'sync.config');
+        self::push($nodeId, 'sync.users');
     }
 
-    /**
-     * Notify machine that its node set has changed.
-     * Always publishes via Redis so the WS process can update its in-memory registry.
-     */
     public static function notifyMachineNodesChanged(int $machineId): void
     {
-        $machine = ServerMachine::find($machineId);
+        DB::afterCommit(function () use ($machineId) {
+            $machine = ServerMachine::find($machineId);
+            $nodes = $machine ? ServerService::getMachineNodes($machine)->map(fn ($node) => [
+                'id' => $node->id,
+                'type' => $node->type,
+                'name' => $node->name,
+            ])->values()->toArray() : [];
 
-        $nodeList = [];
-        if ($machine) {
-            $nodes = ServerService::getMachineNodes($machine);
-            $nodeList = $nodes->map(fn($n) => [
-                'id' => $n->id,
-                'type' => $n->type,
-                'name' => $n->name,
-            ])->values()->toArray();
-        }
-
-        // Always publish via Redis so the WS process can update its in-memory registry
-        self::pushMachine($machineId, 'sync.nodes', ['nodes' => $nodeList]);
+            self::pushMachine($machineId, 'sync.nodes', ['nodes' => $nodes]);
+        });
     }
 
     public static function revisionDomain(string $event): ?string
@@ -229,84 +81,209 @@ class NodeSyncService
         };
     }
 
-    private static function revisionKey(int $nodeId, string $event): ?string
-    {
-        $domain = self::revisionDomain($event);
-        return $domain === null ? null : "node:state_revision:{$nodeId}:{$domain}";
-    }
-
     public static function currentRevision(int $nodeId, string $event): int
     {
-        $key = self::revisionKey($nodeId, $event);
-        if ($key === null) {
-            throw new \InvalidArgumentException("No revision domain for {$event}");
+        return self::snapshot($nodeId, $event)['state_revision'] ?? 0;
+    }
+
+    public static function snapshot(int $nodeId, string $event, ?callable $allows = null): ?array
+    {
+        $domain = self::revisionDomain($event) ?? throw new \InvalidArgumentException("No revision domain for {$event}");
+        $snapshot = NodeStateSnapshot::read($nodeId, $domain, $allows);
+        if ($snapshot) {
+            self::mirror($nodeId, $domain, $snapshot['data'], '');
         }
 
-        return (int) Redis::get($key);
+        return $snapshot['data'] ?? null;
     }
 
     /**
-     * Publish in the same Redis operation as revision allocation, so concurrent
-     * publishers reach the worker in revision order.
+     * Only build the payload after commit. An older callback always reads
+     * current DB state, even when callbacks run out of commit order.
      */
-    public static function push(int $nodeId, string $event, array $data): bool
+    public static function push(int $nodeId, string $event, array $data = []): bool
     {
+        $published = false;
+        DB::afterCommit(function () use ($nodeId, $event, $data, &$published) {
+            try {
+                $domain = self::revisionDomain($event);
+                if ($domain === null) {
+                    $published = self::publish(['node_id' => $nodeId, 'event' => $event, 'data' => $data]);
+                    return;
+                }
+
+                $snapshot = NodeStateSnapshot::read($nodeId, $domain);
+                if (!$snapshot) {
+                    return;
+                }
+
+                $full = $snapshot['data'];
+                $eventData = $full;
+                if ($event === 'sync.user.delta') {
+                    $delta = self::userDelta($nodeId, $snapshot, array_column($data['users'] ?? [], 'id'));
+                    $event = $delta ? 'sync.user.delta' : 'sync.users';
+                    $eventData = $delta ?? $full;
+                }
+
+                $message = self::isNodeOnline($nodeId)
+                    ? json_encode(['node_id' => $nodeId, 'event' => $event, 'data' => $eventData], JSON_THROW_ON_ERROR)
+                    : '';
+                $published = self::mirror($nodeId, $domain, $full, $message);
+            } catch (\Throwable $e) {
+                Log::warning('[NodePush] Push failed', ['node_id' => $nodeId, 'event' => $event, 'error' => $e->getMessage()]);
+            }
+        });
+
+        return $published;
+    }
+
+    private static function userDelta(int $nodeId, array $snapshot, array $ids): ?array
+    {
+        $base = $snapshot['previous'];
+        $full = $snapshot['data'];
+        if ($base === $full['state_revision'] || !$snapshot['previous_digest'] || !$ids) {
+            return null;
+        }
+
         try {
-            $key = self::revisionKey($nodeId, $event);
-            if ($key === null) {
-                $published = Redis::publish('node:push', json_encode([
-                    'node_id' => $nodeId,
-                    'event' => $event,
-                    'data' => $data,
-                ], JSON_THROW_ON_ERROR));
-                return (int) $published > 0;
+            $cached = Redis::get(self::usersCacheKey($nodeId, $base));
+        } catch (\Throwable) {
+            return null;
+        }
+        if (!$cached || hash('sha256', $cached) !== $snapshot['previous_digest']) {
+            return null;
+        }
+
+        $old = array_column(json_decode($cached, true, flags: JSON_THROW_ON_ERROR)['users'], null, 'id');
+        $current = array_column($full['users'], null, 'id');
+        $add = [];
+        $remove = [];
+        foreach ($ids as $id) {
+            if (isset($current[$id])) {
+                $add[$id] = $old[$id] = $current[$id];
+            } elseif (isset($old[$id])) {
+                $remove[$id] = ['id' => $id];
+                unset($old[$id]);
+            }
+        }
+
+        // If other commits have been folded into this revision, the suggested
+        // increment may not reproduce the snapshot. Send the full state then.
+        if ($old != $current || (bool) $add === (bool) $remove) {
+            return null;
+        }
+
+        return [
+            'action' => $add ? 'add' : 'remove',
+            'users' => array_values($add ?: $remove),
+            'base_revision' => $base,
+            'state_revision' => $full['state_revision'],
+        ];
+    }
+
+    private static function usersCacheKey(int $nodeId, int $revision): string
+    {
+        return "node:users_snapshot:{$nodeId}:{$revision}";
+    }
+
+    private static function pendingKey(string $domain): string
+    {
+        return $domain === 'config' ? self::CONFIG_RESYNC_PENDING_KEY : self::USERS_PENDING_KEY;
+    }
+
+    private static function deliveredKey(string $domain): string
+    {
+        return "node:state_delivered:{$domain}";
+    }
+
+    /**
+     * Rebuild the Redis counter mirror from the durable DB revision on every
+     * snapshot. A flush loses delivery watermarks, so both domains are resent.
+     * Compare decimal strings for revisions outside Lua's precise integer range.
+     */
+    private static function mirror(int $nodeId, string $domain, array $data, string $message): bool
+    {
+        $revision = $data['state_revision'];
+        try {
+            if ($domain === 'users') {
+                Redis::setex(self::usersCacheKey($nodeId, $revision), 120, json_encode(['users' => $data['users']], JSON_THROW_ON_ERROR));
             }
 
-            unset($data['state_revision'], $data['base_revision']);
-            $header = json_encode(['node_id' => $nodeId, 'event' => $event], JSON_THROW_ON_ERROR);
-            // Encode the original fields in PHP, preserving empty arrays and large integers.
-            $fields = json_encode((object) $data, JSON_THROW_ON_ERROR);
-            $published = Redis::eval(<<<'LUA'
-                local previous = redis.call('GET', KEYS[1]) or '0'
-                redis.call('INCR', KEYS[1])
-                local revision = redis.call('GET', KEYS[1])
-                local fields = '"state_revision":' .. revision
-                if ARGV[4] == '1' then
-                    fields = fields .. ',"base_revision":' .. previous
+            return (int) Redis::eval(<<<'LUA'
+                local current = redis.call('GET', KEYS[1])
+                local node = ARGV[1]
+                local revision = ARGV[2]
+                if current and (#current > #revision or (#current == #revision and current > revision)) then
+                    return 0
                 end
-                local suffix = ARGV[3] == '{}' and '}' or ',' .. string.sub(ARGV[3], 2)
-                return redis.call('PUBLISH', ARGV[1], ARGV[2] .. fields .. suffix .. '}')
-                LUA, 1, $key, config('database.redis.options.prefix', '') . 'node:push',
-                substr($header, 0, -1) . ',"data":{', $fields, $event === 'sync.user.delta' ? '1' : '0');
-            if ($published === false) {
-                throw new \RuntimeException('Redis rejected the revision update');
-            }
-            return (int) $published > 0;
+                redis.call('SET', KEYS[1], revision)
+                if redis.call('HGET', KEYS[2], node) ~= revision then
+                    redis.call('HSET', KEYS[3], node, revision)
+                end
+                if ARGV[4] ~= '' then
+                    return redis.call('PUBLISH', ARGV[3], ARGV[4])
+                end
+                return 0
+                LUA, 3, NodeStateSnapshot::key($nodeId, $domain), self::deliveredKey($domain), self::pendingKey($domain),
+                (string) $nodeId, (string) $revision, config('database.redis.options.prefix', '') . 'node:push', $message) > 0;
         } catch (\Throwable $e) {
-            Log::warning("[NodePush] Redis publish failed: {$e->getMessage()}", [
-                'node_id' => $nodeId,
-                'event' => $event,
-            ]);
+            Log::warning('[NodePush] Redis mirror or publish failed', ['node_id' => $nodeId, 'domain' => $domain, 'error' => $e->getMessage()]);
             return false;
         }
     }
 
-    /**
-     * Publish a machine-level push command to Redis — picked up by the Workerman WS server
-     */
-    public static function pushMachine(int $machineId, string $event, array $data): void
+    private static function needsSync(int $nodeId, string $domain, int $revision): bool
+    {
+        return (string) Redis::hget(self::deliveredKey($domain), (string) $nodeId) !== (string) $revision;
+    }
+
+    public static function confirmDelivery(int $nodeId, string $domain, int $revision): void
     {
         try {
-            Redis::publish('node:push', json_encode([
-                'machine_id' => $machineId,
-                'event' => $event,
-                'data' => $data,
-            ], JSON_THROW_ON_ERROR));
+            Redis::eval(<<<'LUA'
+                local function newer(a, b)
+                    return a and (#a > #b or (#a == #b and a > b))
+                end
+                local node = ARGV[1]
+                local revision = ARGV[2]
+                if not newer(redis.call('HGET', KEYS[1], node), revision) then
+                    redis.call('HSET', KEYS[1], node, revision)
+                end
+                if not newer(redis.call('HGET', KEYS[2], node), revision) then
+                    redis.call('HDEL', KEYS[2], node)
+                end
+                LUA, 2, self::deliveredKey($domain), self::pendingKey($domain), (string) $nodeId, (string) $revision);
         } catch (\Throwable $e) {
-            Log::warning("[NodePush] Redis machine publish failed: {$e->getMessage()}", [
-                'machine_id' => $machineId,
-                'event' => $event,
-            ]);
+            Log::warning('[NodePush] Delivery watermark write failed', ['node_id' => $nodeId, 'domain' => $domain, 'error' => $e->getMessage()]);
+        }
+    }
+
+    public static function reconcile(int $nodeId, string $event): void
+    {
+        $domain = self::revisionDomain($event);
+        $snapshot = NodeStateSnapshot::read($nodeId, $domain)['data'] ?? null;
+        if (!$snapshot) {
+            return;
+        }
+
+        $message = self::needsSync($nodeId, $domain, $snapshot['state_revision'])
+            ? json_encode(['node_id' => $nodeId, 'event' => $event, 'data' => $snapshot], JSON_THROW_ON_ERROR)
+            : '';
+        self::mirror($nodeId, $domain, $snapshot, $message);
+    }
+
+    public static function pushMachine(int $machineId, string $event, array $data): void
+    {
+        DB::afterCommit(fn () => self::publish(['machine_id' => $machineId, 'event' => $event, 'data' => $data]));
+    }
+
+    private static function publish(array $payload): bool
+    {
+        try {
+            return (int) Redis::publish('node:push', json_encode($payload, JSON_THROW_ON_ERROR)) > 0;
+        } catch (\Throwable $e) {
+            Log::warning('[NodePush] Redis publish failed', ['event' => $payload['event'], 'error' => $e->getMessage()]);
+            return false;
         }
     }
 }

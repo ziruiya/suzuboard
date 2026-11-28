@@ -3,10 +3,11 @@
 namespace App\Http\Controllers\V1\Server;
 
 use App\Http\Controllers\Controller;
+use App\Models\Server;
 use App\Services\DeviceStateService;
 use App\Services\ServerService;
+use App\Services\NodeSyncService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Http\JsonResponse;
 
 class UniProxyController extends Controller
@@ -28,7 +29,7 @@ class UniProxyController extends Controller
 
         ServerService::touchNode($node);
 
-        $response['users'] = ServerService::getAvailableUsers($node);
+        $response = $this->snapshot($request, 'sync.users');
 
         $eTag = sha1(json_encode($response));
         if (str_contains($request->header('If-None-Match', ''), $eTag)) {
@@ -54,19 +55,29 @@ class UniProxyController extends Controller
 
     public function config(Request $request)
     {
-        $node = $this->getNodeInfo($request);
-        $response = ServerService::buildNodeConfig($node);
-
-        $response['base_config'] = [
-            'push_interval' => (int) admin_setting('server_push_interval', 60),
-            'pull_interval' => (int) admin_setting('server_pull_interval', 60)
-        ];
+        $snapshot = $this->snapshot($request, 'sync.config');
+        $response = $snapshot['config'] + ['state_revision' => $snapshot['state_revision']];
 
         $eTag = sha1(json_encode($response));
         if (str_contains($request->header('If-None-Match', ''), $eTag)) {
             return response(null, 304);
         }
         return response($response)->header('ETag', "\"{$eTag}\"");
+    }
+
+    private function snapshot(Request $request, string $event): array
+    {
+        $machine = $request->attributes->get('machine_info');
+        $snapshot = NodeSyncService::snapshot(
+            $this->getNodeInfo($request)->id,
+            $event,
+            fn (Server $node) => $machine
+                ? $node->machine_id === $machine->id && ServerService::isMachineDeliverable($node)
+                : ServerService::isAgentDeliverable($node),
+        );
+        abort_if($snapshot === null, 404);
+
+        return $snapshot;
     }
 
     public function alivelist(Request $request): JsonResponse
@@ -83,12 +94,18 @@ class UniProxyController extends Controller
     public function alive(Request $request): JsonResponse
     {
         $node = $this->getNodeInfo($request);
-        $data = json_decode(request()->getContent(), true);
-        if ($data === null) {
+        $data = json_decode($request->getContent(), true);
+        if (!is_array($data)) {
             return response()->json(['error' => 'Invalid online data'], 400);
         }
 
-        ServerService::processAlive($node->id, $data);
+        $complete = ($data['alive_complete'] ?? false) === true;
+        $alive = $data['alive'] ?? array_diff_key($data, ['alive_complete' => true]);
+        if (!is_array($alive)) {
+            return response()->json(['error' => 'Invalid online data'], 400);
+        }
+
+        ServerService::processAlive($node->id, $alive, $complete);
 
         return response()->json(['data' => true]);
     }

@@ -254,12 +254,9 @@ class ServerService
     /**
      * 处理节点在线设备汇报
      */
-    public static function processAlive(int $nodeId, array $alive): void
+    public static function processAlive(int $nodeId, array $alive, bool $complete = false): void
     {
-        $service = app(DeviceStateService::class);
-        foreach ($alive as $uid => $ips) {
-            $service->setDevices((int) $uid, $nodeId, (array) $ips);
-        }
+        app(DeviceStateService::class)->reportDevices($nodeId, $alive, $complete);
     }
 
     /**

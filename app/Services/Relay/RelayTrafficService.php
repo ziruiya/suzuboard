@@ -5,9 +5,11 @@ namespace App\Services\Relay;
 use App\Models\RelayRule;
 use App\Models\RelayRuleStat;
 use App\Models\RelayTrafficBatch;
+use App\Models\RelayTrafficConflict;
 use App\Models\ServerMachine;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * SB-RELAY-01 traffic accounting. The agent reports immutable batches
@@ -61,7 +63,15 @@ class RelayTrafficService
             $bytesIn = max(0, (int) ($batch['bytes_in'] ?? 0));
             $bytesOut = max(0, (int) ($batch['bytes_out'] ?? 0));
 
-            $booked = DB::transaction(function () use ($machine, $ruleCode, $bootId, $seq, $start, $end, $bytesIn, $bytesOut, $batch) {
+            $metering = [
+                'rule_code' => $ruleCode, 'boot_id' => $bootId, 'seq' => $seq,
+                'period_start' => $start, 'period_end' => $end,
+                'bytes_in' => $bytesIn, 'bytes_out' => $bytesOut,
+                'connections' => max(0, (int) ($batch['connections'] ?? 0)),
+            ];
+            $digest = self::digest($metering + $batch);
+
+            $booked = DB::transaction(function () use ($machine, $ruleCode, $bootId, $seq, $start, $end, $bytesIn, $bytesOut, $metering, $digest) {
                 $rule = RelayRule::where('machine_id', $machine->id)->where('rule_code', $ruleCode)
                     ->lockForUpdate()->first();
                 $deletedAt = null;
@@ -89,12 +99,14 @@ class RelayTrafficService
                         'period_end' => $end,
                         'bytes_in' => $bytesIn,
                         'bytes_out' => $bytesOut,
-                        'connections' => max(0, (int) ($batch['connections'] ?? 0)),
+                        'connections' => $metering['connections'],
+                        'payload_digest' => $digest,
                         'rule_deleted_at' => $deletedAt,
                         'created_at' => now(),
                     ]));
                 } catch (UniqueConstraintViolationException $e) {
-                    if (RelayTrafficBatch::where($identity)->lockForUpdate()->first(['id'])) {
+                    if ($stored = RelayTrafficBatch::where($identity)->lockForUpdate()->first()) {
+                        $this->observeConflict($stored, $metering, $digest);
                         return false;
                     }
                     throw $e;
@@ -122,6 +134,57 @@ class RelayTrafficService
             'rejected' => $rejected,
             'rejected_batches' => $rejectedBatches,
         ];
+    }
+
+    private function observeConflict(RelayTrafficBatch $stored, array $metering, string $digest): void
+    {
+        $first = $stored->payload_digest;
+        if ($first === null) {
+            // Historical receipts only preserve metering fields. Compare
+            // those fields without making assumptions about old extensions.
+            $first = self::digest([
+                'rule_code' => $metering['rule_code'], 'boot_id' => $stored->boot_id, 'seq' => (int) $stored->seq,
+                'period_start' => (int) $stored->period_start, 'period_end' => (int) $stored->period_end,
+                'bytes_in' => (int) $stored->bytes_in, 'bytes_out' => (int) $stored->bytes_out,
+                'connections' => (int) $stored->connections,
+            ]);
+            $digest = self::digest($metering);
+        }
+        if ($first === $digest) {
+            return;
+        }
+
+        // Callers hold the receipt row lock, serializing conflict counts.
+        $identity = ['receipt_id' => $stored->id, 'conflicting_digest' => $digest];
+        $context = [
+            'machine_id' => $stored->machine_id, 'rule_id' => $stored->rule_id,
+            'batch_id' => $stored->batch_id, 'first_digest' => $first,
+        ];
+        $conflict = RelayTrafficConflict::firstOrCreate($identity, $context);
+        if (!$conflict->wasRecentlyCreated) {
+            $conflict->increment('count');
+        }
+
+        DB::afterCommit(fn () => Log::warning('relay_traffic_batch_conflict', $context + $identity));
+    }
+
+    private static function digest(array $batch): string
+    {
+        return hash('sha256', json_encode(self::canonicalize($batch), JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION));
+    }
+
+    private static function canonicalize(array $value): array
+    {
+        if (!array_is_list($value)) {
+            ksort($value, SORT_STRING);
+        }
+        foreach ($value as &$item) {
+            if (is_array($item)) {
+                $item = self::canonicalize($item);
+            }
+        }
+
+        return $value;
     }
 
     /**
