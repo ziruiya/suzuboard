@@ -61,6 +61,12 @@ class Kernel extends ConsoleKernel
         // Business plans batch 3: dedicated-VPS fulfilment tick every 5
         // minutes (install detection, SLA stages, grace/reclaim, leases)
         $schedule->command('suzu:machine-fulfillment-tick')->everyFiveMinutes()->onOneServer()->withoutOverlapping(5);
+        $schedule->command('log0:maintain events')->everyMinute()->onOneServer()->withoutOverlapping(5)->runInBackground();
+        $schedule->command('log0:maintain candidates')->everyMinute()->onOneServer()->withoutOverlapping(5)->runInBackground();
+        $schedule->command('log0:maintain daily')->dailyAt('00:20')->timezone('Asia/Shanghai')
+            ->onOneServer()->withoutOverlapping(30)->runInBackground();
+        $schedule->command('log0:maintain retention')->dailyAt('00:40')->timezone('Asia/Shanghai')
+            ->onOneServer()->withoutOverlapping(30)->runInBackground();
         // backup Timing
         // if (env('ENABLE_AUTO_BACKUP_AND_UPDATE', false)) {
         //     $schedule->command('backup:database', ['true'])->daily()->onOneServer();
